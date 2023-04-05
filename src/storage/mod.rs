@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
     channel::mpsc,
+    future::Either,
     sink::SinkExt,
     stream::{BoxStream, Stream, StreamExt},
     Future,
@@ -64,7 +65,7 @@ pub type ByteStream =
 /// A namespace is used to categorize stored LFS objects. The storage
 /// implementation is free to ignore this. However, it can be useful when
 /// pruning old LFS objects from permanent storage.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Namespace {
     org: String,
     project: String,
@@ -97,7 +98,7 @@ impl fmt::Display for Namespace {
 }
 
 /// A key into storage.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct StorageKey {
     namespace: Namespace,
     oid: Oid,
@@ -295,5 +296,104 @@ where
         expires_in: Duration,
     ) -> Option<String> {
         self.as_ref().upload_url(key, expires_in).await
+    }
+}
+
+#[async_trait]
+impl<A, B> Storage for Either<A, B>
+where
+    A: Storage + Send + Sync,
+    B: Storage<Error = A::Error> + Send + Sync,
+    // A: Storage + Send + Sync + 'static,
+    // B: Storage<Error = A::Error> + Send + Sync + 'static,
+{
+    type Error = A::Error;
+
+    #[inline]
+    async fn get(
+        &self,
+        key: &StorageKey,
+    ) -> Result<Option<LFSObject>, Self::Error> {
+        match self {
+            Either::Left(x) => x.get(key),
+            Either::Right(x) => x.get(key),
+        }
+        .await
+    }
+
+    #[inline]
+    async fn put(
+        &self,
+        key: StorageKey,
+        value: LFSObject,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Either::Left(x) => x.put(key, value),
+            Either::Right(x) => x.put(key, value),
+        }
+        .await
+    }
+
+    #[inline]
+    async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
+        match self {
+            Either::Left(x) => x.size(key),
+            Either::Right(x) => x.size(key),
+        }
+        .await
+    }
+
+    #[inline]
+    async fn delete(&self, key: &StorageKey) -> Result<(), Self::Error> {
+        match self {
+            Either::Left(x) => x.delete(key),
+            Either::Right(x) => x.delete(key),
+        }
+        .await
+    }
+
+    #[inline]
+    fn list(&self) -> StorageStream<(StorageKey, u64), Self::Error> {
+        match self {
+            Either::Left(x) => x.list(),
+            Either::Right(x) => x.list(),
+        }
+    }
+
+    #[inline]
+    async fn total_size(&self) -> Option<u64> {
+        match self {
+            Either::Left(x) => x.total_size(),
+            Either::Right(x) => x.total_size(),
+        }
+        .await
+    }
+
+    #[inline]
+    async fn max_size(&self) -> Option<u64> {
+        match self {
+            Either::Left(x) => x.max_size(),
+            Either::Right(x) => x.max_size(),
+        }
+        .await
+    }
+
+    fn public_url(&self, key: &StorageKey) -> Option<String> {
+        match self {
+            Either::Left(x) => x.public_url(key),
+            Either::Right(x) => x.public_url(key),
+        }
+    }
+
+    async fn upload_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        match self {
+            Either::Left(x) => x.upload_url(key, expires_in),
+            Either::Right(x) => x.upload_url(key, expires_in),
+        }
+        .await
     }
 }

@@ -20,69 +20,73 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
+use clap::Parser;
 use hex::FromHex;
-use structopt::StructOpt;
 
 use rudolfs::{Cache, LocalServerBuilder, S3ServerBuilder};
+use rudolfs::{LocalLs, NoneLs};
 
-mod lfs;
-mod lru;
-mod sha256;
-mod storage;
-mod util;
+#[cfg(feature = "otel")]
+use opentelemetry_otlp::WithExportConfig;
+#[cfg(feature = "dynamodb")]
+use rudolfs::DynamoLs;
+#[cfg(feature = "redis")]
+use rudolfs::RedisLs;
+#[cfg(feature = "otel")]
+use tracing_subscriber::{prelude::*, Registry};
 
 // Additional help to append to the end when `--help` is specified.
 static AFTER_HELP: &str = include_str!("help.md");
 
-#[derive(StructOpt)]
-#[structopt(after_help = AFTER_HELP)]
+#[derive(Parser)]
+#[clap(after_help = AFTER_HELP)]
 struct Args {
-    #[structopt(flatten)]
+    #[clap(flatten)]
     global: GlobalArgs,
 
-    #[structopt(subcommand)]
+    #[clap(flatten)]
+    lock_args: LockArgs,
+
+    #[clap(subcommand)]
     backend: Backend,
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 enum Backend {
     /// Starts the server with S3 as the storage backend.
-    #[structopt(name = "s3")]
+    #[clap(name = "s3")]
     S3(S3Args),
 
     /// Starts the server with the local disk as the storage backend.
-    #[structopt(name = "local")]
+    #[clap(name = "local")]
     Local(LocalArgs),
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 struct GlobalArgs {
     /// The host or address to listen on. If this is not specified, then
     /// `0.0.0.0` is used where the port can be specified with `--port`
     /// (port 8080 is used by default if that is also not specified).
-    #[structopt(long = "host", env = "RUDOLFS_HOST")]
+    #[clap(long = "host", env = "RUDOLFS_HOST")]
     host: Option<String>,
 
     /// The port to bind to. This is only used if `--host` is not specified.
-    #[structopt(long = "port", default_value = "8080", env = "PORT")]
+    #[clap(long = "port", default_value = "8080", env = "PORT")]
     port: u16,
 
-    /// Encryption key to use.
-    #[structopt(
-        long = "key",
-        parse(try_from_str = FromHex::from_hex),
-        env = "RUDOLFS_KEY"
-    )]
-    key: [u8; 32],
+    /// Encryption key to use. If not specified, then objects are *not*
+    /// encrypted.
+    #[clap(long = "key", value_parser = from_hex, env = "RUDOLFS_KEY")]
+    key: Option<[u8; 32]>,
 
     /// Root directory of the object cache. If not specified or if the local
     /// disk is the storage backend, then no local disk cache will be used.
-    #[structopt(long = "cache-dir", env = "RUDOLFS_CACHE_DIR")]
+    #[clap(long = "cache-dir", env = "RUDOLFS_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
 
     /// Maximum size of the cache, in bytes. Set to 0 for an unlimited cache
     /// size.
-    #[structopt(
+    #[clap(
         long = "max-cache-size",
         default_value = "50 GiB",
         env = "RUDOLFS_MAX_CACHE_SIZE"
@@ -90,35 +94,122 @@ struct GlobalArgs {
     max_cache_size: human_size::Size,
 
     /// Logging level to use.
-    #[structopt(
-        long = "log-level",
-        default_value = "info",
-        env = "RUDOLFS_LOG"
-    )]
+    #[clap(long = "log-level", default_value = "info", env = "RUDOLFS_LOG")]
     log_level: log::LevelFilter,
+
+    /// Pass authorization header to GitHub to check permissions
+    #[clap(long)]
+    github_auth: bool,
 }
 
-#[derive(StructOpt)]
+fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
+    FromHex::from_hex(s)
+}
+
+#[derive(Parser, Clone)]
+enum LockBackend {
+    /// Starts the server with DynamoDB as the lock backend.
+    #[cfg(feature = "dynamodb")]
+    #[clap(name = "dynamodb")]
+    DynamoDB,
+
+    /// Starts the server with DynamoDB as the lock backend.
+    #[cfg(feature = "redis")]
+    #[clap(name = "redis")]
+    Redis,
+
+    /// Starts the server with the local disk as the lock backend.
+    #[clap(name = "local")]
+    Local,
+
+    /// Default to not supporting locking endpoints
+    #[clap(name = "no-locks")]
+    None,
+}
+
+impl From<&str> for LockBackend {
+    fn from(value: &str) -> Self {
+        match value {
+            "local" | "localfs" => LockBackend::Local,
+            #[cfg(feature = "dynamodb")]
+            "dynamo" | "dynamodb" => LockBackend::DynamoDB,
+            #[cfg(feature = "redis")]
+            "redis" => LockBackend::Redis,
+            "none" | "no-locks" | "false" => LockBackend::None,
+            _ => panic!("Could not parse lock-backend!"),
+        }
+    }
+}
+
+#[derive(Parser)]
+pub struct LockArgs {
+    /// Locking backend to use
+    #[clap(
+        long = "lock-backend",
+        default_value = "no-locks",
+        value_parser = clap::value_parser!(LockBackend),
+        env = "RUDOLFS_LOCK_BACKEND"
+    )]
+    lock_backend: LockBackend,
+
+    /// If the --lock-backend is set to local, the root directory of the lock
+    /// storage.
+    #[clap(
+        long = "lock-path",
+        env = "RUDOLFS_LOCK_PATH",
+        required_if_eq_any([
+            ("lock_backend", "local"),
+            ("lock_backend", "localfs"),
+        ])
+    )]
+    local_lock_path: Option<PathBuf>,
+
+    /// If the --lock-backend is set to redis, the uri to use for lock storage.
+    #[cfg(feature = "redis")]
+    #[clap(
+        long = "lock-redis-uri",
+        env = "RUDOLFS_LOCK_REDIS_URI",
+        required_if_eq("lock_backend", "redis")
+    )]
+    redis_uri: Option<String>,
+
+    /// If the --lock-backend is set to redis, the default ttl to use for
+    /// locks. FIXME: Not implemented
+    #[cfg(feature = "redis")]
+    #[clap(long = "lock-redis-ttl", env = "RUDOLFS_LOCK_REDIS_TTL")]
+    redis_ttl: Option<usize>,
+
+    /// If the --lock-backend is set to dynamodb, the table name
+    #[cfg(feature = "dynamodb")]
+    #[clap(
+        long = "lock-dynamodb-table",
+        env = "RUDOLFS_LOCK_DYNAMODB_TABLE",
+        required_if_eq("lock_backend", "dynamodb")
+    )]
+    dynamodb_table: Option<String>,
+}
+
+#[derive(Parser)]
 struct S3Args {
     /// Amazon S3 bucket to use.
-    #[structopt(long, env = "RUDOLFS_S3_BUCKET")]
+    #[clap(long, env = "RUDOLFS_S3_BUCKET")]
     bucket: String,
 
     /// Amazon S3 path prefix to use.
-    #[structopt(long, default_value = "lfs", env = "RUDOLFS_S3_PREFIX")]
+    #[clap(long, default_value = "lfs", env = "RUDOLFS_S3_PREFIX")]
     prefix: String,
 
     /// The base URL of your CDN. If specified, then all download URLs will be
     /// prefixed with this URL.
-    #[structopt(long = "cdn", env = "RUDOLFS_S3_CDN")]
+    #[clap(long = "cdn", env = "RUDOLFS_S3_CDN")]
     cdn: Option<String>,
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 struct LocalArgs {
     /// Directory where the LFS files should be stored. This directory will be
     /// created if it does not exist.
-    #[structopt(long, env = "RUDOLFS_LOCAL_PATH")]
+    #[clap(long, env = "RUDOLFS_LOCAL_PATH")]
     path: PathBuf,
 }
 
@@ -134,7 +225,21 @@ impl Args {
             logger_builder.parse_filters(&env);
         }
 
-        logger_builder.init();
+        #[cfg(feature = "otel")]
+        {
+            let exporter =
+                opentelemetry_otlp::new_exporter().tonic().with_env();
+            let pipeline = opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(exporter)
+                .install_batch(opentelemetry::runtime::Tokio)?;
+            let telemetry = tracing_opentelemetry::layer()
+                .with_tracer(pipeline)
+                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+            Registry::default().with(telemetry).init();
+        }
+
+        // logger_builder.init();
 
         // Find a socket address to bind to. This will resolve domain names.
         let addr = match self.global.host {
@@ -148,8 +253,12 @@ impl Args {
         log::info!("Initializing storage...");
 
         match self.backend {
-            Backend::S3(s3) => s3.run(addr, self.global).await?,
-            Backend::Local(local) => local.run(addr, self.global).await?,
+            Backend::S3(s3) => {
+                s3.run(addr, self.global, self.lock_args).await?
+            }
+            Backend::Local(local) => {
+                local.run(addr, self.global, self.lock_args).await?
+            }
         }
 
         Ok(())
@@ -161,9 +270,11 @@ impl S3Args {
         self,
         addr: SocketAddr,
         global_args: GlobalArgs,
+        lock: LockArgs,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = S3ServerBuilder::new(self.bucket, global_args.key);
         builder.prefix(self.prefix);
+        builder.authenticated(global_args.github_auth);
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);
@@ -177,7 +288,28 @@ impl S3Args {
             builder.cache(Cache::new(cache_dir, max_cache_size));
         }
 
-        builder.run(addr).await
+        match lock.lock_backend {
+            #[cfg(feature = "dynamodb")]
+            LockBackend::DynamoDB => {
+                let table_name = lock.dynamodb_table.clone().unwrap();
+                builder
+                    .run(addr, DynamoLs::new(table_name, None).await)
+                    .await
+            }
+            #[cfg(feature = "redis")]
+            LockBackend::Redis => {
+                let uri = lock.redis_uri.clone().unwrap();
+                let ttl = lock.redis_ttl.unwrap_or(0);
+                let locks = RedisLs::new(&uri, ttl).await?;
+                builder.run(addr, locks).await
+            }
+            LockBackend::Local => {
+                let path = lock.local_lock_path.clone().unwrap();
+                let locks = LocalLs::new(path).await?;
+                builder.run(addr, locks).await
+            }
+            LockBackend::None => builder.run(addr, NoneLs::new()).await,
+        }
     }
 }
 
@@ -186,8 +318,11 @@ impl LocalArgs {
         self,
         addr: SocketAddr,
         global_args: GlobalArgs,
+        lock: LockArgs,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = LocalServerBuilder::new(self.path, global_args.key);
+
+        builder.authenticated(global_args.github_auth);
 
         if let Some(cache_dir) = global_args.cache_dir {
             let max_cache_size = global_args
@@ -197,13 +332,34 @@ impl LocalArgs {
             builder.cache(Cache::new(cache_dir, max_cache_size));
         }
 
-        builder.run(addr).await
+        match lock.lock_backend {
+            #[cfg(feature = "dynamodb")]
+            LockBackend::DynamoDB => {
+                let table_name = lock.dynamodb_table.clone().unwrap();
+                builder
+                    .run(addr, DynamoLs::new(table_name, None).await)
+                    .await
+            }
+            #[cfg(feature = "redis")]
+            LockBackend::Redis => {
+                let uri = lock.redis_uri.clone().unwrap();
+                let ttl = lock.redis_ttl.unwrap_or(0);
+                let locks = RedisLs::new(&uri, ttl).await?;
+                builder.run(addr, locks).await
+            }
+            LockBackend::Local => {
+                let path = lock.local_lock_path.clone().unwrap();
+                let locks = LocalLs::new(path).await?;
+                builder.run(addr, locks).await
+            }
+            LockBackend::None => builder.run(addr, NoneLs::new()).await,
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let exit_code = if let Err(err) = Args::from_args().main().await {
+    let exit_code = if let Err(err) = Args::parse().main().await {
         log::error!("{}", err);
         1
     } else {

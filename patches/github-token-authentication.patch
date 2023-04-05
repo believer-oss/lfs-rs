@@ -1,0 +1,320 @@
+From 3ed2b40967474b9ca14ab6e942259cc8d8c4a443 Mon Sep 17 00:00:00 2001
+From: js6pak <kubastaron@hotmail.com>
+Date: Mon, 12 Sep 2022 00:15:47 +0200
+Subject: [PATCH] Add very simple github auth
+
+---
+ Cargo.lock | 108 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ Cargo.toml |   1 +
+ src/app.rs |  82 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 189 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f38029a..012c88f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -415,6 +415,21 @@ version = "1.0.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+ 
++[[package]]
++name = "foreign-types"
++version = "0.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
++dependencies = [
++ "foreign-types-shared",
++]
++
++[[package]]
++name = "foreign-types-shared"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
++
+ [[package]]
+ name = "form_urlencoded"
+ version = "1.0.1"
+@@ -708,6 +723,19 @@ dependencies = [
+  "webpki",
+ ]
+ 
++[[package]]
++name = "hyper-tls"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d6183ddfa99b85da61a140bea0efc93fdf56ceaa041b37d553518030827f9905"
++dependencies = [
++ "bytes",
++ "hyper",
++ "native-tls",
++ "tokio",
++ "tokio-native-tls",
++]
++
+ [[package]]
+ name = "idna"
+ version = "0.2.3"
+@@ -849,6 +877,24 @@ dependencies = [
+  "windows-sys",
+ ]
+ 
++[[package]]
++name = "native-tls"
++version = "0.2.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fd7e2f3618557f980e0b17e8856252eee3c97fa12c54dff0ca290fb6266ca4a9"
++dependencies = [
++ "lazy_static",
++ "libc",
++ "log",
++ "openssl",
++ "openssl-probe",
++ "openssl-sys",
++ "schannel",
++ "security-framework",
++ "security-framework-sys",
++ "tempfile",
++]
++
+ [[package]]
+ name = "nom"
+ version = "6.2.1"
+@@ -903,12 +949,51 @@ version = "0.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "624a8340c38c1b80fd549087862da4ba43e08858af025b236e509b6649fc13d5"
+ 
++[[package]]
++name = "openssl"
++version = "0.10.41"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "618febf65336490dfcf20b73f885f5651a0c89c64c2d4a8c3662585a70bf5bd0"
++dependencies = [
++ "bitflags",
++ "cfg-if",
++ "foreign-types",
++ "libc",
++ "once_cell",
++ "openssl-macros",
++ "openssl-sys",
++]
++
++[[package]]
++name = "openssl-macros"
++version = "0.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b501e44f11665960c7e7fcf062c7d96a14ade4aa98116c004b2e37b5be7d736c"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
+ [[package]]
+ name = "openssl-probe"
+ version = "0.1.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ff011a302c396a5197692431fc1948019154afc178baf7d8e37367442a4601cf"
+ 
++[[package]]
++name = "openssl-sys"
++version = "0.9.75"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e5f9bd0c2710541a3cda73d6f9ac4f1b240de4ae261065d309dbe73d9dceb42f"
++dependencies = [
++ "autocfg",
++ "cc",
++ "libc",
++ "pkg-config",
++ "vcpkg",
++]
++
+ [[package]]
+ name = "os_pipe"
+ version = "0.9.2"
+@@ -980,6 +1065,12 @@ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+ 
++[[package]]
++name = "pkg-config"
++version = "0.3.25"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1df8c4ec4b0627e53bdf214615ad287367e482558cf84b109250b37464dc03ae"
++
+ [[package]]
+ name = "ppv-lite86"
+ version = "0.2.16"
+@@ -1168,6 +1259,7 @@ dependencies = [
+  "humansize",
+  "humantime 2.1.0",
+  "hyper",
++ "hyper-tls",
+  "linked-hash-map",
+  "log",
+  "pretty_env_logger",
+@@ -1789,6 +1881,16 @@ dependencies = [
+  "syn",
+ ]
+ 
++[[package]]
++name = "tokio-native-tls"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f7d995660bd2b7f8c1568414c1126076c13fbb725c40112dc0120b78eb9b717b"
++dependencies = [
++ "native-tls",
++ "tokio",
++]
++
+ [[package]]
+ name = "tokio-rustls"
+ version = "0.22.0"
+@@ -1937,6 +2039,12 @@ dependencies = [
+  "getrandom",
+ ]
+ 
++[[package]]
++name = "vcpkg"
++version = "0.2.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
++
+ [[package]]
+ name = "vec_map"
+ version = "0.8.2"
+diff --git a/Cargo.toml b/Cargo.toml
+index c5b5407..e87ad18 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -30,6 +30,7 @@ human-size = "0.4"
+ humansize = "1"
+ humantime = "2"
+ hyper = { version = "0.14", features = ["server", "http1", "http2", "tcp", "stream"] }
++hyper-tls = "0.5.0"
+ linked-hash-map = { version = "0.5", features = ["serde_impl"] }
+ log = "0.4"
+ pretty_env_logger = "0.4"
+diff --git a/src/app.rs b/src/app.rs
+index c881d5e..2cd5a1e 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -27,13 +27,18 @@ use futures::{
+     future::{self, BoxFuture},
+     stream::TryStreamExt,
+ };
+-use http::{self, header, StatusCode, Uri};
+-use hyper::{self, body::Body, service::Service, Method, Request, Response};
++use http::{self, header, HeaderMap, StatusCode, Uri};
++use hyper::{
++    self, body::Body, body::Buf, service::Service, Client, Method, Request,
++    Response,
++};
++use hyper_tls::HttpsConnector;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::error::Error;
+ use crate::hyperext::RequestExt;
+ use crate::lfs;
++use crate::lfs::Operation;
+ use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
+ use std::time::Duration;
+ 
+@@ -78,6 +83,24 @@ impl<S> App<S> {
+     }
+ }
+ 
++#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
++struct Repository {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub permissions: Option<Permissions>,
++}
++
++#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
++struct Permissions {
++    #[serde(default)]
++    pub admin: bool,
++    pub push: bool,
++    pub pull: bool,
++    #[serde(default)]
++    pub triage: bool,
++    #[serde(default)]
++    pub maintain: bool,
++}
++
+ impl<S> App<S>
+ where
+     S: Storage + Send + Sync,
+@@ -237,6 +260,41 @@ where
+             .body(Body::empty())?)
+     }
+ 
++    async fn authorize(
++        headers: &HeaderMap,
++        namespace: &Namespace,
++    ) -> Result<Option<Permissions>, Error> {
++        if let Some(auth) = headers.get(header::AUTHORIZATION) {
++            let client = Client::builder().build(HttpsConnector::new());
++
++            let req = Request::get(format!(
++                "https://api.github.com/repos/{}/{}",
++                namespace.org(),
++                namespace.project()
++            ))
++            .header(header::ACCEPT, "application/vnd.github+json")
++            .header(header::AUTHORIZATION, auth)
++            .header(header::USER_AGENT, "rudolfs")
++            .body(Body::empty())?;
++
++            let res = client.request(req).await?;
++
++            if res.status() == StatusCode::OK {
++                let body = hyper::body::aggregate(res).await?;
++                let repository: Repository =
++                    serde_json::from_reader(body.reader())?;
++
++                if let Some(permissions) = repository.permissions {
++                    if permissions.pull || permissions.push {
++                        return Ok(Some(permissions));
++                    }
++                }
++            }
++        }
++
++        Ok(None)
++    }
++
+     /// Batch API endpoint for the Git LFS server spec.
+     ///
+     /// See also:
+@@ -249,10 +307,30 @@ where
+         // Get the host name and scheme.
+         let uri = req.base_uri().path_and_query("/").build().unwrap();
+ 
++        let permissions = Self::authorize(req.headers(), &namespace).await?;
++
+         match from_json::<lfs::BatchRequest>(req.into_body()).await {
+             Ok(val) => {
+                 let operation = val.operation;
+ 
++                let is_unauthorized = permissions == None;
++                if is_unauthorized || {
++                    let permissions = permissions.unwrap();
++                    match operation {
++                        Operation::Download => !permissions.pull,
++                        Operation::Upload => !permissions.push,
++                    }
++                } {
++                    return Ok(Response::builder()
++                        .status(if is_unauthorized {
++                            StatusCode::UNAUTHORIZED
++                        } else {
++                            StatusCode::FORBIDDEN
++                        })
++                        .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
++                        .body(Body::empty())?);
++                }
++
+                 // For each object, check if it exists in the storage
+                 // backend.
+                 let objects = val.objects.into_iter().map(|object| {

@@ -1,0 +1,105 @@
+From dbe4fcfcfc82db7ca7ba903f9b14378cfaf051da Mon Sep 17 00:00:00 2001
+From: Steven Chan <stevenchan@oursky.com>
+Date: Fri, 21 Jun 2019 12:17:05 +0800
+Subject: [PATCH] Update api handler to pass authorization header to action
+
+---
+ src/app.rs | 34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/app.rs b/src/app.rs
+index bd695d8..2f76b6f 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -17,6 +17,7 @@
+ // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ // SOFTWARE.
++use std::collections::BTreeMap;
+ use std::fmt;
+ use std::io;
+ use std::sync::Arc;
+@@ -27,7 +28,7 @@ use futures::{
+     Future, IntoFuture, Stream,
+ };
+ use http::{self, header, StatusCode, Uri};
+-use hyper::{self, service::Service, Chunk, Method, Request, Response};
++use hyper::{self, service::Service, Chunk, Method, Request, Response, HeaderMap};
+ 
+ use crate::error::Error;
+ use crate::hyperext::{into_request, Body, IntoResponse, RequestExt};
+@@ -271,6 +272,7 @@ where
+     ) -> impl Future<Item = Response<Body>, Error = Error> {
+         // Get the host name and scheme.
+         let uri = req.base_uri().path_and_query("/").build().unwrap();
++        let auth = auth_header(req.headers());
+ 
+         let state = self.state.clone();
+ 
+@@ -285,6 +287,7 @@ where
+                         let objects =
+                             val.objects.into_iter().map(move |object| {
+                                 let uri = uri.clone();
++                                let auth = auth.clone();
+ 
+                                 let key = StorageKey::new(
+                                     namespace.clone(),
+@@ -294,7 +297,7 @@ where
+                                 state.storage.size(&key).then(move |size| {
+                                     let (namespace, _) = key.into_parts();
+                                     Ok(basic_response(
+-                                        uri, object, operation, size, namespace,
++                                        uri, auth, object, operation, size, namespace,
+                                     ))
+                                 })
+                             });
+@@ -340,8 +343,31 @@ where
+     }
+ }
+ 
++fn auth_header(
++    headers: &HeaderMap,
++) -> Option<String> {
++    if let Some(value) = headers.get("authorization") {
++        return Some(value.to_str().unwrap().to_string());
++    } else {
++        return None;
++    }
++}
++
++fn header_with_auth(
++    auth: Option<String>,
++) -> Option<BTreeMap<String, String>> {
++    if let Some(auth_value) = auth {
++        let mut map = BTreeMap::new();
++        map.insert("Authorization".to_string(), auth_value);
++        return Some(map);
++    } else {
++        return None;
++    }
++}
++
+ fn basic_response<E>(
+     uri: Uri,
++    auth: Option<String>,
+     object: lfs::RequestObject,
+     op: lfs::Operation,
+     size: Result<Option<u64>, E>,
+@@ -397,7 +423,7 @@ where
+ 
+     let action = lfs::Action {
+         href,
+-        header: None,
++        header: header_with_auth(auth.clone()),
+         expires_in: None,
+         expires_at: None,
+     };
+@@ -429,7 +455,7 @@ where
+                                 "{}api/{}/objects/verify",
+                                 uri, namespace
+                             ),
+-                            header: None,
++                            header: header_with_auth(auth.clone()),
+                             expires_in: None,
+                             expires_at: None,
+                         }),

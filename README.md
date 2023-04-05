@@ -1,34 +1,29 @@
-# Rudo*lfs*
-
-[![Cirrus CI - Specific Branch Build Status](https://img.shields.io/cirrus/github/jasonwhite/rudolfs/master?style=for-the-badge)](https://cirrus-ci.com/github/jasonwhite/rudolfs)
-[![Crates.io](https://img.shields.io/crates/v/rudolfs?style=for-the-badge)](https://crates.io/crates/rudolfs)
-[![AUR version](https://img.shields.io/aur/version/rudolfs?style=for-the-badge)](https://aur.archlinux.org/packages/rudolfs/)
-[![Docker Image Version (latest semver)](https://img.shields.io/docker/v/jasonwhite0/rudolfs?label=Docker&sort=semver&style=for-the-badge)](https://hub.docker.com/r/jasonwhite0/rudolfs)
-[![Docker Image Size (latest semver)](https://img.shields.io/docker/image-size/jasonwhite0/rudolfs?sort=semver&style=for-the-badge)](https://hub.docker.com/r/jasonwhite0/rudolfs)
+# lfs-rs
 
 A high-performance, caching Git LFS server with an AWS S3 back-end.
 
 ## Features
 
- - Multiple backends:
+- Multiple backends:
 
-   1. AWS S3 backend with an optional local disk cache.
-   2. Local disk backend.
+    1. AWS S3 backend with an optional local disk cache.
+    2. Local disk backend.
 
- - A configurable local disk cache to speed up downloads (and reduce your
-   S3 bill).
+- A configurable local disk cache to speed up downloads (and reduce your
+  S3 bill).
 
- - Corruption-resilient local disk cache. Even if the disk is getting
-   blasted by cosmic rays, it'll find corrupted LFS objects and purge them from
-   the cache transparently. The client should never notice this happening.
+- Corruption-resilient local disk cache. Even if the disk is getting
+  blasted by cosmic rays, it'll find corrupted LFS objects and purge them from
+  the cache transparently. The client should never notice this happening.
 
- - Encryption of LFS objects in both the cache and in permanent storage.
+- Encryption of LFS objects in both the cache and in permanent storage.
+  (Optional)
 
- - Separation of GitHub organizations and projects. Just specify the org and
-   project names in the URL and they are automatically created. If two projects
-   share many LFS objects, have them use the same URL to save on storage space.
+- Separation of GitHub organizations and projects. Just specify the org and
+  project names in the URL and they are automatically created. If two projects
+  share many LFS objects, have them use the same URL to save on storage space.
 
- - A tiny (&lt;10MB) Docker image ([jasonwhite0/rudolfs][]).
+- A tiny (&lt;10MB) Docker image ([jasonwhite0/rudolfs][]).
 
 [jasonwhite0/rudolfs]: https://hub.docker.com/r/jasonwhite0/rudolfs
 
@@ -38,30 +33,32 @@ know by submitting an issue.
 
 ## Non-Features
 
- - There is no client authentication. This is meant to be run in an internal
-   network with clients you trust, not on the internet with malicious actors.
+- There is no client authentication. This is meant to be run in an internal
+  network with clients you trust, not on the internet with malicious actors.
 
 ## Running It
 
-### Generate an encryption key
+### Generate an encryption key (optional)
 
-All LFS objects are encrypted with the xchacha20 symmetric stream cipher. You
-must generate a 32-byte encryption key before starting the server.
+If configured, all LFS objects are encrypted with the xchacha20 symmetric stream
+cipher. You must generate a 32-byte encryption key before starting the server.
 
 Generating a random key is easy:
 
     openssl rand -hex 32
 
 Keep this secret and save it in a password manager so you don't lose it. We will
-pass this to the server below.
+pass this to the server below via the `--key` option. If the `--key` option is
+**not** specified, then the LFS objects are **not** encrypted.
 
 **Note**:
- - If the key ever changes, all existing LFS objects will become garbage.
-   When the Git LFS client attempts to download them, the SHA256 verification
-   step will fail.
- - LFS objects in both the cache and in permanent storage are encrypted.
-   However, objects are decrypted before being sent to the LFS client, so take
-   any necessary precautions to keep your intellectual property safe.
+
+- If the key ever changes (or if encryption is disabled), all existing LFS
+  objects will become garbage. When the Git LFS client attempts to download
+  them, the SHA256 verification step will fail.
+- LFS objects in both the cache and in permanent storage are encrypted.
+  However, objects are decrypted before being sent to the LFS client, so take
+  any necessary precautions to keep your intellectual property safe.
 
 ### Development
 
@@ -103,33 +100,34 @@ information.
 
 To run in a production environment, it is easiest to use `docker-compose`:
 
- 1. Create a `.env` file next to `docker-compose.yml` with the configuration
-    variables:
+1. Create a `.env` file next to `docker-compose.yml` with the configuration
+   variables:
 
-    ```
-    AWS_ACCESS_KEY_ID=XXXXXXXXXXXXXXXXXXXQ
-    AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-    AWS_DEFAULT_REGION=us-west-1
-    LFS_ENCRYPTION_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    LFS_S3_BUCKET=my-bucket
-    LFS_MAX_CACHE_SIZE=10GB
-    ```
+   ```
+   AWS_ACCESS_KEY_ID=XXXXXXXXXXXXXXXXXXXQ
+   AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+   AWS_DEFAULT_REGION=us-west-1
+   LFS_ENCRYPTION_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   LFS_S3_BUCKET=my-bucket
+   LFS_MAX_CACHE_SIZE=10GB
+   ```
 
- 2. Use the provided `docker-compose.yml` file to run a production environment:
+2. Use the provided `docker-compose.yml` file to run a production environment:
 
-    ```bash
-    docker-compose up -d
-    ```
+   ```bash
+   docker-compose up -d
+   ```
 
- 3. **[Optional]**: It is best to use nginx as a reverse proxy for this server.
-    Use it to enable TLS. How to configure this is better covered by other
-    tutorials on the internet.
+3. **[Optional]**: It is best to use nginx as a reverse proxy for this server.
+   Use it to enable TLS. How to configure this is better covered by other
+   tutorials on the internet.
 
 **Note**:
- - A bigger cache is (almost) always better. Try to use ~85% of the available
-   disk space.
- - The cache data is stored in a Docker volume named `rudolfs_data`. If you
-   want to delete it, run `docker volume rm rudolfs_data`.
+
+- A bigger cache is (almost) always better. Try to use ~85% of the available
+  disk space.
+- The cache data is stored in a Docker volume named `rudolfs_data`. If you
+  want to delete it, run `docker volume rm rudolfs_data`.
 
 ## AWS Credentials
 
@@ -138,10 +136,10 @@ the S3 bucket specified on the command line (with `--s3-bucket`).
 
 Your AWS credentials will be searched for in the following order:
 
- 1. Environment variables: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
- 2. AWS credentials file. Usually located at `~/.aws/credentials`.
- 3. IAM instance profile. Will only work if running on an EC2 instance with an
-    instance profile/role.
+1. Environment variables: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+2. AWS credentials file. Usually located at `~/.aws/credentials`.
+3. IAM instance profile. Will only work if running on an EC2 instance with an
+   instance profile/role.
 
 The AWS region is read from the `AWS_DEFAULT_REGION` or `AWS_REGION` environment
 variable. If it is malformed, it will fall back to `us-east-1`. If it is not
@@ -181,6 +179,13 @@ git config --global lfs.storage ~/.cache/lfs
 
 ## Thanks
 
+This repository started out as a private fork of [rudolfs](https://github.com/jasonwhite/rudolfs) by Jason White. We've
+made a handful of changes and feature additions to increase compatibility with Unreal Engine projects, but we wanted to
+give special thanks to Jason. The "thanks" from his original README is included below:
+
+```
 This was developed at [Environmental Systems Research
 Institute](http://www.esri.com/) (Esri) who have graciously allowed me to retain
 the copyright and publish it as open source software.
+```
+

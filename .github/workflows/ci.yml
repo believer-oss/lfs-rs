@@ -2,6 +2,9 @@ name: ci
 
 on:
   push:
+    branches:
+      - believer
+      - believer-next
   pull_request:
 
 jobs:
@@ -78,58 +81,58 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  publish_crate:
-    name: Publish Crate
-    # Don't publish unless all the checks pass.
-    needs: [check, test, clippy, rustfmt]
-    # Only publish for tags
-    if: ${{ startsWith(github.event.ref, 'refs/tags/') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v1
+#  publish_crate:
+#    name: Publish Crate
+#    # Don't publish unless all the checks pass.
+#    needs: [check, test, clippy, rustfmt]
+#    # Only publish for tags
+#    if: ${{ startsWith(github.event.ref, 'refs/tags/') }}
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Checkout sources
+#        uses: actions/checkout@v1
+#
+#      - name: cargo login
+#        uses: actions-rs/cargo@v1
+#        with:
+#          command: login
+#          args: ${{ secrets.CARGO_TOKEN }}
+#
+#      - name: publish
+#        run: cargo publish --no-verify
 
-      - name: cargo login
-        uses: actions-rs/cargo@v1
-        with:
-          command: login
-          args: ${{ secrets.CARGO_TOKEN }}
-
-      - name: publish
-        run: cargo publish --no-verify
-
-  docker:
-    name: Push Docker Image
-    needs: [check, test]
-    runs-on: ubuntu-latest
-    steps:
-      -
-        name: Checkout sources
-        uses: actions/checkout@v2
-      -
-        name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v3
-        with:
-          images: jasonwhite0/rudolfs
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-      -
-        name: Login to DockerHub
-        if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      -
-        name: Build and push
-        uses: docker/build-push-action@v2
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+#  docker:
+#    name: Push Docker Image
+#    needs: [check, test]
+#    runs-on: ubuntu-latest
+#    steps:
+#      -
+#        name: Checkout sources
+#        uses: actions/checkout@v2
+#      -
+#        name: Docker meta
+#        id: meta
+#        uses: docker/metadata-action@v3
+#        with:
+#          images: jasonwhite0/rudolfs
+#          tags: |
+#            type=ref,event=branch
+#            type=ref,event=pr
+#            type=semver,pattern={{version}}
+#      -
+#        name: Login to DockerHub
+#        if: ${{ github.event_name != 'pull_request' }}
+#        uses: docker/login-action@v1
+#        with:
+#          username: ${{ secrets.DOCKERHUB_USERNAME }}
+#          password: ${{ secrets.DOCKERHUB_TOKEN }}
+#      -
+#        name: Build and push
+#        uses: docker/build-push-action@v2
+#        with:
+#          context: .
+#          push: ${{ github.event_name != 'pull_request' }}
+#          tags: ${{ steps.meta.outputs.tags }}
+#          labels: ${{ steps.meta.outputs.labels }}
 
 

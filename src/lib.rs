@@ -20,31 +20,45 @@
 #![deny(clippy::all)]
 
 mod app;
+mod auth;
 mod error;
 mod hyperext;
 mod lfs;
+mod locks;
 mod logger;
 mod lru;
 mod sha256;
 mod storage;
 mod util;
 
+use parking_lot::RwLock;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::future::{self, Future, TryFutureExt};
+use auth::Auth;
+use futures::future::{self, Either, Future, TryFutureExt};
 use hyper::{
     self,
     server::conn::{AddrIncoming, AddrStream},
     service::make_service_fn,
 };
+use linked_hash_map::LinkedHashMap;
 
 use crate::app::App;
 use crate::error::Error;
+#[cfg(feature = "dynamodb")]
+pub use crate::locks::DynamoLs;
+#[cfg(feature = "redis")]
+pub use crate::locks::RedisLs;
+pub use crate::locks::{
+    CreateLockBatchRequest, LocalLs, LockBatch, LockBatchOuter, LockFailure,
+    LockStorage, NoneLs, ReleaseLockBatchRequest,
+};
 use crate::logger::Logger;
 use crate::storage::{Cached, Disk, Encrypted, Retrying, Storage, Verify, S3};
+pub use crate::util::{from_json, into_json};
 
 #[cfg(feature = "faulty")]
 use crate::storage::Faulty;
@@ -82,20 +96,24 @@ impl Cache {
 #[derive(Debug)]
 pub struct S3ServerBuilder {
     bucket: String,
-    key: [u8; 32],
+    key: Option<[u8; 32]>,
     prefix: Option<String>,
     cdn: Option<String>,
     cache: Option<Cache>,
+    authenticated: bool,
+    authentication_server: Option<String>,
 }
 
 impl S3ServerBuilder {
-    pub fn new(bucket: String, key: [u8; 32]) -> Self {
+    pub fn new(bucket: String, key: Option<[u8; 32]>) -> Self {
         Self {
             bucket,
             prefix: None,
             cdn: None,
             key,
             cache: None,
+            authenticated: false,
+            authentication_server: None,
         }
     }
 
@@ -106,7 +124,7 @@ impl S3ServerBuilder {
     }
 
     /// Sets the encryption key to use.
-    pub fn key(&mut self, key: [u8; 32]) -> &mut Self {
+    pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
         self
     }
@@ -131,11 +149,27 @@ impl S3ServerBuilder {
         self
     }
 
+    /// Sets the flag to perform authentication on endpoints
+    pub fn authenticated(&mut self, authenticated: bool) -> &mut Self {
+        self.authenticated = authenticated;
+        self
+    }
+
+    /// This is used only by tests.
+    pub fn authentication_server(
+        &mut self,
+        authentication_server: String,
+    ) -> &mut Self {
+        self.authentication_server = Some(authentication_server);
+        self
+    }
+
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
     pub async fn spawn(
         mut self,
         addr: SocketAddr,
+        locks: impl LockStorage + Send + Sync + 'static,
     ) -> Result<Box<dyn Server + Unpin + Send>, Box<dyn std::error::Error>>
     {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
@@ -174,12 +208,37 @@ impl S3ServerBuilder {
                 let disk = Faulty::new(disk);
 
                 let cache = Cached::new(cache.max_size, disk, s3).await?;
-                let storage = Verify::new(Encrypted::new(self.key, cache));
-                Ok(Box::new(spawn_server(storage, &addr)))
+                let storage = Verify::new(match self.key {
+                    Some(key) => {
+                        Either::Left(Verify::new(Encrypted::new(key, cache)))
+                    }
+                    None => {
+                        log::warn!("Not encrypting cache");
+                        Either::Right(Verify::new(cache))
+                    }
+                });
+                Ok(Box::new(spawn_server(
+                    storage,
+                    locks,
+                    &addr,
+                    self.authenticated,
+                    self.authentication_server,
+                )))
             }
             None => {
-                let storage = Verify::new(Encrypted::new(self.key, s3));
-                Ok(Box::new(spawn_server(storage, &addr)))
+                let storage = Verify::new(match self.key {
+                    Some(key) => {
+                        Either::Left(Verify::new(Encrypted::new(key, s3)))
+                    }
+                    None => Either::Right(Verify::new(s3)),
+                });
+                Ok(Box::new(spawn_server(
+                    storage,
+                    locks,
+                    &addr,
+                    self.authenticated,
+                    self.authentication_server,
+                )))
             }
         }
     }
@@ -189,8 +248,9 @@ impl S3ServerBuilder {
     pub async fn run(
         self,
         addr: SocketAddr,
+        lock: impl LockStorage + Send + Sync + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let server = self.spawn(addr).await?;
+        let server = self.spawn(addr, lock).await?;
 
         log::info!("Listening on {}", server.addr());
 
@@ -202,23 +262,27 @@ impl S3ServerBuilder {
 #[derive(Debug)]
 pub struct LocalServerBuilder {
     path: PathBuf,
-    key: [u8; 32],
+    key: Option<[u8; 32]>,
     cache: Option<Cache>,
+    authenticated: bool,
+    authentication_server: Option<String>,
 }
 
 impl LocalServerBuilder {
     /// Creates a local server builder. `path` is the path to the folder where
     /// all of the LFS data will be stored.
-    pub fn new(path: PathBuf, key: [u8; 32]) -> Self {
+    pub fn new(path: PathBuf, key: Option<[u8; 32]>) -> Self {
         Self {
             path,
             key,
             cache: None,
+            authenticated: false,
+            authentication_server: None,
         }
     }
 
     /// Sets the encryption key to use.
-    pub fn key(&mut self, key: [u8; 32]) -> &mut Self {
+    pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
         self
     }
@@ -233,18 +297,48 @@ impl LocalServerBuilder {
         self
     }
 
+    /// Sets the flag to perform authentication on endpoints
+    pub fn authenticated(&mut self, authenticated: bool) -> &mut Self {
+        self.authenticated = authenticated;
+        self
+    }
+
+    /// This is used only by tests.
+    pub fn authentication_server(
+        &mut self,
+        authentication_server: String,
+    ) -> &mut Self {
+        self.authentication_server = Some(authentication_server);
+        self
+    }
+
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
     pub async fn spawn(
         self,
         addr: SocketAddr,
+        locks: impl LockStorage + Send + Sync + 'static,
     ) -> Result<impl Server, Box<dyn std::error::Error>> {
         let storage = Disk::new(self.path).map_err(Error::from).await?;
-        let storage = Verify::new(Encrypted::new(self.key, storage));
+        let storage = Verify::new(match self.key {
+            Some(key) => {
+                Either::Left(Verify::new(Encrypted::new(key, storage)))
+            }
+            None => {
+                log::warn!("Not encrypting cache");
+                Either::Right(Verify::new(storage))
+            }
+        });
 
         log::info!("Local disk storage initialized.");
 
-        Ok(spawn_server(storage, &addr))
+        Ok(spawn_server(
+            storage,
+            locks,
+            &addr,
+            self.authenticated,
+            self.authentication_server,
+        ))
     }
 
     /// Spawns the server and runs it to completion. This will run forever
@@ -252,8 +346,9 @@ impl LocalServerBuilder {
     pub async fn run(
         self,
         addr: SocketAddr,
+        locks: impl LockStorage + Send + Sync + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let server = self.spawn(addr).await?;
+        let server = self.spawn(addr, locks).await?;
 
         log::info!("Listening on {}", server.addr());
 
@@ -262,20 +357,39 @@ impl LocalServerBuilder {
     }
 }
 
-fn spawn_server<S>(storage: S, addr: &SocketAddr) -> impl Server
+fn spawn_server<S, L>(
+    storage: S,
+    locks: L,
+    addr: &SocketAddr,
+    authenticated: bool,
+    authentication_server: Option<String>,
+) -> impl Server
 where
     S: Storage + Send + Sync + 'static,
     S::Error: Into<Error>,
+    L: LockStorage + Send + Sync + 'static,
     Error: From<S::Error>,
 {
     let storage = Arc::new(storage);
+    let locks = Arc::new(locks);
+    let cache = Arc::new(RwLock::new(LinkedHashMap::new()));
 
     let new_service = make_service_fn(move |socket: &AddrStream| {
         // Create our app.
-        let service = App::new(storage.clone());
+        let service = App::new(storage.clone(), locks.clone());
+        let cache = Arc::clone(&cache);
+
+        // Wrap the app in an auth middleware. If not authenticated, wrapper
+        // acts as a passthrough service.
+        let auth = Auth::new(
+            service,
+            cache,
+            authenticated,
+            authentication_server.clone(),
+        );
 
         // Add logging middleware
-        future::ok::<_, Infallible>(Logger::new(socket.remote_addr(), service))
+        future::ok::<_, Infallible>(Logger::new(socket.remote_addr(), auth))
     });
 
     hyper::Server::bind(addr).serve(new_service)

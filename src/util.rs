@@ -18,10 +18,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use crate::error::Error;
 use core::mem;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use futures::TryStreamExt;
+use hyper::body::Body;
+use serde::Deserialize;
+use serde::Serialize;
 
 use std::path::{Path, PathBuf};
 
@@ -155,4 +160,25 @@ impl AsyncWrite for NamedTempFile {
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.file).poll_shutdown(cx)
     }
+}
+
+pub async fn from_json<T>(mut body: Body) -> Result<T, Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut buf = Vec::new();
+
+    while let Some(chunk) = body.try_next().await? {
+        buf.extend(chunk);
+    }
+
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+pub fn into_json<T>(value: &T) -> Result<Body, Error>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec_pretty(value)?;
+    Ok(bytes.into())
 }

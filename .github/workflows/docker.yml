@@ -1,0 +1,27 @@
+name: docker
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: lfs-rs
+
+jobs:
+  docker:
+    name: Docker Build and Push
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Log in to registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+
+      - name: Build, tag, and push image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t ghcr.io/believerco/$IMAGE_NAME:$IMAGE_TAG .
+          docker push ghcr.io/believerco/$IMAGE_NAME:$IMAGE_TAG

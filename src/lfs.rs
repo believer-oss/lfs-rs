@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sha256::Sha256;
+use crate::{locks::Lock, sha256::Sha256};
 
 pub type Oid = Sha256;
 
@@ -175,6 +175,10 @@ pub struct BatchResponse {
 /// An error response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BatchResponseError {
+    /// Optional locks if a create conflict has occurred
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locks: Option<Lock>,
+
     /// The error message.
     pub message: String,
 
