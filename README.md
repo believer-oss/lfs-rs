@@ -1,6 +1,6 @@
 # lfs-rs
 
-A high-performance, caching Git LFS server with an AWS S3 back-end.
+A high-performance, caching Git LFS server with an AWS S3 backend.
 
 ## Features
 
@@ -23,9 +23,7 @@ A high-performance, caching Git LFS server with an AWS S3 back-end.
   project names in the URL and they are automatically created. If two projects
   share many LFS objects, have them use the same URL to save on storage space.
 
-- A tiny (&lt;10MB) Docker image ([jasonwhite0/rudolfs][]).
-
-[jasonwhite0/rudolfs]: https://hub.docker.com/r/jasonwhite0/rudolfs
+- Lock support via a DynamoDB-based backend.
 
 The back-end storage code is very modular and composable. PRs for implementing
 other storage back-ends are welcome. If you begin working on this, please let us
