@@ -3,8 +3,7 @@ name: ci
 on:
   push:
     branches:
-      - believer
-      - believer-next
+      - main
   pull_request:
 
 jobs:
