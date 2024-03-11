@@ -23,5 +23,5 @@ jobs:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t ghcr.io/believerco/$IMAGE_NAME:$IMAGE_TAG .
-          docker push ghcr.io/believerco/$IMAGE_NAME:$IMAGE_TAG
+          docker build -t ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG .
+          docker push ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG
