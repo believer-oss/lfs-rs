@@ -1,5 +1,7 @@
-// mod common;
+// Some code in here is used in tests that aren't always built/run
+#![allow(dead_code)]
 
+// mod common;
 use base64::Engine;
 use duct::cmd;
 use futures::future::Either;
