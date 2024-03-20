@@ -81,7 +81,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
 
     let locks =
-        rudolfs::DynamoLs::new(creds.table.clone(), Some(&creds.endpoint_url))
+        lfs_rs::DynamoLs::new(creds.table.clone(), Some(&creds.endpoint_url))
             .await;
     GitRepo::setup_dynamodb_table(&creds.table, &creds.endpoint_url).await?;
 

@@ -42,10 +42,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use futures::future::Either;
+use lfs_rs::S3ServerBuilder;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rudolfs::S3ServerBuilder;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -91,7 +91,7 @@ async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = S3ServerBuilder::new(creds.bucket, key);
     server.prefix("test_lfs".into());
 
-    let locks = rudolfs::NoneLs::new();
+    let locks = lfs_rs::NoneLs::new();
 
     let server = server
         .spawn(SocketAddr::from(([0, 0, 0, 0], 0)), locks)

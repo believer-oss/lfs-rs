@@ -23,10 +23,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use futures::future::Either;
+use lfs_rs::{LocalServerBuilder, Server};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rudolfs::{LocalServerBuilder, Server};
 use tokio::sync::oneshot;
 
 use common::{init_logger, GitRepo};
@@ -42,7 +42,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let data = tempfile::TempDir::new()?;
     let key = rng.gen();
 
-    let locks = rudolfs::NoneLs::new();
+    let locks = lfs_rs::NoneLs::new();
 
     let server = LocalServerBuilder::new(data.path().into(), key);
     let server = server

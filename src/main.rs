@@ -23,15 +23,15 @@ use std::path::PathBuf;
 use clap::Parser;
 use hex::FromHex;
 
-use rudolfs::{Cache, LocalServerBuilder, S3ServerBuilder};
-use rudolfs::{LocalLs, NoneLs};
+use lfs_rs::{Cache, LocalServerBuilder, S3ServerBuilder};
+use lfs_rs::{LocalLs, NoneLs};
 
+#[cfg(feature = "dynamodb")]
+use lfs_rs::DynamoLs;
+#[cfg(feature = "redis")]
+use lfs_rs::RedisLs;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
-#[cfg(feature = "dynamodb")]
-use rudolfs::DynamoLs;
-#[cfg(feature = "redis")]
-use rudolfs::RedisLs;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{prelude::*, Registry};
 

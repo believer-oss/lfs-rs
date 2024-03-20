@@ -26,7 +26,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let lock_data = tempfile::TempDir::new()?;
     let lock_data_file = lock_data.path().join("locking.json");
-    let locks = rudolfs::LocalLs::new(lock_data_file).await?;
+    let locks = lfs_rs::LocalLs::new(lock_data_file).await?;
 
     common::smoke_test(locks, Some(startup_span)).await
 }

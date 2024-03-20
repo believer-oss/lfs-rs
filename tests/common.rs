@@ -5,13 +5,13 @@
 use base64::Engine;
 use duct::cmd;
 use futures::future::Either;
-use rand::rngs::StdRng;
-use rand::Rng;
-use rand::SeedableRng;
-use rudolfs::{
+use lfs_rs::{
     into_json, CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter,
     LockStorage, ReleaseLockBatchRequest, Server,
 };
+use rand::rngs::StdRng;
+use rand::Rng;
+use rand::SeedableRng;
 use std::fs::{self, File};
 use std::io;
 use std::io::ErrorKind;
