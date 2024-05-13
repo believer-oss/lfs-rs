@@ -28,8 +28,8 @@ RUN cargo build --release
 
 RUN \
 	mkdir -p /build && \
-	cp target/${CARGO_BUILD_TARGET}/release/rudolfs /build/ && \
-	strip /build/rudolfs
+	cp target/${CARGO_BUILD_TARGET}/release/lfs-rs /build/ && \
+	strip /build/lfs-rs
 
 # Use scratch so we can get an itty-bitty-teeny-tiny image. This requires us to
 # use musl when building the application.
@@ -44,5 +44,5 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 
 COPY --from=build /build/ /
 
-ENTRYPOINT ["/tini", "--", "/rudolfs"]
+ENTRYPOINT ["/tini", "--", "/lfs-rs"]
 CMD ["--cache-dir", "/data"]
