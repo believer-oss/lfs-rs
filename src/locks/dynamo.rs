@@ -423,12 +423,17 @@ impl LockStorage for DynamoLockStore {
             .projection_expression("id, #path, locked_at, #owner")
             .expression_attribute_names("#path", "path")
             .expression_attribute_names("#owner", "owner")
-            .expression_attribute_values(":repo", AttributeValue::S(repo));
+            .expression_attribute_values(
+                ":repo",
+                AttributeValue::S(repo.clone()),
+            );
 
-        if let Some(path) = path {
+        if let Some(path) = path.clone() {
             request = request.filter_expression("#path = :path");
-            request = request
-                .expression_attribute_values(":path", AttributeValue::S(path));
+            request = request.expression_attribute_values(
+                ":path",
+                AttributeValue::S(path.clone()),
+            );
         }
 
         if let Some(limit) = limit {
@@ -445,7 +450,7 @@ impl LockStorage for DynamoLockStore {
 
         let results = request.send().await?;
         if let Some(items) = &results.items {
-            let locks = items
+            let locks: Vec<Lock> = items
                 .iter()
                 .map(|lock| Lock {
                     id: lock["id"].as_s().unwrap().to_string(),
@@ -457,18 +462,31 @@ impl LockStorage for DynamoLockStore {
                 })
                 .collect();
 
-            Ok(ListLocksResponse {
-                locks,
-                next_cursor: match results.last_evaluated_key() {
-                    Some(last_evaluated_key) => {
-                        let dynamo_cursor = DynamoCursor {
-                            last_evaluated_key: last_evaluated_key.clone(),
-                        };
-                        Some(dynamo_cursor.to_cursor_string().unwrap())
-                    }
-                    None => None,
-                },
-            })
+            let next_cursor = match results.last_evaluated_key() {
+                Some(last_evaluated_key) => {
+                    let dynamo_cursor = DynamoCursor {
+                        last_evaluated_key: last_evaluated_key.clone(),
+                    };
+                    Some(dynamo_cursor.to_cursor_string().unwrap())
+                }
+                None => None,
+            };
+
+            // if there are no locks, but there is a cursor, we need to run another request using
+            // the cursor
+            if locks.is_empty() && next_cursor.is_some() {
+                return self
+                    .list_locks(
+                        repo.clone(),
+                        path.clone(),
+                        id,
+                        next_cursor,
+                        limit,
+                    )
+                    .await;
+            }
+
+            Ok(ListLocksResponse { locks, next_cursor })
         } else {
             Ok(ListLocksResponse {
                 locks: vec![],
