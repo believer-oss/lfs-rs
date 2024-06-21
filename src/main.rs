@@ -1,3 +1,4 @@
+use std::env;
 // Copyright (c) 2021 Jason White
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -33,8 +34,9 @@ use lfs_rs::RedisLs;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
 #[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
-
+use tracing_subscriber::{fmt, EnvFilter, Registry};
+#[cfg(not(feature = "otel"))]
+use tracing_subscriber::{fmt, EnvFilter};
 // Additional help to append to the end when `--help` is specified.
 static AFTER_HELP: &str = include_str!("help.md");
 
@@ -224,22 +226,35 @@ impl Args {
             // dependencies, such as Hyper.
             logger_builder.parse_filters(&env);
         }
-
-        #[cfg(feature = "otel")]
+        if env::var("ENABLE_OTEL").is_ok(){
+            #[cfg(feature = "otel")]
+            {
+                let exporter =
+                    opentelemetry_otlp::new_exporter().tonic().with_env();
+                let pipeline = opentelemetry_otlp::new_pipeline()
+                    .tracing()
+                    .with_exporter(exporter)
+                    .install_batch(opentelemetry::runtime::Tokio)?;
+                let telemetry = tracing_opentelemetry::layer()
+                    .with_tracer(pipeline)
+                    .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+                Registry::default().with(telemetry).init();
+            }
+            #[cfg(not(feature = "otel"))]
+            {
+                eprintln!("otel feature is not enabled. OpenTelemetry tracing is not available.");
+            }
+        }else
         {
-            let exporter =
-                opentelemetry_otlp::new_exporter().tonic().with_env();
-            let pipeline = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(exporter)
-                .install_batch(opentelemetry::runtime::Tokio)?;
-            let telemetry = tracing_opentelemetry::layer()
-                .with_tracer(pipeline)
-                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-            Registry::default().with(telemetry).init();
+                let subscriber = fmt::Subscriber::builder()
+                    .with_env_filter(EnvFilter::from_default_env())
+                    .finish();
+
+                tracing::subscriber::set_global_default(subscriber)?;
+                println!("Default tracing to stdout.");
         }
 
-        // logger_builder.init();
+        logger_builder.init();
 
         // Find a socket address to bind to. This will resolve domain names.
         let addr = match self.global.host {
