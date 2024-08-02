@@ -17,9 +17,13 @@ use futures::future;
 
 use uuid::Uuid;
 
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::batch_write_item::{
+    BatchWriteItemError, BatchWriteItemOutput,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::str;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 #[derive(Clone, Debug, PartialEq)]
 struct DynamoCursor {
@@ -220,20 +224,34 @@ impl DynamoLockStore {
         let mut iterations: u64 = 0;
 
         while !writes.is_empty() {
-            let mut requests = vec![];
+            let mut results: Vec<
+                Result<BatchWriteItemOutput, SdkError<BatchWriteItemError>>,
+            > = vec![];
 
-            // BatchWriteItem can write up to 25 items per request
-            for chunk in writes.chunks_mut(25) {
-                let request = self
-                    .client
-                    .batch_write_item()
-                    .request_items(self.table_name.clone(), chunk.to_vec())
-                    .send();
-                requests.push(request);
+            // We send requests in batches of 200 items (8 x 25), to avoid
+            // DynamoDB throttling issues.
+            // https://stackoverflow.com/questions/66019805/dynamodb-throttlingexception-issues
+            for chunk in writes.chunks_mut(200) {
+                let mut requests = vec![];
+
+                // BatchWriteItem can write up to 25 items per request
+                for chunk in chunk.chunks_mut(25) {
+                    let request = self
+                        .client
+                        .batch_write_item()
+                        .request_items(self.table_name.clone(), chunk.to_vec())
+                        .send();
+                    requests.push(request);
+                }
+
+                let res = future::join_all(requests).await;
+                results.extend(res);
+
+                // sleep 1s
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             writes.clear();
 
-            let results = future::join_all(requests).await;
             for res in results {
                 if let Err(e) = res {
                     let unified_error: aws_sdk_dynamodb::Error = e.into();
@@ -267,7 +285,7 @@ impl DynamoLockStore {
                 let base_delay_ms: u64 = 100;
                 let total_delay_ms = base_delay_ms * iterations;
                 let delay = std::time::Duration::from_millis(total_delay_ms);
-                log::info!(
+                info!(
                     "write_batch: Got {} unprocessed items, sleeping for {}ms",
                     writes.len(),
                     total_delay_ms
