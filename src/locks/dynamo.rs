@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use std::collections::{BTreeMap, HashMap};
 use std::str;
+use tracing::instrument;
 
 #[derive(Clone, Debug, PartialEq)]
 struct DynamoCursor {
@@ -103,6 +104,7 @@ impl DynamoLockStore {
         DynamoLockStore { client, table_name }
     }
 
+    #[instrument(level = "info", err, skip(self), fields(paths = paths.len()))]
     async fn get_locks_for_paths(
         &self,
         repo: &str,
@@ -157,13 +159,6 @@ impl DynamoLockStore {
                 match res {
                     Err(e) => {
                         let unified_error: aws_sdk_dynamodb::Error = e.into();
-
-                        log::error!(
-                            "Failed to get locks {:?} due to SDK error: {:?}",
-                            paths,
-                            unified_error
-                        );
-
                         bail!(
                             "SDK error fetching locks {:?}: {:?}",
                             paths,
@@ -217,13 +212,14 @@ impl DynamoLockStore {
                     keys_and_attributes.len(),
                     total_delay_ms
                 );
-                std::thread::sleep(delay);
+                tokio::time::sleep(delay).await;
             }
         }
 
         Ok(all_locks)
     }
 
+    #[instrument(level = "info", err, skip(self), fields(writes = writes.len()))]
     async fn write_batch(&self, mut writes: Vec<WriteRequest>) -> Result<()> {
         let mut iterations: u64 = 0;
 
@@ -242,13 +238,12 @@ impl DynamoLockStore {
             writes.clear();
 
             let results = future::join_all(requests).await;
-            for res in results.iter() {
+            for res in results {
                 if let Err(e) = res {
-                    log::error!(
-                        "Failed to create locks due to SDK error: {:?}",
-                        e
+                    bail!(
+                        "SDK error creating locks: {}",
+                        e.into_service_error()
                     );
-                    bail!("SDK error creating locks: {}", e);
                 }
                 if let Ok(output) = res {
                     if let Some(unprocessed) = &output.unprocessed_items {
@@ -283,7 +278,7 @@ impl DynamoLockStore {
                     writes.len(),
                     total_delay_ms
                 );
-                std::thread::sleep(delay);
+                tokio::time::sleep(delay).await;
             }
         }
 
