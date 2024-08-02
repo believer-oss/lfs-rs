@@ -159,11 +159,7 @@ impl DynamoLockStore {
                 match res {
                     Err(e) => {
                         let unified_error: aws_sdk_dynamodb::Error = e.into();
-                        bail!(
-                            "SDK error fetching locks {:?}: {:?}",
-                            paths,
-                            unified_error
-                        );
+                        bail!("SDK error fetching locks: {:?}", unified_error);
                     }
                     Ok(output) => {
                         if let Some(responses) = &output.responses {
@@ -240,10 +236,8 @@ impl DynamoLockStore {
             let results = future::join_all(requests).await;
             for res in results {
                 if let Err(e) = res {
-                    bail!(
-                        "SDK error creating locks: {}",
-                        e.into_service_error()
-                    );
+                    let unified_error: aws_sdk_dynamodb::Error = e.into();
+                    bail!("SDK error creating locks: {:?}", unified_error);
                 }
                 if let Ok(output) = res {
                     if let Some(unprocessed) = &output.unprocessed_items {
