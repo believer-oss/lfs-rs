@@ -29,10 +29,9 @@ use aws_sdk_dynamodb::types::{
 };
 
 #[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
-
+use opentelemetry_sdk::runtime;
 #[cfg(feature = "otel")]
-use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::{prelude::*, Registry};
 
 /// A temporary git repository.
 pub struct GitRepo {
@@ -515,15 +514,24 @@ pub fn init_logger() {
 
 #[cfg(feature = "otel")]
 pub fn init_logger() {
-    let exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
-    let pipeline = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .install_batch(opentelemetry::runtime::Tokio)
+    use opentelemetry::trace::TracerProvider as _;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
         .unwrap();
 
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_id_generator(
+            opentelemetry_sdk::trace::RandomIdGenerator::default(),
+        )
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .build();
+
+    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+
     let telemetry = tracing_opentelemetry::layer()
-        .with_tracer(pipeline)
+        .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
     Registry::default().with(telemetry).init();
 }
