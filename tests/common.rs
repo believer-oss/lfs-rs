@@ -48,9 +48,9 @@ impl GitRepo {
         let path = repo.path();
         let lfs_url = format!("http://{}/api/test/test", lfs_server);
 
-        cmd!("git", "config", "--global", "init.defaultBranch", "main")
+        cmd!("git", "init", "--initial-branch=main", ".")
+            .dir(path)
             .run()?;
-        cmd!("git", "init", ".").dir(path).run()?;
         cmd!("git", "lfs", "install").dir(path).run()?;
         cmd!("git", "remote", "add", "origin", "fake_remote")
             .dir(path)
