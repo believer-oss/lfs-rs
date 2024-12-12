@@ -90,7 +90,6 @@ fn init_tracer_provider() -> TracerProvider {
         .with_sampler(Sampler::ParentBased(Box::new(
             Sampler::TraceIdRatioBased(1.0),
         )))
-        // If export trace to AWS X-Ray, you can use XrayIdGenerator
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource())
         .with_batch_exporter(exporter, runtime::Tokio)
@@ -106,18 +105,10 @@ pub fn setup_tracing(_level: log::LevelFilter) -> OtelGuard {
 
     let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
 
-    // Create a new OpenTelemetry logging pipeline that prints to stdout
-    // let exporter = opentelemetry_stdout::LogExporter::default();
-    // let logs_provider = LoggerProvider::builder()
-    //     .with_simple_exporter(exporter)
-    //     .build();
-
     let env_filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
-    // Use the tracing subscriber `Registry`, or any other subscriber
-    // that impls `LookupSpan`
     let subscriber = Registry::default()
         .with(tracing_subscriber::fmt::layer())
         // .with(otel_logs_layer)
