@@ -87,6 +87,7 @@ tracing-subscriber = { version = "0.3", features = [
   "registry",
 ], optional = true }
 opentelemetry-stdout = "0.27.0"
+aws-sdk-s3 = "1.65.0"
 
 [dev-dependencies]
 rand = "0.8"
