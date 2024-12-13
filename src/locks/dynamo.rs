@@ -334,7 +334,7 @@ impl LockStorage for DynamoLockStore {
             Err(e) => {
                 let unified_error: aws_sdk_dynamodb::Error = e.into();
                 log::error!("Errror locking file {}: {}", path, unified_error);
-                return Err(unified_error.into());
+                Err(unified_error.into())
             }
             Ok(_) => Ok(lock),
         }
