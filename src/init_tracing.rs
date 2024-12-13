@@ -111,7 +111,6 @@ pub fn setup_tracing(_level: log::LevelFilter) -> OtelGuard {
 
     let subscriber = Registry::default()
         .with(tracing_subscriber::fmt::layer())
-        // .with(otel_logs_layer)
         .with(OpenTelemetryLayer::new(tracer))
         .with(MetricsLayer::new(meter_provider.clone()))
         .with(env_filter);
