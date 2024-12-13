@@ -91,12 +91,10 @@ pub struct DynamoLockStore {
 impl DynamoLockStore {
     pub async fn new(table_name: String, endpoint_url: Option<&str>) -> Self {
         let client: Client;
-        let shared_config =
+        let mut shared_config =
             aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
-        let shared_config = if let Some(endpoint_url) = endpoint_url {
-            shared_config.endpoint_url(endpoint_url)
-        } else {
-            shared_config
+        if let Some(endpoint_url) = endpoint_url {
+            shared_config = shared_config.endpoint_url(endpoint_url)
         };
         let sdkconfig = shared_config.load().await;
         client = Client::new(&sdkconfig);
