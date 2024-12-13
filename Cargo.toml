@@ -97,24 +97,6 @@ env_logger = "0.10"
 toml = "0.7"
 wiremock = "0.5"
 
-[dependencies.rusoto_core]
-version = "0.48"
-default-features = false
-features = ["rustls"]
-
-[dependencies.rusoto_credential]
-version = "0.48"
-
-[dependencies.rusoto_sts]
-version = "0.48"
-features = ["rustls"]
-default-features = false
-
-[dependencies.rusoto_s3]
-version = "0.48"
-default-features = false
-features = ["rustls"]
-
 [features]
 default = ["dynamodb", "redis", "otel"]
 # If the "faulty" feature is enabled, random failures are injected into the byte
