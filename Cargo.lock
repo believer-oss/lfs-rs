@@ -1819,6 +1819,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "backoff",
  "base64 0.21.7",
  "bytes",
