@@ -23,8 +23,10 @@ async-stream = "0.3"
 async-trait = "0.1"
 aws-config = { version = "1.5.10", optional = true }
 aws-sdk-dynamodb = { version = "1.55.0", optional = true }
-aws-sdk-s3 = { version = "1.65.0", optional = true }
-aws-smithy-types = { version = "1.2.9", optional = true }
+aws-sdk-s3 = { version = "1.65.0", features = ["rt-tokio"] }
+aws-smithy-types = { version = "1.2.9" }
+aws-smithy-types-convert = "0.60.8"
+aws-smithy-http = "0.60.11"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1"
 chacha = "0.3"
@@ -105,7 +107,6 @@ default = ["dynamodb", "redis", "otel"]
 faulty = ["rand"]
 redis = ["dep:redis"]
 dynamodb = ["dep:aws-config", "dep:aws-sdk-dynamodb"]
-s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types"]
 otel = [
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",
