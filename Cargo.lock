@@ -608,6 +608,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-types-convert"
+version = "0.60.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f280f434214856abace637b1f944d50ccca216814813acd195cdd7f206ce17f"
+
+[[package]]
 name = "aws-smithy-xml"
 version = "0.60.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1598,7 +1604,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.4.10",
+ "socket2 0.5.7",
  "tokio",
  "tower-service",
  "tracing",
@@ -1819,7 +1825,9 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-smithy-http",
  "aws-smithy-types",
+ "aws-smithy-types-convert",
  "backoff",
  "base64 0.21.7",
  "bytes",

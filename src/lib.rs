@@ -188,9 +188,7 @@ impl S3ServerBuilder {
             }
         }
 
-        let s3 = S3::new(self.bucket, prefix, self.cdn)
-            .map_err(Error::from)
-            .await?;
+        let s3 = S3::new(self.bucket, prefix, self.cdn).await;
 
         // Retry certain operations to S3 to make it more reliable.
         let s3 = Retrying::new(s3);
