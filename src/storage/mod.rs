@@ -26,14 +26,13 @@ mod retrying;
 mod s3;
 mod verify;
 
-pub use aws_sdk_s3::Error as S3Error;
 pub use cached::Backend as Cached;
 pub use disk::Backend as Disk;
 pub use encrypt::Backend as Encrypted;
 #[cfg(feature = "faulty")]
 pub use faulty::Backend as Faulty;
 pub use retrying::Backend as Retrying;
-pub use s3::Backend as S3;
+pub use s3::{Backend as S3, Error as S3Error};
 pub use verify::Backend as Verify;
 
 use crate::lfs::Oid;
