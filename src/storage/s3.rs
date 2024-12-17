@@ -19,6 +19,8 @@
 // SOFTWARE.
 use async_trait::async_trait;
 use aws_config::Region;
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -38,19 +40,18 @@ use futures::{stream, TryStreamExt};
 use tokio_util::io::ReaderStream;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
-use aws_smithy_types::retry::ProvideErrorKind;
 use derive_more::{Display, From};
 use std::time::Duration;
 
 #[derive(Debug, From, Display)]
 pub enum Error {
-    S3Generic(S3Error),
     Get(GetObjectError),
     Put(PutObjectError),
     CreateMultipart(CreateMultipartUploadError),
     Upload(UploadPartError),
     CompleteMultipart(CompleteMultipartUploadError),
     Head(HeadObjectError),
+    Generic(String),
 
     Stream(std::io::Error),
 
@@ -59,6 +60,49 @@ pub enum Error {
 
     /// The uploaded object is too large.
     TooLarge(u64),
+}
+
+impl From<S3Error> for Error {
+    fn from(value: S3Error) -> Self {
+        let x = value;
+        Self::Generic(x.to_string())
+    }
+}
+
+impl From<SdkError<GetObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<GetObjectError, HttpResponse>) -> Self {
+        Error::Get(err.into_service_error())
+    }
+}
+
+impl From<SdkError<PutObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<PutObjectError, HttpResponse>) -> Self {
+        Error::Put(err.into_service_error())
+    }
+}
+
+impl From<SdkError<CreateMultipartUploadError, HttpResponse>> for Error {
+    fn from(err: SdkError<CreateMultipartUploadError, HttpResponse>) -> Self {
+        Error::CreateMultipart(err.into_service_error())
+    }
+}
+
+impl From<SdkError<UploadPartError, HttpResponse>> for Error {
+    fn from(err: SdkError<UploadPartError, HttpResponse>) -> Self {
+        Error::Upload(err.into_service_error())
+    }
+}
+
+impl From<SdkError<CompleteMultipartUploadError, HttpResponse>> for Error {
+    fn from(err: SdkError<CompleteMultipartUploadError, HttpResponse>) -> Self {
+        Error::CompleteMultipart(err.into_service_error())
+    }
+}
+
+impl From<SdkError<HeadObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<HeadObjectError, HttpResponse>) -> Self {
+        Error::Head(err.into_service_error())
+    }
 }
 
 impl ::std::error::Error for Error {}
@@ -97,26 +141,24 @@ impl From<HeadBucketError> for InitError {
     fn from(err: HeadBucketError) -> Self {
         match err {
             HeadBucketError::NotFound(_not_found) => InitError::Bucket,
-            err => match err.code() {
-                Some("Forbidden") => InitError::Credentials,
-                _ => InitError::Other(err.to_string()),
-            }, // RusotoError::Credentials(_) => InitError::Credentials,
-               // RusotoError::Unknown(r) => {
-               //     // Rusoto really sucks at correctly reporting errors.
-               //     // Lets work around that here.
-               //     match r.status {
-               //         StatusCode::NOT_FOUND => InitError::Bucket,
-               //         StatusCode::FORBIDDEN => InitError::Credentials,
-               //         _ => InitError::Other(format!(
-               //             "S3 returned HTTP status {}",
-               //             r.status
-               //         )),
-               //     }
-               // }
-               // RusotoError::Service(HeadBucketError::NoSuchBucket(_)) => {
-               //     InitError::Bucket
-               // }
-               // x => InitError::Other(x.to_string()),
+            x => InitError::Other(x.to_string()),
+            // RusotoError::Credentials(_) => InitError::Credentials,
+            // RusotoError::Unknown(r) => {
+            //     // Rusoto really sucks at correctly reporting errors.
+            //     // Lets work around that here.
+            //     match r.status {
+            //         StatusCode::NOT_FOUND => InitError::Bucket,
+            //         StatusCode::FORBIDDEN => InitError::Credentials,
+            //         _ => InitError::Other(format!(
+            //             "S3 returned HTTP status {}",
+            //             r.status
+            //         )),
+            //     }
+            // }
+            // RusotoError::Service(HeadBucketError::NoSuchBucket(_)) => {
+            //     InitError::Bucket
+            // }
+            // x => InitError::Other(x.to_string()),
         }
     }
 }
@@ -216,27 +258,30 @@ impl Storage for Backend {
         &self,
         key: &StorageKey,
     ) -> Result<Option<LFSObject>, Self::Error> {
-        let resp = self
+        let resp = match self
             .client
             .get_object()
             .bucket(self.bucket.clone())
             .key(self.key_to_path(key))
             .send()
             .await
-            .map_err(S3Error::from);
-
-        match resp {
-            Ok(get_object_output) => {
-                let stream =
-                    ReaderStream::new(get_object_output.body.into_async_read());
-                Ok(Some(LFSObject::new(
-                    get_object_output.content_length.unwrap() as u64,
-                    Box::pin(stream),
-                )))
+        {
+            Ok(get_object_output) => Ok(Some(LFSObject::new(
+                get_object_output.content_length.unwrap() as u64,
+                Box::pin(ReaderStream::new(
+                    get_object_output.body.into_async_read(),
+                )),
+            ))),
+            Err(e) => {
+                let e = S3Error::from(e);
+                if let S3Error::NoSuchKey(_) = e {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
             }
-            Err(S3Error::NoSuchKey(_)) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        }?;
+        Ok(resp)
     }
 
     async fn put(
@@ -254,7 +299,7 @@ impl Storage for Backend {
             .key(self.key_to_path(&key))
             .send()
             .await
-            .map_err(S3Error::from)?;
+            .map_err(Error::from)?;
 
         // Okay to unwrap. This would only be None there is a bug in S3
         let upload_id = multipart_upload_resp.upload_id.unwrap();
@@ -269,8 +314,7 @@ impl Storage for Backend {
         let mut streaming_body = stream.into_async_read();
 
         loop {
-            // FIXME - handle errors
-            let size = streaming_body.read(&mut buffer).await.expect("Oh no!");
+            let size = streaming_body.read(&mut buffer).await?;
 
             if buffer.len() < CHUNK_SIZE && size != 0 {
                 continue;
