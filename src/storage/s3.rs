@@ -35,8 +35,9 @@ use aws_sdk_s3::Error as S3Error;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::BytesMut;
-use futures::AsyncReadExt;
 use futures::{stream, TryStreamExt};
+use tokio::io::AsyncReadExt;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
@@ -311,10 +312,10 @@ impl Storage for Backend {
         let mut part_number = 1;
         let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
             Vec::new();
-        let mut streaming_body = stream.into_async_read();
+        let mut streaming_body = stream.into_async_read().compat();
 
         loop {
-            let size = streaming_body.read(&mut buffer).await?;
+            let size = streaming_body.read_buf(&mut buffer).await?;
 
             if buffer.len() < CHUNK_SIZE && size != 0 {
                 continue;
