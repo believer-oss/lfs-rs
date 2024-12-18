@@ -354,10 +354,10 @@ impl GitRepo {
         table: &str,
         endpoint_url: &str,
     ) -> anyhow::Result<()> {
-        let sdk_config = aws_config::from_env()
-            .endpoint_url(endpoint_url)
-            .load()
-            .await;
+        let shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+        let shared_config = shared_config.endpoint_url(endpoint_url);
+        let sdk_config = shared_config.load().await;
 
         let client = aws_sdk_dynamodb::Client::new(&sdk_config);
         match client.describe_table().table_name(table).send().await {
@@ -387,29 +387,29 @@ impl GitRepo {
                 AttributeDefinition::builder()
                     .attribute_name("repo")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("id")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("path")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("locked_at")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_key_schema(Some(vec![
                 KeySchemaElement::builder()
                     .attribute_name("repo")
                     .key_type("HASH".into())
-                    .build(),
+                    .build()?,
                 KeySchemaElement::builder()
                     .attribute_name("path")
                     .key_type("RANGE".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_local_secondary_indexes(Some(vec![
                 LocalSecondaryIndex::builder()
@@ -418,11 +418,11 @@ impl GitRepo {
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("id")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -431,18 +431,18 @@ impl GitRepo {
                             .non_key_attributes("locked_at")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
                 LocalSecondaryIndex::builder()
                     .index_name("creation-index")
                     .set_key_schema(Some(vec![
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("locked_at")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -452,7 +452,7 @@ impl GitRepo {
                             .non_key_attributes("owner")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
             ]))
             .billing_mode("PAY_PER_REQUEST".into())
             .send()
