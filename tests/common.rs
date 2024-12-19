@@ -49,7 +49,9 @@ impl GitRepo {
         let path = repo.path();
         let lfs_url = format!("http://{}/api/test/test", lfs_server);
 
-        cmd!("git", "init", ".").dir(path).run()?;
+        cmd!("git", "init", "--initial-branch=main", ".")
+            .dir(path)
+            .run()?;
         cmd!("git", "lfs", "install").dir(path).run()?;
         cmd!("git", "remote", "add", "origin", "fake_remote")
             .dir(path)
@@ -57,6 +59,14 @@ impl GitRepo {
         cmd!("git", "config", "lfs.url", &lfs_url,)
             .dir(path)
             .run()?;
+        cmd!(
+            "git",
+            "config",
+            "lfs.storage",
+            path.join(".git/lfs").to_str().unwrap()
+        )
+        .dir(path)
+        .run()?;
         cmd!("git", "config", "user.name", "Foo Bar")
             .dir(path)
             .run()?;
@@ -135,7 +145,7 @@ impl GitRepo {
     }
 
     pub fn lfs_push(&self) -> io::Result<()> {
-        cmd!("git", "lfs", "push", "origin", "master")
+        cmd!("git", "lfs", "push", "origin", "main")
             .dir(self.repo.path())
             .run()?;
         Ok(())
