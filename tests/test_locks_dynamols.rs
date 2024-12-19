@@ -50,6 +50,7 @@ use std::fs;
 struct Credentials {
     access_key_id: String,
     secret_access_key: String,
+    session_token: Option<String>,
     default_region: String,
     table: String,
     endpoint_url: String,
@@ -78,6 +79,10 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
     std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
+    std::env::set_var(
+        "AWS_SESSION_TOKEN",
+        creds.session_token.unwrap_or_default(),
+    );
     std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
 
     let locks =

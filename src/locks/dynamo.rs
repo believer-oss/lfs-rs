@@ -479,8 +479,8 @@ impl LockStorage for DynamoLockStore {
                 None => None,
             };
 
-            // if there are no locks, but there is a cursor, we need to run another request using
-            // the cursor
+            // if there are no locks, but there is a cursor, we need to run
+            // another request using the cursor
             if locks.is_empty() && next_cursor.is_some() {
                 return self
                     .list_locks(
