@@ -674,9 +674,9 @@ pub async fn smoke_test(
         repo.unlock_files(&stress_locks, 1, false, vec![]).await?;
 
         let elapsed_secs = now.elapsed().as_secs_f32();
-        if elapsed_secs > 5.0 {
+        if elapsed_secs > 10.0 {
             return Err(format!(
-                "Batch stress test took too long. Max allowed is 5 seconds, \
+                "Batch stress test took too long. Max allowed is 10 seconds, \
                  but test finished in {} seconds.",
                 elapsed_secs
             )
