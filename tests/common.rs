@@ -29,10 +29,9 @@ use aws_sdk_dynamodb::types::{
 };
 
 #[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
-
+use opentelemetry_sdk::runtime;
 #[cfg(feature = "otel")]
-use opentelemetry_otlp::WithExportConfig;
+use tracing_subscriber::{prelude::*, Registry};
 
 /// A temporary git repository.
 pub struct GitRepo {
@@ -355,10 +354,10 @@ impl GitRepo {
         table: &str,
         endpoint_url: &str,
     ) -> anyhow::Result<()> {
-        let sdk_config = aws_config::from_env()
-            .endpoint_url(endpoint_url)
-            .load()
-            .await;
+        let shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+        let shared_config = shared_config.endpoint_url(endpoint_url);
+        let sdk_config = shared_config.load().await;
 
         let client = aws_sdk_dynamodb::Client::new(&sdk_config);
         match client.describe_table().table_name(table).send().await {
@@ -388,29 +387,29 @@ impl GitRepo {
                 AttributeDefinition::builder()
                     .attribute_name("repo")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("id")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("path")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("locked_at")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_key_schema(Some(vec![
                 KeySchemaElement::builder()
                     .attribute_name("repo")
                     .key_type("HASH".into())
-                    .build(),
+                    .build()?,
                 KeySchemaElement::builder()
                     .attribute_name("path")
                     .key_type("RANGE".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_local_secondary_indexes(Some(vec![
                 LocalSecondaryIndex::builder()
@@ -419,11 +418,11 @@ impl GitRepo {
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("id")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -432,18 +431,18 @@ impl GitRepo {
                             .non_key_attributes("locked_at")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
                 LocalSecondaryIndex::builder()
                     .index_name("creation-index")
                     .set_key_schema(Some(vec![
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("locked_at")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -453,7 +452,7 @@ impl GitRepo {
                             .non_key_attributes("owner")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
             ]))
             .billing_mode("PAY_PER_REQUEST".into())
             .send()
@@ -515,15 +514,24 @@ pub fn init_logger() {
 
 #[cfg(feature = "otel")]
 pub fn init_logger() {
-    let exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
-    let pipeline = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .install_batch(opentelemetry::runtime::Tokio)
+    use opentelemetry::trace::TracerProvider as _;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
         .unwrap();
 
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_id_generator(
+            opentelemetry_sdk::trace::RandomIdGenerator::default(),
+        )
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .build();
+
+    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+
     let telemetry = tracing_opentelemetry::layer()
-        .with_tracer(pipeline)
+        .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
     Registry::default().with(telemetry).init();
 }

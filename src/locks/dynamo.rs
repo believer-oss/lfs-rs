@@ -91,19 +91,13 @@ pub struct DynamoLockStore {
 impl DynamoLockStore {
     pub async fn new(table_name: String, endpoint_url: Option<&str>) -> Self {
         let client: Client;
-        match endpoint_url {
-            Some(endpoint_url) => {
-                let shared_config = aws_config::from_env()
-                    .endpoint_url(endpoint_url)
-                    .load()
-                    .await;
-                client = Client::new(&shared_config);
-            }
-            None => {
-                let shared_config = aws_config::load_from_env().await;
-                client = Client::new(&shared_config);
-            }
-        }
+        let mut shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+        if let Some(endpoint_url) = endpoint_url {
+            shared_config = shared_config.endpoint_url(endpoint_url)
+        };
+        let sdk_config = shared_config.load().await;
+        client = Client::new(&sdk_config);
 
         DynamoLockStore { client, table_name }
     }
@@ -132,7 +126,7 @@ impl DynamoLockStore {
                         );
                         builder = builder.keys(map);
                     }
-                    let items = builder.build();
+                    let items = builder.build().expect("Failed to build keys");
                     HashMap::<String, KeysAndAttributes>::from([(
                         self.table_name.clone(),
                         items,
@@ -340,7 +334,7 @@ impl LockStorage for DynamoLockStore {
             Err(e) => {
                 let unified_error: aws_sdk_dynamodb::Error = e.into();
                 log::error!("Errror locking file {}: {}", path, unified_error);
-                return Err(unified_error.into());
+                Err(unified_error.into())
             }
             Ok(_) => Ok(lock),
         }
@@ -398,7 +392,8 @@ impl LockStorage for DynamoLockStore {
                                 "locked_at",
                                 AttributeValue::S(batch.timestamp.clone()),
                             )
-                            .build(),
+                            .build()
+                            .expect("Failed to build put request"),
                     )
                     .build(),
             );
@@ -607,7 +602,7 @@ impl LockStorage for DynamoLockStore {
 
         let output = request.send().await?;
 
-        if let Some(item) = output.items().unwrap().first() {
+        if let Some(item) = output.items().first() {
             let lock = Lock {
                 id: item["id"].as_s().unwrap().to_string(),
                 path: item["path"].as_s().unwrap().to_string(),
@@ -680,7 +675,8 @@ impl LockStorage for DynamoLockStore {
                         DeleteRequest::builder()
                             .key("repo", AttributeValue::S(repo.clone()))
                             .key("path", AttributeValue::S(path.clone()))
-                            .build(),
+                            .build()
+                            .expect("Failed to build delete request"),
                     )
                     .build(),
             );

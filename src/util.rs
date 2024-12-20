@@ -175,6 +175,7 @@ where
     Ok(serde_json::from_slice(&buf)?)
 }
 
+#[allow(clippy::result_large_err)]
 pub fn into_json<T>(value: &T) -> Result<Body, Error>
 where
     T: Serialize,
