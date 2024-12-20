@@ -1,7 +1,6 @@
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
-// use opentelemetry_sdk::logs::LoggerProvider;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
