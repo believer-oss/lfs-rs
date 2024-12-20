@@ -31,7 +31,6 @@ use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::Error as S3Error;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::BytesMut;
@@ -61,13 +60,6 @@ pub enum Error {
 
     /// The uploaded object is too large.
     TooLarge(u64),
-}
-
-impl From<S3Error> for Error {
-    fn from(value: S3Error) -> Self {
-        let x = value;
-        Self::Generic(x.to_string())
-    }
 }
 
 impl From<SdkError<GetObjectError, HttpResponse>> for Error {
@@ -142,24 +134,13 @@ impl From<HeadBucketError> for InitError {
     fn from(err: HeadBucketError) -> Self {
         match err {
             HeadBucketError::NotFound(_not_found) => InitError::Bucket,
-            x => InitError::Other(x.to_string()),
-            // RusotoError::Credentials(_) => InitError::Credentials,
-            // RusotoError::Unknown(r) => {
-            //     // Rusoto really sucks at correctly reporting errors.
-            //     // Lets work around that here.
-            //     match r.status {
-            //         StatusCode::NOT_FOUND => InitError::Bucket,
-            //         StatusCode::FORBIDDEN => InitError::Credentials,
-            //         _ => InitError::Other(format!(
-            //             "S3 returned HTTP status {}",
-            //             r.status
-            //         )),
-            //     }
-            // }
-            // RusotoError::Service(HeadBucketError::NoSuchBucket(_)) => {
-            //     InitError::Bucket
-            // }
-            // x => InitError::Other(x.to_string()),
+            x => match x.meta().code() {
+                Some(status) => InitError::Other(format!(
+                    "S3 returned HTTP status {}",
+                    status
+                )),
+                None => InitError::Other(x.to_string()),
+            },
         }
     }
 }
@@ -274,8 +255,8 @@ impl Storage for Backend {
                 )),
             ))),
             Err(e) => {
-                let e = S3Error::from(e);
-                if let S3Error::NoSuchKey(_) = e {
+                let e = e.into_service_error();
+                if let GetObjectError::NoSuchKey(_) = e {
                     Ok(None)
                 } else {
                     Err(e)
@@ -335,7 +316,7 @@ impl Storage for Backend {
                 .body(stream)
                 .send()
                 .await
-                .map_err(S3Error::from)?;
+                .map_err(Error::from)?;
 
             completed_parts.push(
                 CompletedPart::builder()
@@ -365,7 +346,7 @@ impl Storage for Backend {
             .upload_id(upload_id)
             .send()
             .await
-            .map_err(S3Error::from)?;
+            .map_err(Error::from)?;
 
         Ok(())
     }
@@ -377,15 +358,20 @@ impl Storage for Backend {
             .bucket(self.bucket.clone())
             .key(self.key_to_path(key))
             .send()
-            .await
-            .map_err(S3Error::from);
+            .await;
 
         match resp {
             Ok(head_object_output) => {
                 Ok(Some(head_object_output.content_length.unwrap() as u64))
             }
-            Err(S3Error::NotFound(_)) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                let e = e.into_service_error();
+                if let HeadObjectError::NotFound(_) = e {
+                    Ok(None)
+                } else {
+                    Err(Error::Head(e))
+                }
+            }
         }
     }
 
