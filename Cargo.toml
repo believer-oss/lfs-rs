@@ -43,6 +43,8 @@ hyper = { version = "0.14", features = [
   "http2",
   "tcp",
   "stream",
+  "backports",
+  "deprecated",
 ] }
 hyper-tls = { version = "0.5.0", features = ["vendored"] }
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }

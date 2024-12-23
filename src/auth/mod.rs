@@ -5,7 +5,10 @@ use core::task::{Context, Poll};
 use futures::future::BoxFuture;
 use http::{self, header, HeaderMap, HeaderValue, StatusCode};
 use hyper::{
-    self, body::Body, body::Buf, service::Service, Client, Request, Response,
+    self,
+    body::{Body, Buf, HttpBody},
+    service::Service,
+    Client, Request, Response,
 };
 use hyper_tls::HttpsConnector;
 use linked_hash_map::LinkedHashMap;
@@ -140,7 +143,7 @@ impl<S> Auth<S> {
             event!(Level::INFO, status = ?res.status(), url = %url);
 
             if res.status() == StatusCode::OK {
-                let body = hyper::body::aggregate(res).await?;
+                let body = res.collect().await?.aggregate();
                 let repository: Repository =
                     serde_json::from_reader(body.reader())?;
 
@@ -186,7 +189,7 @@ impl<S> Auth<S> {
         let res = client.request(req).await?;
 
         if res.status() == StatusCode::OK {
-            let body = hyper::body::aggregate(res).await?;
+            let body = res.collect().await?.aggregate();
             let user_info: UserResp = serde_json::from_reader(body.reader())?;
 
             if let Some(username) = user_info.login {
