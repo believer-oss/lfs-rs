@@ -32,7 +32,7 @@ use serde::{
     Deserialize, Serialize,
 };
 
-use generic_array::{typenum, GenericArray};
+use sha2::digest::generic_array::{typenum, GenericArray};
 use sha2::{self, Digest};
 
 /// An error associated with parsing a SHA256.

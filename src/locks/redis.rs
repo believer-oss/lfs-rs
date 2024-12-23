@@ -25,7 +25,7 @@ impl RedisLockStore {
     }
 
     async fn get_lock_from_oid(&self, oid: &Oid) -> Result<Vec<Lock>> {
-        let mut con = self.client.get_async_connection().await?;
+        let mut con = self.client.get_multiplexed_async_connection().await?;
         match con.get::<String, Lock>(oid.to_string()).await {
             Ok(v) => Ok(vec![v]),
             Err(_) => Err(anyhow!(super::LockStoreError::InternalServerError)),
@@ -65,7 +65,7 @@ impl LockStorage for RedisLockStore {
         // of the lock and a separate lookup from repo/path to the
         // hashed key. This implements the latter.
         let lock = Lock::new(key.to_string(), path, owner);
-        let mut con = self.client.get_async_connection().await?;
+        let mut con = self.client.get_multiplexed_async_connection().await?;
 
         let json_lock = serde_json::to_string(&lock)?;
 
@@ -114,7 +114,8 @@ impl LockStorage for RedisLockStore {
         } else if let Some(path) = path {
             // If we have a path, we need to find it and return the matching
             // lock
-            let mut con = self.client.get_async_connection().await?;
+            let mut con =
+                self.client.get_multiplexed_async_connection().await?;
             let key = format!("{}:{}", repo, path);
             match con.get::<String, String>(key).await {
                 Ok(id) => {
@@ -129,7 +130,8 @@ impl LockStorage for RedisLockStore {
             }
         } else {
             // If we don't get an id or path, we return them all...
-            let mut con = self.client.get_async_connection().await?;
+            let mut con =
+                self.client.get_multiplexed_async_connection().await?;
             let iter: AsyncIter<String> =
                 con.scan_match(format!("{}:*", repo)).await?;
             let keys: Vec<String> = iter.collect().await;
@@ -153,7 +155,7 @@ impl LockStorage for RedisLockStore {
         //     .lock()
         //     .expect("couldnt acquire lock, poisoned");
         //
-        let mut con = self.client.get_async_connection().await?;
+        let mut con = self.client.get_multiplexed_async_connection().await?;
         let iter: AsyncIter<String> =
             con.scan_match(format!("{}:*", repo)).await?;
         let keys: Vec<String> = iter.collect().await;
@@ -190,7 +192,7 @@ impl LockStorage for RedisLockStore {
         // lockfile.del_entry(&key, owner, force)
         let force = force.unwrap_or(false);
         let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
-        let mut con = self.client.get_async_connection().await?;
+        let mut con = self.client.get_multiplexed_async_connection().await?;
         let lock = con.get::<String, Lock>(oid.to_string()).await?;
         if let Some(o) = lock.owner.clone() {
             if owner == o.name || force {
