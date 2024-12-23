@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use aws_config::Region;
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
-use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_bucket::HeadBucketError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::operation::put_object::PutObjectError;
-use aws_sdk_s3::operation::upload_part::UploadPartError;
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadError,
+    create_multipart_upload::CreateMultipartUploadError,
+    get_object::GetObjectError, head_bucket::HeadBucketError,
+    head_object::HeadObjectError, put_object::PutObjectError,
+    upload_part::UploadPartError,
+};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
@@ -38,6 +38,7 @@ use futures::{stream, TryStreamExt};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 use derive_more::{Display, From};
@@ -51,7 +52,6 @@ pub enum Error {
     Upload(UploadPartError),
     CompleteMultipart(CompleteMultipartUploadError),
     Head(HeadObjectError),
-    Generic(String),
 
     Stream(std::io::Error),
 
@@ -102,13 +102,13 @@ impl ::std::error::Error for Error {}
 
 #[derive(Debug, Display)]
 pub enum InitError {
-    #[display(fmt = "Invalid S3 bucket name")]
+    #[display("Invalid S3 bucket name")]
     Bucket,
 
-    #[display(fmt = "Invalid S3 credentials")]
+    #[display("Invalid S3 credentials")]
     Credentials,
 
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     Other(String),
 }
 
@@ -171,25 +171,26 @@ impl Backend {
             prefix.pop();
         }
 
-        let (region, endpoint_url) =
-            if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
-                // If a custom endpoint is set, do not use the AWS default
-                // (us-east-1). Instead, check environment variables for a region
-                // name.
-                let name = std::env::var("AWS_DEFAULT_REGION")
-                    .or_else(|_| std::env::var("AWS_REGION"))
-                    .map_err(|_| {
-                        InitError::Other(
+        let (region, endpoint_url) = if let Ok(endpoint) =
+            std::env::var("AWS_S3_ENDPOINT")
+        {
+            // If a custom endpoint is set, do not use the AWS default
+            // (us-east-1). Instead, check environment variables for a region
+            // name.
+            let name = std::env::var("AWS_DEFAULT_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .map_err(|_| {
+                    InitError::Other(
                         "$AWS_S3_ENDPOINT was set without $AWS_DEFAULT_REGION \
                          or $AWS_REGION being set. Custom endpoints don't \
                          make sense without also setting a region."
                             .into(),
                     )
-                    })?;
-                (Region::new(name), Some(endpoint))
-            } else {
-                (Region::new("us-east-1"), None)
-            };
+                })?;
+            (Region::new(name), Some(endpoint))
+        } else {
+            (Region::new("us-east-1"), None)
+        };
 
         let client: Client;
         let mut shared_config =
@@ -224,9 +225,7 @@ impl Backend {
             cdn,
         })
     }
-}
 
-impl Backend {
     fn key_to_path(&self, key: &StorageKey) -> String {
         format!("{}/{}/{}", self.prefix, key.namespace(), key.oid().path())
     }
@@ -236,6 +235,7 @@ impl Backend {
 impl Storage for Backend {
     type Error = Error;
 
+    #[instrument(skip(self))]
     async fn get(
         &self,
         key: &StorageKey,
@@ -266,6 +266,7 @@ impl Storage for Backend {
         Ok(resp)
     }
 
+    #[instrument(skip(self, value))]
     async fn put(
         &self,
         key: StorageKey,
@@ -273,7 +274,8 @@ impl Storage for Backend {
     ) -> Result<(), Self::Error> {
         let (_len, stream) = value.into_parts();
 
-        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload to upload the file.
+        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload
+        // to upload the file.
         let multipart_upload_resp = self
             .client
             .create_multipart_upload()
@@ -351,6 +353,7 @@ impl Storage for Backend {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         let resp = self
             .client
