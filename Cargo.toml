@@ -58,9 +58,9 @@ tokio-util = { version = "0.7", features = ["full"] }
 url = "2"
 uuid = { version = "1.1", features = ["v4"] }
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 redis = { version = "0.27", optional = true, features = ["aio", "tokio-comp"] }
-base64 = { version = "0.21.2" }
+base64 = { version = "0.22.1" }
 parking_lot = { version = "0.12" }
 
 opentelemetry = { version = "0.27.1", optional = true }
@@ -91,9 +91,9 @@ opentelemetry-stdout = "0.27.0"
 rand = "0.8"
 tempfile = "3"
 duct = "0.13"
-env_logger = "0.10"
-toml = "0.7"
-wiremock = "0.5"
+env_logger = "0.11"
+toml = "0.8"
+wiremock = "0.6"
 
 [features]
 default = ["dynamodb", "redis", "otel"]
