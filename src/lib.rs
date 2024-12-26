@@ -31,52 +31,37 @@ mod sha256;
 mod storage;
 mod util;
 
+use futures::future::{BoxFuture, Either, Future, TryFutureExt};
 use parking_lot::RwLock;
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    net::SocketAddr, path::PathBuf, pin::pin, sync::Arc, time::Duration,
+};
+
+use hyper_util::service::TowerToHyperService;
+use tokio::net::TcpListener;
+use tower::ServiceBuilder;
 
 use auth::Auth;
-use futures::future::{self, Either, Future, TryFutureExt};
-use hyper::{
-    self,
-    server::conn::{AddrIncoming, AddrStream},
-    service::make_service_fn,
-};
 use linked_hash_map::LinkedHashMap;
 
 use crate::app::App;
 use crate::error::Error;
-#[cfg(feature = "dynamodb")]
-pub use crate::locks::DynamoLs;
-#[cfg(feature = "redis")]
-pub use crate::locks::RedisLs;
 pub use crate::locks::{
     CreateLockBatchRequest, LocalLs, LockBatch, LockBatchOuter, LockFailure,
     LockStorage, NoneLs, ReleaseLockBatchRequest,
 };
 use crate::logger::Logger;
 use crate::storage::{Cached, Disk, Encrypted, Retrying, Storage, Verify, S3};
-pub use crate::util::{from_json, into_json};
+pub use crate::util::{empty, from_json, full, into_json};
+
+#[cfg(feature = "dynamodb")]
+pub use crate::locks::DynamoLs;
+
+#[cfg(feature = "redis")]
+pub use crate::locks::RedisLs;
 
 #[cfg(feature = "faulty")]
 use crate::storage::Faulty;
-
-/// Represents a running LFS server.
-pub trait Server: Future<Output = hyper::Result<()>> {
-    /// Returns the local address this server is bound to.
-    fn addr(&self) -> SocketAddr;
-}
-
-impl<S, E> Server for hyper::Server<AddrIncoming, S, E>
-where
-    hyper::Server<AddrIncoming, S, E>: Future<Output = hyper::Result<()>>,
-{
-    fn addr(&self) -> SocketAddr {
-        self.local_addr()
-    }
-}
 
 #[derive(Debug)]
 pub struct Cache {
@@ -170,8 +155,10 @@ impl S3ServerBuilder {
         mut self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<Box<dyn Server + Unpin + Send>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
+        Box<dyn std::error::Error>,
+    > {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
 
         if self.cdn.is_some() {
@@ -217,13 +204,16 @@ impl S3ServerBuilder {
                         Either::Right(Verify::new(cache))
                     }
                 });
-                Ok(Box::new(spawn_server(
+                let (fut, addr) = spawn_server(
                     storage,
                     locks,
-                    &addr,
+                    addr,
                     self.authenticated,
                     self.authentication_server,
-                )))
+                )
+                .await?;
+
+                Ok((Box::pin(fut), addr))
             }
             None => {
                 let storage = Verify::new(match self.key {
@@ -232,13 +222,16 @@ impl S3ServerBuilder {
                     }
                     None => Either::Right(Verify::new(s3)),
                 });
-                Ok(Box::new(spawn_server(
+                let (fut, addr) = spawn_server(
                     storage,
                     locks,
-                    &addr,
+                    addr,
                     self.authenticated,
                     self.authentication_server,
-                )))
+                )
+                .await?;
+
+                Ok((Box::pin(fut), addr))
             }
         }
     }
@@ -250,9 +243,9 @@ impl S3ServerBuilder {
         addr: SocketAddr,
         lock: impl LockStorage + Send + Sync + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let server = self.spawn(addr, lock).await?;
+        let (server, addr) = self.spawn(addr, lock).await?;
 
-        log::info!("Listening on {}", server.addr());
+        log::info!("Listening on {}", addr);
 
         server.await?;
         Ok(())
@@ -318,7 +311,10 @@ impl LocalServerBuilder {
         self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<impl Server, Box<dyn std::error::Error>> {
+    ) -> Result<
+        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
+        Box<dyn std::error::Error>,
+    > {
         let storage = Disk::new(self.path).map_err(Error::from).await?;
         let storage = Verify::new(match self.key {
             Some(key) => {
@@ -332,13 +328,16 @@ impl LocalServerBuilder {
 
         log::info!("Local disk storage initialized.");
 
-        Ok(spawn_server(
+        let (fut, addr) = spawn_server(
             storage,
             locks,
-            &addr,
+            addr,
             self.authenticated,
             self.authentication_server,
-        ))
+        )
+        .await?;
+
+        Ok((Box::pin(fut), addr))
     }
 
     /// Spawns the server and runs it to completion. This will run forever
@@ -348,22 +347,22 @@ impl LocalServerBuilder {
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let server = self.spawn(addr, locks).await?;
+        let (server, addr) = self.spawn(addr, locks).await?;
 
-        log::info!("Listening on {}", server.addr());
+        log::info!("Listening on {}", addr);
 
         server.await?;
         Ok(())
     }
 }
 
-fn spawn_server<S, L>(
+async fn spawn_server<S, L>(
     storage: S,
     locks: L,
-    addr: &SocketAddr,
+    addr: SocketAddr,
     authenticated: bool,
     authentication_server: Option<String>,
-) -> impl Server
+) -> Result<(impl Future<Output = Result<(), Error>>, SocketAddr), Error>
 where
     S: Storage + Send + Sync + 'static,
     S::Error: Into<Error>,
@@ -374,23 +373,81 @@ where
     let locks = Arc::new(locks);
     let cache = Arc::new(RwLock::new(LinkedHashMap::new()));
 
-    let new_service = make_service_fn(move |socket: &AddrStream| {
-        // Create our app.
-        let service = App::new(storage.clone(), locks.clone());
-        let cache = Arc::clone(&cache);
+    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    let server = hyper_util::server::conn::auto::Builder::new(
+        hyper_util::rt::TokioExecutor::new(),
+    );
 
-        // Wrap the app in an auth middleware. If not authenticated, wrapper
-        // acts as a passthrough service.
-        let auth = Auth::new(
-            service,
-            cache,
-            authenticated,
-            authentication_server.clone(),
-        );
+    Ok((
+        async move {
+            let graceful =
+                hyper_util::server::graceful::GracefulShutdown::new();
+            let mut ctrl_c = pin!(tokio::signal::ctrl_c());
+            loop {
+                tokio::select! {
+                    conn = listener.accept() => {
+                        let (stream, peer_addr) = match conn {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                log::error!("accept error: {}", e);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        };
+                        // Create our app.
+                        let app = App::new(storage.clone(), locks.clone());
+                        let cache = Arc::clone(&cache);
 
-        // Add logging middleware
-        future::ok::<_, Infallible>(Logger::new(socket.remote_addr(), auth))
-    });
+                        // Wrap the app in an auth middleware. If not authenticated, wrapper
+                        // acts as a passthrough service.
+                        let auth = Auth::new(
+                            app,
+                            cache,
+                            authenticated,
+                            authentication_server.clone(),
+                        );
 
-    hyper::Server::bind(addr).serve(new_service)
+                        // Add logging middleware
+                        let logger = Logger::new(peer_addr, auth);
+                        let svc = TowerToHyperService::new(logger);
+
+                        let service = ServiceBuilder::new()
+                            .service(svc);
+
+                        let stream = hyper_util::rt::TokioIo::new(Box::pin(stream));
+
+                        let conn = server.serve_connection(stream, service);
+
+                        let conn = graceful.watch(conn.into_owned());
+
+                        tokio::spawn(async move {
+                            if let Err(err) = conn.await {
+                                log::error!("connection error: {}", err);
+                            }
+                            log::error!("connection dropped: {}", peer_addr);
+                        });
+                    },
+
+                    _ = ctrl_c.as_mut() => {
+                        drop(listener);
+                        log::info!("Ctrl-C received, starting shutdown");
+                            break;
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = graceful.shutdown() => {
+                    log::info!("Gracefully shutdown!");
+                    Ok(())
+                },
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    log::info!("Waited 10 seconds for graceful shutdown, aborting...");
+                    Ok(())
+                }
+            }
+        },
+        addr,
+    ))
 }

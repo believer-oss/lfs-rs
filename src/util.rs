@@ -18,13 +18,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use crate::app::BoxBody;
 use crate::error::Error;
+use bytes::Bytes;
 use core::mem;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use futures::TryStreamExt;
-use hyper::body::Body;
+use http_body_util::BodyExt;
+use http_body_util::BodyStream;
+use http_body_util::Full;
+use hyper::body::Incoming;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -162,24 +167,39 @@ impl AsyncWrite for NamedTempFile {
     }
 }
 
-pub async fn from_json<T>(mut body: Body) -> Result<T, Error>
+pub async fn from_json<T>(body: Incoming) -> Result<T, Error>
 where
     T: for<'de> Deserialize<'de>,
 {
     let mut buf = Vec::new();
+    let mut stream = BodyStream::new(body);
 
-    while let Some(chunk) = body.try_next().await? {
-        buf.extend(chunk);
+    while let Some(chunk) = stream.try_next().await? {
+        if chunk.is_data() {
+            buf.extend_from_slice(chunk.into_data().unwrap().as_ref());
+        }
     }
 
     Ok(serde_json::from_slice(&buf)?)
 }
 
 #[allow(clippy::result_large_err)]
-pub fn into_json<T>(value: &T) -> Result<Body, Error>
+pub fn into_json<T>(value: &T) -> Result<Bytes, Error>
 where
     T: Serialize,
 {
     let bytes = serde_json::to_vec_pretty(value)?;
     Ok(bytes.into())
+}
+
+pub fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+pub fn empty() -> BoxBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }

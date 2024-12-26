@@ -18,66 +18,76 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::io;
-
-use core::task::{Context, Poll};
-
-use askama::Template;
 use futures::{
     future::{self, BoxFuture},
-    stream::TryStreamExt,
+    TryStreamExt,
 };
-use http::HeaderMap;
-use http::{self, header, StatusCode, Uri};
-use hyper::{self, body::Body, service::Service, Method, Request, Response};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    task::{Context, Poll},
+    time::Duration,
+};
 
+use http::{self, header, HeaderMap, StatusCode, Uri};
+use http_body_util::{BodyDataStream, BodyExt, StreamBody};
+use hyper::{
+    self,
+    body::{Frame, Incoming},
+    Method, Request, Response,
+};
+use tower::Service;
 use url::form_urlencoded;
+
+use askama::Template;
+use bytes::Bytes;
 
 use crate::auth::UserRepoInfo;
 use crate::error::Error;
 use crate::hyperext::RequestExt;
 use crate::lfs;
-use crate::locks::LockStoreError;
 use crate::locks::{
     CreateLockBatchRequest, CreateLockRequest, ListLocksResponse, Lock,
-    LockBatchOuter, LockOuter, LockStorage, OwnerInfo, ReleaseLockBatchRequest,
-    ReleaseLockRequest, VerifyLocksRequest, VerifyLocksResponse,
+    LockBatchOuter, LockOuter, LockStorage, LockStoreError, OwnerInfo,
+    ReleaseLockBatchRequest, ReleaseLockRequest, VerifyLocksRequest,
+    VerifyLocksResponse,
 };
 use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
-use crate::util::from_json;
-use crate::util::into_json;
-use std::time::Duration;
+use crate::{empty, from_json, full, into_json};
+
 #[cfg(feature = "otel")]
 use tracing::instrument;
 
 const UPLOAD_EXPIRATION: Duration = Duration::from_secs(30 * 60);
 
-fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, Body) {
+fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
     match err.downcast_ref::<LockStoreError>() {
         Some(e @ LockStoreError::CreateConflict(l)) => (
             StatusCode::CONFLICT,
-            into_json(&lfs::BatchResponseError {
-                locks: Some(l.clone()),
-                message: e.to_string(),
-                documentation_url: None,
-                request_id: None,
-            })
-            .unwrap(),
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: Some(l.clone()),
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
         ),
         Some(LockStoreError::NotImplemented) => {
-            (StatusCode::NOT_FOUND, Body::empty())
+            (StatusCode::NOT_FOUND, empty())
         }
         None | Some(LockStoreError::InternalServerError) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            into_json(&lfs::BatchResponseError {
-                locks: None,
-                message: err.to_string(),
-                documentation_url: None,
-                request_id: None,
-            })
-            .unwrap(),
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: err.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
         ),
     }
 }
@@ -101,6 +111,9 @@ impl<S, L> App<S, L> {
     }
 }
 
+pub type Req = Request<Incoming>;
+pub type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Error>;
+
 impl<S, L> App<S, L>
 where
     S: Storage + Send + Sync,
@@ -110,32 +123,32 @@ where
 {
     /// Handles the index route.
     #[cfg_attr(feature = "otel", instrument(level = "debug", skip(req)))]
-    fn index(req: Request<Body>) -> Result<Response<Body>, Error> {
+    fn index(req: Req) -> Result<Response<BoxBody>, Error> {
         let template = IndexTemplate {
             title: "Rudolfs",
-            api: req.base_uri().path_and_query("/api").build().unwrap(),
+            api: req.base_uri().path_and_query("/api").build()?,
         };
 
         Ok(Response::builder()
             .status(StatusCode::OK)
-            .body(template.render()?.into())?)
+            .body(full(template.render()?))?)
     }
 
     /// Generates a "404 not found" response.
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
-    fn not_found(_req: Request<Body>) -> Result<Response<Body>, Error> {
+    fn not_found(_req: Req) -> Result<Response<BoxBody>, Error> {
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body("Not found".into())?)
+            .body(full("Not found"))?)
     }
 
     /// Generates a "403 forbidden" response.
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
-    fn forbidden(_req: Request<Body>) -> Result<Response<Body>, Error> {
+    fn forbidden(_req: Req) -> Result<Response<BoxBody>, Error> {
         Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-            .body(Body::empty())?)
+            .body(empty())?)
     }
 
     /// Handles `/api` routes.
@@ -146,8 +159,8 @@ where
     async fn api(
         storage: S,
         locks: L,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, Error> {
+        req: Request<Incoming>,
+    ) -> Result<Response<BoxBody>, Error> {
         let mut parts = req.uri().path().split('/').filter(|s| !s.is_empty());
 
         // Skip over the '/api' part.
@@ -161,7 +174,7 @@ where
             _ => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from("Missing org/project in URL"))?)
+                    .body(full("Missing org/project in URL"))?)
             }
         };
 
@@ -174,7 +187,7 @@ where
                     None => {
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(Body::from("Missing OID parameter."))?)
+                            .body(full("Missing OID parameter."))?)
                     }
                 };
 
@@ -200,14 +213,14 @@ where
                 if let Some(user) = user {
                     match (req.method(), parts.next()) {
                         (&Method::GET, None) => {
-                            if !user.permissions.unwrap().pull {
+                            if !user.permissions.unwrap_or_default().pull {
                                 return Self::forbidden(req);
                             }
 
                             Self::list_locks(locks, req, namespace).await
                         }
                         (&Method::POST, None) => {
-                            if !user.permissions.unwrap().push {
+                            if !user.permissions.unwrap_or_default().push {
                                 return Self::forbidden(req);
                             }
 
@@ -220,7 +233,7 @@ where
                             .await
                         }
                         (&Method::POST, Some("batch")) => {
-                            if !user.permissions.unwrap().push {
+                            if !user.permissions.unwrap_or_default().push {
                                 return Self::forbidden(req);
                             }
 
@@ -247,7 +260,7 @@ where
                             }
                         }
                         (&Method::POST, Some("verify")) => {
-                            if !user.permissions.unwrap().push {
+                            if !user.permissions.unwrap_or_default().push {
                                 return Self::forbidden(req);
                             }
 
@@ -260,7 +273,7 @@ where
                             .await
                         }
                         (&Method::POST, Some(id)) => {
-                            if !user.permissions.unwrap().push {
+                            if !user.permissions.unwrap_or_default().push {
                                 return Self::forbidden(req);
                             }
 
@@ -297,19 +310,27 @@ where
     )]
     async fn download(
         storage: S,
-        _req: Request<Body>,
+        _req: Req,
         key: StorageKey,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         if let Some(object) = storage.get(&key).await? {
+            let len = &object.len().to_string();
+            let body_stream = StreamBody::new(
+                object
+                    .stream()
+                    .map_ok(Frame::data)
+                    .map_err(|e: std::io::Error| e.into()),
+            );
+            let boxed_body = body_stream.boxed_unsync();
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, object.len())
-                .body(Body::wrap_stream(object.stream()))?)
+                .header(header::CONTENT_LENGTH, len)
+                .body(boxed_body)?)
         } else {
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())?)
+                .body(empty())?)
         }
     }
 
@@ -320,9 +341,9 @@ where
     )]
     async fn upload(
         storage: S,
-        req: Request<Body>,
+        req: Request<Incoming>,
         key: StorageKey,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let len = req
             .headers()
             .get("Content-Length")
@@ -334,23 +355,22 @@ where
             None => {
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from("Invalid Content-Length header."))
+                    .body(full("Invalid Content-Length header."))
                     .map_err(Into::into);
             }
         };
 
         // Verify the SHA256 of the uploaded object as it is being uploaded.
-        let stream = req
-            .into_body()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        let body = req.into_body();
+        let stream = BodyDataStream::new(body)
+            .try_filter_map(|chunk| async { Ok(Some(chunk)) })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
         let object = LFSObject::new(len, Box::pin(stream));
 
         storage.put(key, object).await?;
 
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())?)
+        Ok(Response::builder().status(StatusCode::OK).body(empty())?)
     }
 
     /// Verifies that an LFS object exists on the server.
@@ -360,9 +380,9 @@ where
     )]
     async fn verify(
         storage: S,
-        req: Request<Body>,
+        req: Request<Incoming>,
         namespace: Namespace,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: lfs::VerifyRequest = from_json(req.into_body()).await?;
         let key = StorageKey::new(namespace, val.oid);
 
@@ -370,14 +390,14 @@ where
             if size == val.size {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::empty())?);
+                    .body(empty())?);
             }
         }
 
         // Object doesn't exist or the size is incorrect.
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())?)
+            .body(empty())?)
     }
 
     /// Batch API endpoint for the Git LFS server spec.
@@ -390,11 +410,11 @@ where
     )]
     async fn batch(
         storage: S,
-        req: Request<Body>,
+        req: Request<Incoming>,
         namespace: Namespace,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         // Get the host name and scheme.
-        let uri = req.base_uri().path_and_query("/").build().unwrap();
+        let uri = req.base_uri().path_and_query("/").build()?;
         let headers = req.headers().clone();
 
         match from_json::<lfs::BatchRequest>(req.into_body()).await {
@@ -428,7 +448,7 @@ where
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(into_json(&response)?)?)
+                    .body(full(into_json(&response)?))?)
             }
             Err(err) => {
                 let response = lfs::BatchResponseError {
@@ -440,16 +460,16 @@ where
 
                 Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(into_json(&response).unwrap())?)
+                    .body(full(into_json(&response)?))?)
             }
         }
     }
 
     async fn list_locks(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let params: Option<HashMap<String, String>> =
             req.uri().query().map(|q| {
                 form_urlencoded::parse(q.as_bytes())
@@ -481,7 +501,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -498,10 +518,10 @@ where
 
     async fn create_lock(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
         owner: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: CreateLockRequest = from_json(req.into_body()).await?;
 
         match locks
@@ -526,7 +546,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -543,10 +563,10 @@ where
 
     async fn create_lock_batch(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
         owner: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: CreateLockBatchRequest = from_json(req.into_body()).await?;
 
         match locks
@@ -562,7 +582,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -579,10 +599,10 @@ where
 
     async fn list_locks_for_verification(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
         owner: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: VerifyLocksRequest = from_json(req.into_body()).await?;
         match locks
             .verify_locks(namespace.to_string(), owner, val.cursor, val.limit)
@@ -601,7 +621,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -618,11 +638,11 @@ where
 
     async fn release_lock(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
         id: String,
         owner: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: ReleaseLockRequest = from_json(req.into_body()).await?;
         match locks
             .release_lock(namespace.to_string(), owner, id, val.force)
@@ -646,7 +666,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -663,10 +683,10 @@ where
 
     async fn release_lock_batch(
         locks: L,
-        req: Request<Body>,
+        req: Req,
         namespace: Namespace,
         owner: String,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response<BoxBody>, Error> {
         let val: ReleaseLockBatchRequest = from_json(req.into_body()).await?;
         match locks
             .release_locks(namespace.to_string(), owner, val.paths, val.force)
@@ -681,7 +701,7 @@ where
                         header::CONTENT_TYPE,
                         "application/vnd.git-lfs+json",
                     )
-                    .body(into_json(&resp).unwrap())?)
+                    .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
                 let (status, body) = handle_lock_error_response(err);
@@ -878,14 +898,14 @@ fn extract_auth_header(
     }
 }
 
-impl<S, L> Service<Request<Body>> for App<S, L>
+impl<S, L> Service<Req> for App<S, L>
 where
     S: Storage + Clone + Send + Sync + 'static,
     S::Error: Into<Error> + 'static,
     L: LockStorage + Clone + Send + Sync + 'static,
     Error: From<S::Error>,
 {
-    type Response = Response<Body>;
+    type Response = Response<BoxBody>;
     type Error = Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -896,7 +916,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         if req.uri().path() == "/" {
             Box::pin(future::ready(Self::index(req)))
         } else if req.uri().path().starts_with("/api/") {

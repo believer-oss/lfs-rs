@@ -25,9 +25,13 @@ use std::time::Instant;
 
 use futures::future::{BoxFuture, FutureExt};
 use humantime::format_duration;
-use hyper::{service::Service, Body, Request, Response};
+use hyper::{body::Incoming, Request, Response};
+use tower::Service;
+
+use crate::app::BoxBody;
 
 /// Wraps a service to provide logging on both the request and the response.
+#[derive(Debug, Clone)]
 pub struct Logger<S> {
     remote_addr: SocketAddr,
     service: S,
@@ -42,9 +46,9 @@ impl<S> Logger<S> {
     }
 }
 
-impl<S> Service<Request<Body>> for Logger<S>
+impl<S> Service<Request<Incoming>> for Logger<S>
 where
-    S: Service<Request<Body>, Response = Response<Body>>,
+    S: Service<Request<Incoming>, Response = Response<BoxBody>>,
     S::Future: Send + 'static,
     S::Error: fmt::Display + Send + 'static,
 {
@@ -59,7 +63,7 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let remote_addr = self.remote_addr;

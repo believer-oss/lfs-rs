@@ -1,21 +1,28 @@
-use crate::error::Error;
-use crate::storage::Namespace;
-use base64::{engine::general_purpose, Engine as _};
 use core::task::{Context, Poll};
 use futures::future::BoxFuture;
+use std::{sync::Arc, time::Instant};
+
+use crate::storage::Namespace;
+use crate::util::{empty, full};
+use crate::{app::BoxBody, error::Error};
+
 use http::{self, header, HeaderMap, HeaderValue, StatusCode};
+use http_body_util::BodyExt;
 use hyper::{
     self,
-    body::{Body, Buf, HttpBody},
-    service::Service,
-    Client, Request, Response,
+    body::{Buf, Incoming},
+    Request, Response,
 };
 use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use tower::Service;
+
+use base64::{engine::general_purpose, Engine as _};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Instant};
+
 #[cfg(feature = "otel")]
 use tracing::instrument;
 use tracing::{event, Level};
@@ -58,7 +65,9 @@ pub struct UserRepoInfo {
     pub username: Option<String>,
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default,
+)]
 pub struct Permissions {
     #[serde(default)]
     pub admin: bool,
@@ -123,7 +132,8 @@ impl<S> Auth<S> {
                 }
             }
 
-            let client = Client::builder().build(HttpsConnector::new());
+            let client = Client::builder(TokioExecutor::new())
+                .build(HttpsConnector::new());
 
             let url = format!(
                 "{}/repos/{}/{}",
@@ -136,7 +146,7 @@ impl<S> Auth<S> {
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header(header::AUTHORIZATION, auth)
                 .header(header::USER_AGENT, "rudolfs")
-                .body(Body::empty())?;
+                .body(empty())?;
 
             let res = client.request(req).await?;
 
@@ -178,13 +188,14 @@ impl<S> Auth<S> {
         auth: &HeaderValue,
         server: &str,
     ) -> Result<Option<String>, Error> {
-        let client = Client::builder().build(HttpsConnector::new());
+        let client =
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::new());
 
         let req = Request::get(format!("{}/user", server))
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::AUTHORIZATION, auth)
             .header(header::USER_AGENT, "rudolfs")
-            .body(Body::empty())?;
+            .body(empty())?;
 
         let res = client.request(req).await?;
 
@@ -209,9 +220,11 @@ impl<S> Auth<S> {
     }
 }
 
-impl<S> Service<Request<Body>> for Auth<S>
+type Req = Request<Incoming>;
+
+impl<S> Service<Req> for Auth<S>
 where
-    S: Service<Request<Body>, Response = Response<Body>>
+    S: Service<Req, Response = Response<BoxBody>>
         + Send
         + Sync
         + Clone
@@ -231,7 +244,7 @@ where
     }
 
     #[cfg_attr(feature = "otel", instrument(level = "debug", skip_all))]
-    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: Req) -> Self::Future {
         event!(Level::DEBUG, path = ?req.uri().path());
 
         if (!self.authenticated) || (!req.uri().path().starts_with("/api/")) {
@@ -255,7 +268,7 @@ where
                 _ => {
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from("Missing org/project in URL"))?)
+                        .body(full("Missing org/project in URL"))?)
                 }
             };
 
@@ -270,7 +283,7 @@ where
                 Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-                    .body(Body::empty())?)
+                    .body(empty())?)
             } else {
                 let ext = req.extensions_mut();
                 ext.insert(user.unwrap());

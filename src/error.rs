@@ -30,12 +30,14 @@ pub enum Error {
     Io(io::Error),
     Http(http::Error),
     Hyper(hyper::Error),
+    HyperUtil(hyper_util::client::legacy::Error),
     Json(serde_json::Error),
     Sha256(Sha256Error),
     Sha256Verify(Sha256VerifyError),
     S3(storage::S3Error),
     S3DiskCache(<storage::S3DiskCache as Storage>::Error),
     Askama(askama::Error),
+    Infallible(std::convert::Infallible),
 }
 
 impl std::error::Error for Error {}
