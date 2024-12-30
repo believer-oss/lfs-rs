@@ -1,12 +1,17 @@
-use crate::lfs::Oid;
 use futures::StreamExt;
+
+use crate::lfs::Oid;
+
+use anyhow::{anyhow, bail, Result};
 use hex::FromHex;
-use redis::{from_redis_value, AsyncCommands, AsyncIter, FromRedisValue};
+pub use redis::{
+    from_redis_value, AsyncCommands, AsyncIter, FromRedisValue, RedisError,
+};
 
 use super::{
-    ListLocksResponse, Lock, LockBatch, LockStorage, VerifyLocksResponse,
+    ListLocksResponse, Lock, LockBatch, LockStorage, LockStoreError as Error,
+    VerifyLocksResponse,
 };
-use anyhow::{anyhow, bail, Error, Result};
 use async_trait::async_trait;
 use sha2::Digest;
 
@@ -24,11 +29,11 @@ impl RedisLockStore {
         })
     }
 
-    async fn get_lock_from_oid(&self, oid: &Oid) -> Result<Vec<Lock>> {
+    async fn get_lock_from_oid(&self, oid: &Oid) -> Result<Vec<Lock>, Error> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         match con.get::<String, Lock>(oid.to_string()).await {
             Ok(v) => Ok(vec![v]),
-            Err(_) => Err(anyhow!(super::LockStoreError::InternalServerError)),
+            Err(_) => Err(super::LockStoreError::LockNotFound(oid.to_string())),
         }
     }
 }
@@ -83,7 +88,9 @@ impl LockStorage for RedisLockStore {
                 serde_json::from_str(v.as_str())?
             )))
         } else {
-            Err(anyhow!(super::LockStoreError::InternalServerError))
+            Err(anyhow!(super::LockStoreError::InternalServerError(
+                "could not create lock".to_string()
+            )))
         }
     }
 
@@ -124,7 +131,9 @@ impl LockStorage for RedisLockStore {
                 }
                 Err(_) => {
                     return Err(anyhow!(
-                        super::LockStoreError::InternalServerError
+                        super::LockStoreError::InternalServerError(
+                            "path not found".to_string()
+                        )
                     ))
                 }
             }

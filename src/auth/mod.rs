@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "otel")]
-use tracing::instrument;
+use tracing::{instrument, Instrument as _};
+
 use tracing::{event, Level};
 
 type GithubAuthCache = Arc<RwLock<LinkedHashMap<String, AuthCacheEntry>>>;
@@ -122,7 +123,7 @@ impl<S> Auth<S> {
                 event!(
                     Level::DEBUG,
                     message = "cache hit",
-                    key = key,
+                    key = format!("{}", &key[0..4]),
                     age = entry.timestamp.elapsed().as_secs()
                 );
 
@@ -243,16 +244,35 @@ where
         self.service.poll_ready(cx)
     }
 
-    #[cfg_attr(feature = "otel", instrument(level = "debug", skip_all))]
+    #[cfg_attr(
+        feature = "otel",
+        instrument(
+            name = "auth.call",
+            level = "debug",
+            skip_all,
+            fields(authenticated, cache.entries, server)
+        )
+    )]
     fn call(&mut self, mut req: Req) -> Self::Future {
-        event!(Level::DEBUG, path = ?req.uri().path());
+        log::debug!("checking auth for {}", &req.uri());
 
         if (!self.authenticated) || (!req.uri().path().starts_with("/api/")) {
+            log::trace!("skipping auth");
             return Box::pin(self.service.call(req));
         };
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("authenticated", true);
+
         let mut service = self.service.clone();
+
         let cache = Arc::clone(&self.cache);
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("cache.entries", cache.read().len());
+
         let server = self.server.clone();
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("server", &server);
+
         let auth_fut = async move {
             let mut parts =
                 req.uri().path().split('/').filter(|s| !s.is_empty());
@@ -278,7 +298,6 @@ where
 
             // All endpoints require authentication, so return early
             // if we have no user or permissions.
-            #[allow(clippy::unnecessary_unwrap)]
             if user.is_none() || user.as_ref().unwrap().permissions.is_none() {
                 Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -290,6 +309,10 @@ where
                 service.call(req).await
             }
         };
+
+        #[cfg(feature = "otel")]
+        let auth_fut = auth_fut.instrument(tracing::info_span!("auth"));
+
         Box::pin(auth_fut)
     }
 }

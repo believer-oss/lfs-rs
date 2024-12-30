@@ -18,15 +18,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use futures::{
-    future::{self, BoxFuture},
-    TryStreamExt,
-};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     task::{Context, Poll},
     time::Duration,
+};
+
+use futures::{
+    future::{self, BoxFuture},
+    TryStreamExt,
 };
 
 use http::{self, header, HeaderMap, StatusCode, Uri};
@@ -56,7 +57,13 @@ use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
 use crate::{empty, from_json, full, into_json};
 
 #[cfg(feature = "otel")]
+use crate::util::RedactedHeaders;
+#[cfg(feature = "otel")]
+use opentelemetry::trace::FutureExt;
+#[cfg(feature = "otel")]
 use tracing::instrument;
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const UPLOAD_EXPIRATION: Duration = Duration::from_secs(30 * 60);
 
@@ -77,7 +84,56 @@ fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
         Some(LockStoreError::NotImplemented) => {
             (StatusCode::NOT_FOUND, empty())
         }
-        None | Some(LockStoreError::InternalServerError) => (
+        #[cfg(feature = "redis")]
+        Some(LockStoreError::RedisError(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
+        Some(LockStoreError::DeleteNotFound(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
+        Some(LockStoreError::LockNotFound(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
+        Some(LockStoreError::InternalServerError(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             full(
                 into_json(&lfs::BatchResponseError {
@@ -916,7 +972,44 @@ where
         Poll::Ready(Ok(()))
     }
 
+    #[cfg_attr(
+        feature = "otel",
+        instrument(
+            level = "info",
+            skip(self, req),
+            name = "http.request",
+            fields(
+                method = req.method().as_str(),
+                path = req.uri().path(),
+                query = req.uri().query().unwrap_or_default(),
+                headers
+            )
+        )
+    )]
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+        #[cfg(feature = "otel")]
+        {
+            let span = tracing::Span::current();
+
+            span.record(
+                "headers",
+                format!("{}", RedactedHeaders(req.headers().clone())),
+            );
+            let ctx = span.context();
+
+            if req.uri().path() == "/" {
+                Box::pin(future::ready(Self::index(req)).with_context(ctx))
+            } else if req.uri().path().starts_with("/api/") {
+                Box::pin(
+                    Self::api(self.storage.clone(), self.locks.clone(), req)
+                        .with_context(ctx),
+                )
+            } else {
+                Box::pin(future::ready(Self::not_found(req)).with_context(ctx))
+            }
+        }
+
+        #[cfg(not(feature = "otel"))]
         if req.uri().path() == "/" {
             Box::pin(future::ready(Self::index(req)))
         } else if req.uri().path().starts_with("/api/") {

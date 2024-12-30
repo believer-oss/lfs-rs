@@ -35,6 +35,8 @@ use lfs_rs::RedisLs;
 mod init_tracing;
 #[cfg(feature = "otel")]
 use init_tracing::setup_tracing;
+#[cfg(feature = "otel")]
+use tracing::{field, instrument, span};
 
 // Additional help to append to the end when `--help` is specified.
 static AFTER_HELP: &str = include_str!("help.md");
@@ -63,7 +65,7 @@ enum Backend {
     Local(LocalArgs),
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct GlobalArgs {
     /// The host or address to listen on. If this is not specified, then
     /// `0.0.0.0` is used where the port can be specified with `--port`
@@ -107,7 +109,7 @@ fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
     FromHex::from_hex(s)
 }
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Debug)]
 enum LockBackend {
     /// Starts the server with DynamoDB as the lock backend.
     #[cfg(feature = "dynamodb")]
@@ -142,7 +144,7 @@ impl From<&str> for LockBackend {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub struct LockArgs {
     /// Locking backend to use
     #[clap(
@@ -190,7 +192,7 @@ pub struct LockArgs {
     dynamodb_table: Option<String>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct S3Args {
     /// Amazon S3 bucket to use.
     #[clap(long, env = "RUDOLFS_S3_BUCKET")]
@@ -231,6 +233,10 @@ impl Args {
         #[cfg(feature = "otel")]
         let _guard = setup_tracing(self.global.log_level);
 
+        #[cfg(feature = "otel")]
+        let server_span =
+            span!(tracing::Level::INFO, "server", local_addr = field::Empty);
+
         log::info!("Starting server...");
 
         // Find a socket address to bind to. This will resolve domain names.
@@ -241,6 +247,9 @@ impl Args {
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8080))),
             None => SocketAddr::from(([0, 0, 0, 0], self.global.port)),
         };
+
+        #[cfg(feature = "otel")]
+        server_span.record("local_addr", addr.to_string());
 
         log::info!("Initializing storage...");
 
@@ -258,6 +267,10 @@ impl Args {
 }
 
 impl S3Args {
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "info", name = "s3args.run")
+    )]
     async fn run(
         self,
         addr: SocketAddr,
@@ -306,6 +319,10 @@ impl S3Args {
 }
 
 impl LocalArgs {
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "info", skip(self), name = "http.request")
+    )]
     async fn run(
         self,
         addr: SocketAddr,

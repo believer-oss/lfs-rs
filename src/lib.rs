@@ -421,12 +421,13 @@ where
 
                         let conn = graceful.watch(conn.into_owned());
 
-                        tokio::spawn(async move {
+                        let handler = async move {
                             if let Err(err) = conn.await {
                                 log::error!("connection error: {}", err);
                             }
                             log::error!("connection dropped: {}", peer_addr);
-                        });
+                        };
+                        tokio::spawn(handler);
                     },
 
                     _ = ctrl_c.as_mut() => {

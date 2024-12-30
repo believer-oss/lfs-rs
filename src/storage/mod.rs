@@ -39,7 +39,6 @@ use crate::lfs::Oid;
 
 use std::fmt;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,7 +48,7 @@ use futures::{
     channel::mpsc,
     future::Either,
     sink::SinkExt,
-    stream::{BoxStream, Stream, StreamExt},
+    stream::{BoxStream, StreamExt},
     Future,
 };
 
@@ -59,8 +58,7 @@ pub type S3DiskCache = Cached<Disk, S3>;
 pub type StorageStream<T, E> = BoxStream<'static, Result<T, E>>;
 
 /// The byte stream of an LFS object.
-pub type ByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
+pub type ByteStream = BoxStream<'static, Result<Bytes, io::Error>>;
 
 /// A namespace is used to categorize stored LFS objects. The storage
 /// implementation is free to ignore this. However, it can be useful when
@@ -135,6 +133,12 @@ pub struct LFSObject {
 
     /// The stream of bytes.
     stream: ByteStream,
+}
+
+impl fmt::Debug for LFSObject {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("LFSObject").field("len", &self.len).finish()
+    }
 }
 
 impl LFSObject {

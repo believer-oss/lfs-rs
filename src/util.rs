@@ -18,27 +18,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::app::BoxBody;
-use crate::error::Error;
-use bytes::Bytes;
-use core::mem;
-use core::ops::Deref;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::{
+    fmt, mem,
+    ops::Deref,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use futures::TryStreamExt;
-use http_body_util::BodyExt;
-use http_body_util::BodyStream;
-use http_body_util::Full;
-use hyper::body::Incoming;
-use serde::Deserialize;
-use serde::Serialize;
-
 use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use http::HeaderMap;
+use http_body_util::{BodyExt, BodyStream, Full};
+use hyper::body::Incoming;
+use serde::{Deserialize, Serialize};
 
 use tokio::{
     fs,
     io::{self, AsyncRead, AsyncWrite, ReadBuf},
 };
+
+use crate::app::BoxBody;
+use crate::error::Error;
 
 /// A temporary file path. When dropped, the file is deleted.
 #[derive(Debug)]
@@ -202,4 +203,20 @@ pub fn empty() -> BoxBody {
     Full::new(Bytes::new())
         .map_err(|never| match never {})
         .boxed_unsync()
+}
+
+pub struct RedactedHeaders(pub HeaderMap);
+
+// Redact the Authorization header.
+impl fmt::Display for RedactedHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (key, value) in &self.0 {
+            if key == "authorization" {
+                writeln!(f, "{}: [REDACTED]", key)?;
+            } else {
+                writeln!(f, "{}: {}", key, value.to_str().unwrap_or_default())?;
+            }
+        }
+        Ok(())
+    }
 }

@@ -38,6 +38,8 @@ use futures::{stream, TryStreamExt};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+
+#[cfg(feature = "otel")]
 use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
@@ -235,7 +237,7 @@ impl Backend {
 impl Storage for Backend {
     type Error = Error;
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn get(
         &self,
         key: &StorageKey,
@@ -266,7 +268,7 @@ impl Storage for Backend {
         Ok(resp)
     }
 
-    #[instrument(skip(self, value))]
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn put(
         &self,
         key: StorageKey,
@@ -353,7 +355,7 @@ impl Storage for Backend {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         let resp = self
             .client
@@ -395,6 +397,7 @@ impl Storage for Backend {
             .map(|cdn| format!("{}/{}", cdn, self.key_to_path(key)))
     }
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn upload_url(
         &self,
         key: &StorageKey,

@@ -598,7 +598,7 @@ impl LockStorage for DynamoLockStore {
                 ":repo",
                 AttributeValue::S(repo.clone()),
             )
-            .expression_attribute_values(":id", AttributeValue::S(id));
+            .expression_attribute_values(":id", AttributeValue::S(id.clone()));
 
         let output = request.send().await?;
 
@@ -626,7 +626,7 @@ impl LockStorage for DynamoLockStore {
 
             Ok(lock)
         } else {
-            Err(anyhow!(super::LockStoreError::InternalServerError))
+            Err(anyhow!(super::LockStoreError::DeleteNotFound(id)))
         }
     }
 
