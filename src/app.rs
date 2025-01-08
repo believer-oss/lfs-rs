@@ -496,10 +496,13 @@ where
                 });
 
                 let objects = future::try_join_all(objects).await?;
-                let response = lfs::BatchResponse {
-                    transfer: Some(lfs::Transfer::Basic),
-                    objects,
-                };
+                let mut transfer = Some(lfs::Transfer::Basic);
+                if let Some(transfers) = val.transfers {
+                    if transfers.contains(&lfs::Transfer::LfsRs) {
+                        transfer = Some(lfs::Transfer::LfsRs)
+                    }
+                }
+                let response = lfs::BatchResponse { transfer, objects };
 
                 Ok(Response::builder()
                     .status(StatusCode::OK)
