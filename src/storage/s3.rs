@@ -411,7 +411,7 @@ impl Storage for Backend {
             PresigningConfig::expires_in(expires_in).unwrap();
         let resp = self
             .client
-            .get_object()
+            .put_object()
             .bucket(self.bucket.clone())
             .key(self.key_to_path(key))
             .presigned(presigning_config)
