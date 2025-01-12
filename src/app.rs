@@ -847,44 +847,51 @@ where
                     authenticated: Some(true),
                     actions: None,
                 },
-                None => lfs::ResponseObject {
-                    oid: object.oid,
-                    size: object.size,
-                    error: None,
-                    authenticated: Some(true),
-                    actions: Some(lfs::Actions {
-                        download: None,
-                        upload: Some(lfs::Action {
-                            href: storage
-                                .upload_url(
-                                    &StorageKey::new(
-                                        namespace.clone(),
-                                        object.oid,
-                                    ),
-                                    UPLOAD_EXPIRATION,
-                                )
-                                .await
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "{}api/{}/object/{}",
-                                        uri, namespace, object.oid
-                                    )
-                                }),
-                            header: extract_auth_header(headers),
-                            expires_in: Some(upload_expiry_secs),
-                            expires_at: None,
-                        }),
-                        verify: Some(lfs::Action {
-                            href: format!(
-                                "{}api/{}/objects/verify",
-                                uri, namespace
+                None => {
+                    // If we're returning a pre-signed URL, don't also reflect the auth header back
+                    // to the client.
+                    let (upload_url, header) = match storage
+                        .upload_url(
+                            &StorageKey::new(namespace.clone(), object.oid),
+                            UPLOAD_EXPIRATION,
+                        )
+                        .await
+                    {
+                        Some(url) => (url, None),
+                        None => (
+                            format!(
+                                "{}api/{}/object/{}",
+                                uri, namespace, object.oid
                             ),
-                            header: extract_auth_header(headers),
-                            expires_in: None,
-                            expires_at: None,
+                            extract_auth_header(headers),
+                        ),
+                    };
+
+                    lfs::ResponseObject {
+                        oid: object.oid,
+                        size: object.size,
+                        error: None,
+                        authenticated: Some(true),
+                        actions: Some(lfs::Actions {
+                            download: None,
+                            upload: Some(lfs::Action {
+                                href: upload_url,
+                                header,
+                                expires_in: Some(upload_expiry_secs),
+                                expires_at: None,
+                            }),
+                            verify: Some(lfs::Action {
+                                href: format!(
+                                    "{}api/{}/objects/verify",
+                                    uri, namespace
+                                ),
+                                header: extract_auth_header(headers),
+                                expires_in: None,
+                                expires_at: None,
+                            }),
                         }),
-                    }),
-                },
+                    }
+                }
             }
         }
         lfs::Operation::Download => {
