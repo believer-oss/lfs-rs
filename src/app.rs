@@ -848,8 +848,8 @@ where
                     actions: None,
                 },
                 None => {
-                    // If we're returning a pre-signed URL, don't also reflect the auth header back
-                    // to the client.
+                    // If we're returning a pre-signed URL, don't also reflect
+                    // the auth header back to the client.
                     let (upload_url, header) = match storage
                         .upload_url(
                             &StorageKey::new(namespace.clone(), object.oid),
