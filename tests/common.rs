@@ -555,7 +555,9 @@ pub fn init_logger() {
     let telemetry = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    Registry::default().with(telemetry).init();
+    let subscriber = Registry::default().with(telemetry);
+    // ignore any errors if we fail to set the global default
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 pub fn startup() -> EnteredSpan {

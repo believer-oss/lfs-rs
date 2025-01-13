@@ -65,7 +65,7 @@ use tracing::instrument;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-const UPLOAD_EXPIRATION: Duration = Duration::from_secs(30 * 60);
+const PRESIGNED_URL_EXPIRATION: Duration = Duration::from_secs(30 * 60);
 
 fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
     match err.downcast_ref::<LockStoreError>() {
@@ -838,7 +838,7 @@ where
             //
             // If the object does not exist, then we should return an upload
             // action.
-            let upload_expiry_secs = UPLOAD_EXPIRATION.as_secs() as i32;
+            let upload_expiry_secs = PRESIGNED_URL_EXPIRATION.as_secs() as i32;
             match size {
                 Some(size) => lfs::ResponseObject {
                     oid: object.oid,
@@ -853,7 +853,7 @@ where
                     let (upload_url, header) = match storage
                         .upload_url(
                             &StorageKey::new(namespace.clone(), object.oid),
-                            UPLOAD_EXPIRATION,
+                            PRESIGNED_URL_EXPIRATION,
                         )
                         .await
                     {
@@ -895,6 +895,32 @@ where
             }
         }
         lfs::Operation::Download => {
+            // If we're returning a pre-signed URL, don't also reflect
+            // the auth header back to the client.
+            let (download_url, header) = match storage
+                .download_url(
+                    &StorageKey::new(namespace.clone(), object.oid),
+                    PRESIGNED_URL_EXPIRATION,
+                )
+                .await
+            {
+                Some(url) => (url, None),
+                None => (
+                    storage
+                        .public_url(&StorageKey::new(
+                            namespace.clone(),
+                            object.oid,
+                        ))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}api/{}/object/{}",
+                                uri, namespace, object.oid
+                            )
+                        }),
+                    extract_auth_header(headers),
+                ),
+            };
+
             // If the object does not exist, then we should return a 404 error
             // for this object.
             match size {
@@ -905,18 +931,8 @@ where
                     authenticated: Some(true),
                     actions: Some(lfs::Actions {
                         download: Some(lfs::Action {
-                            href: storage
-                                .public_url(&StorageKey::new(
-                                    namespace.clone(),
-                                    object.oid,
-                                ))
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "{}api/{}/object/{}",
-                                        uri, namespace, object.oid
-                                    )
-                                }),
-                            header: extract_auth_header(headers),
+                            href: download_url,
+                            header,
                             expires_in: None,
                             expires_at: None,
                         }),

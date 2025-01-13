@@ -206,6 +206,11 @@ struct S3Args {
     /// prefixed with this URL.
     #[clap(long = "cdn", env = "RUDOLFS_S3_CDN")]
     cdn: Option<String>,
+
+    /// Use AWS S3 Transfer Acceleration endpoints. The endpoint must have
+    /// transfer acceleration enabled.
+    #[clap(long = "s3ta", env = "RUDOLFS_S3TA")]
+    s3_accelerate: bool,
 }
 
 #[derive(Parser)]
@@ -283,6 +288,10 @@ impl S3Args {
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);
+        }
+
+        if self.s3_accelerate {
+            builder.s3_accelerate(self.s3_accelerate);
         }
 
         if let Some(cache_dir) = global_args.cache_dir {
