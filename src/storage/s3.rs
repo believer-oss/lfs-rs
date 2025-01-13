@@ -469,7 +469,9 @@ impl Storage for Backend {
         // Don't use a presigned URL if we're not using a CDN or S3 Transfer
         // Acceleration. Otherwise, uploads will bypass the encryption
         // process and fail to download.
-        self.cdn.as_ref()?;
+        if self.cdn.is_none() && self.presigned_client.is_none() {
+            return None;
+        }
 
         let presigning_config =
             PresigningConfig::expires_in(expires_in).unwrap();
