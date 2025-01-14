@@ -406,6 +406,7 @@ where
                         // Create our app.
                         let app = App::new(storage.clone(), locks.clone());
                         let cache = Arc::clone(&cache);
+                        stream.set_nodelay(true)?;
 
                         // Wrap the app in an auth middleware. If not authenticated, wrapper
                         // acts as a passthrough service.
