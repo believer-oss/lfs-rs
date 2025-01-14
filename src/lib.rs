@@ -433,7 +433,7 @@ where
                             if let Err(err) = conn.await {
                                 log::error!("connection error: {}", err);
                             }
-                            log::error!("connection dropped: {}", peer_addr);
+                            log::debug!("connection dropped: {}", peer_addr);
                         };
                         tokio::spawn(handler);
                     },

@@ -73,16 +73,18 @@ where
         Box::pin(self.service.call(req).inspect(
             move |response| match response {
                 Ok(response) => log::info!(
-                    "[{}] {} {} - {} ({})",
+                    "[{}:{}] {} {} - {} ({})",
                     remote_addr.ip(),
+                    remote_addr.port(),
                     method,
                     uri,
                     response.status(),
                     format_duration(start.elapsed()),
                 ),
                 Err(err) => log::error!(
-                    "[{}] {} {} - {} ({})",
+                    "[{}:{}] {} {} - {} ({})",
                     remote_addr.ip(),
+                    remote_addr.port(),
                     method,
                     uri,
                     err,
