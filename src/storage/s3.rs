@@ -161,8 +161,8 @@ pub struct Backend {
     /// URL for the CDN. Example: https://lfscdn.myawesomegit.com
     cdn: Option<String>,
 
-    /// Presigned URL client
-    presigned_client: Option<Client>,
+    /// S3 client for generating presigned URLs
+    accelerate_client: Option<Client>,
 }
 
 impl Backend {
@@ -208,7 +208,8 @@ impl Backend {
         let sdk_config = shared_config.load().await;
         client = Client::new(&sdk_config);
 
-        let presigned_client = if s3_accelerate {
+        // S3 client used for signing accelerate upload and download URLs.
+        let accelerate_client = if s3_accelerate {
             let service_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                 .accelerate(true)
                 .build();
@@ -284,7 +285,7 @@ impl Backend {
             bucket,
             prefix,
             cdn,
-            presigned_client,
+            accelerate_client,
         })
     }
 
@@ -451,15 +452,16 @@ impl Storage for Backend {
         Box::pin(stream::empty())
     }
 
-    // Public URL is used to send a static download URL to the client.
+    // Public URL is used to send a static download URL to the client for the
+    // CDN config
     fn public_url(&self, key: &StorageKey) -> Option<String> {
         self.cdn
             .as_ref()
             .map(|cdn| format!("{}/{}", cdn, self.key_to_path(key)))
     }
 
-    // Upload URL is used for the CDN case and the S3 Transfer Acceleration
-    // case.
+    // Upload URL is used for the CDN config and the S3 Transfer Acceleration
+    // config.
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn upload_url(
         &self,
@@ -469,14 +471,14 @@ impl Storage for Backend {
         // Don't use a presigned URL if we're not using a CDN or S3 Transfer
         // Acceleration. Otherwise, uploads will bypass the encryption
         // process and fail to download.
-        if self.cdn.is_none() && self.presigned_client.is_none() {
+        if self.cdn.is_none() && self.accelerate_client.is_none() {
             return None;
         }
 
         let presigning_config =
             PresigningConfig::expires_in(expires_in).unwrap();
 
-        let client = if let Some(client) = &self.presigned_client {
+        let client = if let Some(client) = &self.accelerate_client {
             client
         } else {
             &self.client
@@ -507,13 +509,13 @@ impl Storage for Backend {
         // Don't use a presigned URL if we're not using S3 Transfer
         // Acceleration. Otherwise, uploads will bypass the encryption
         // process and fail to download.
-        self.presigned_client.as_ref()?;
+        self.accelerate_client.as_ref()?;
 
         let presigning_config =
             PresigningConfig::expires_in(expires_in).unwrap();
 
         let resp = self
-            .presigned_client
+            .accelerate_client
             .as_ref()?
             .get_object()
             .bucket(self.bucket.clone())
