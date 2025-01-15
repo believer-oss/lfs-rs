@@ -239,6 +239,13 @@ pub trait Storage {
         key: &StorageKey,
         expires_in: Duration,
     ) -> Option<String>;
+
+    /// Returns a signed URL
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String>;
 }
 
 #[async_trait]
@@ -300,6 +307,14 @@ where
         expires_in: Duration,
     ) -> Option<String> {
         self.as_ref().upload_url(key, expires_in).await
+    }
+
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        self.as_ref().download_url(key, expires_in).await
     }
 }
 
@@ -397,6 +412,18 @@ where
         match self {
             Either::Left(x) => x.upload_url(key, expires_in),
             Either::Right(x) => x.upload_url(key, expires_in),
+        }
+        .await
+    }
+
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        match self {
+            Either::Left(x) => x.download_url(key, expires_in),
+            Either::Right(x) => x.download_url(key, expires_in),
         }
         .await
     }

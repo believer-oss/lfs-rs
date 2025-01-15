@@ -84,6 +84,7 @@ pub struct S3ServerBuilder {
     key: Option<[u8; 32]>,
     prefix: Option<String>,
     cdn: Option<String>,
+    s3_accelerate: bool,
     cache: Option<Cache>,
     authenticated: bool,
     authentication_server: Option<String>,
@@ -95,6 +96,7 @@ impl S3ServerBuilder {
             bucket,
             prefix: None,
             cdn: None,
+            s3_accelerate: false,
             key,
             cache: None,
             authenticated: false,
@@ -124,6 +126,12 @@ impl S3ServerBuilder {
     /// encryption since the LFS object is not sent to Rudolfs.
     pub fn cdn(&mut self, url: String) -> &mut Self {
         self.cdn = Some(url);
+        self
+    }
+
+    /// Sets the flag to use S3 accelerate endpoints.
+    pub fn s3_accelerate(&mut self, s3_accelerate: bool) -> &mut Self {
+        self.s3_accelerate = s3_accelerate;
         self
     }
 
@@ -175,7 +183,7 @@ impl S3ServerBuilder {
             }
         }
 
-        let s3 = S3::new(self.bucket, prefix, self.cdn)
+        let s3 = S3::new(self.bucket, prefix, self.cdn, self.s3_accelerate)
             .map_err(Error::from)
             .await?;
 
@@ -398,6 +406,7 @@ where
                         // Create our app.
                         let app = App::new(storage.clone(), locks.clone());
                         let cache = Arc::clone(&cache);
+                        stream.set_nodelay(true)?;
 
                         // Wrap the app in an auth middleware. If not authenticated, wrapper
                         // acts as a passthrough service.
@@ -425,7 +434,7 @@ where
                             if let Err(err) = conn.await {
                                 log::error!("connection error: {}", err);
                             }
-                            log::error!("connection dropped: {}", peer_addr);
+                            log::debug!("connection dropped: {}", peer_addr);
                         };
                         tokio::spawn(handler);
                     },

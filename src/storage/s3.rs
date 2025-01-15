@@ -160,6 +160,9 @@ pub struct Backend {
 
     /// URL for the CDN. Example: https://lfscdn.myawesomegit.com
     cdn: Option<String>,
+
+    /// S3 client for generating presigned URLs
+    accelerate_client: Option<Client>,
 }
 
 impl Backend {
@@ -167,6 +170,7 @@ impl Backend {
         bucket: String,
         mut prefix: String,
         cdn: Option<String>,
+        s3_accelerate: bool,
     ) -> Result<Self, Error> {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
@@ -204,12 +208,24 @@ impl Backend {
         let sdk_config = shared_config.load().await;
         client = Client::new(&sdk_config);
 
+        // S3 client used for signing accelerate upload and download URLs.
+        let accelerate_client = if s3_accelerate {
+            let service_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+                .accelerate(true)
+                .build();
+            Some(Client::from_conf(service_config))
+        } else {
+            None
+        };
+
         // Perform a HEAD operation to check that the bucket exists and that
         // our credentials work. This helps catch very common errors early on
-        // in application startup.
+        // in application startup. Exit on error, since we can't do anything
+        // useful.
         let resp = client.head_bucket().bucket(bucket.clone()).send().await;
         if resp.is_err() {
             log::error!("Failed to connect to S3 bucket '{}'", bucket);
+            std::process::exit(1);
         } else {
             log::info!(
                 "Connecting to S3 bucket '{}' at region '{}'",
@@ -220,11 +236,56 @@ impl Backend {
             );
         }
 
+        // If we expect to use transfer acceleration, check that it is enabled.
+        if s3_accelerate {
+            let resp = client
+                .get_bucket_accelerate_configuration()
+                .bucket(bucket.clone())
+                .send()
+                .await;
+            if resp.is_err() {
+                log::error!(
+                    "Failed to check S3 transfer acceleration for bucket '{}'",
+                    bucket
+                );
+                std::process::exit(1);
+            } else {
+                let status = resp.unwrap().status.expect(
+                    "Unable to determine S3 transfer acceleration status",
+                );
+                match status.as_str() {
+                    "Enabled" => log::info!(
+                        "S3 transfer acceleration is enabled for bucket '{}'",
+                        bucket
+                    ),
+                    "Suspended" => {
+                        log::error!(
+                            "S3 transfer acceleration is suspended for bucket \
+                             '{}'",
+                            bucket
+                        );
+                        log::error!(
+                            "Please enable S3 transfer acceleration for this \
+                             bucket or disable configuration"
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => log::warn!(
+                        "S3 transfer acceleration is in an unknown state '{}' \
+                         for bucket '{}'",
+                        status,
+                        bucket
+                    ),
+                }
+            }
+        }
+
         Ok(Backend {
             client,
             bucket,
             prefix,
             cdn,
+            accelerate_client,
         })
     }
 
@@ -391,27 +452,72 @@ impl Storage for Backend {
         Box::pin(stream::empty())
     }
 
+    // Public URL is used to send a static download URL to the client for the
+    // CDN config
     fn public_url(&self, key: &StorageKey) -> Option<String> {
         self.cdn
             .as_ref()
             .map(|cdn| format!("{}/{}", cdn, self.key_to_path(key)))
     }
 
+    // Upload URL is used for the CDN config and the S3 Transfer Acceleration
+    // config.
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn upload_url(
         &self,
         key: &StorageKey,
         expires_in: Duration,
     ) -> Option<String> {
-        // Don't use a presigned URL if we're not using a CDN. Otherwise,
-        // uploads will bypass the encryption process and fail to download.
-        self.cdn.as_ref()?;
+        // Don't use a presigned URL if we're not using a CDN or S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        if self.cdn.is_none() && self.accelerate_client.is_none() {
+            return None;
+        }
 
         let presigning_config =
             PresigningConfig::expires_in(expires_in).unwrap();
-        let resp = self
-            .client
+
+        let client = if let Some(client) = &self.accelerate_client {
+            client
+        } else {
+            &self.client
+        };
+
+        let resp = client
             .put_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .presigned(presigning_config)
+            .await;
+
+        let presigned_url = match resp {
+            Ok(presigned_request) => presigned_request.uri().to_string(),
+            _ => return None,
+        };
+
+        Some(presigned_url)
+    }
+
+    // Download URL is only used when S3 Transfer Acceleration is enabled.
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        // Don't use a presigned URL if we're not using S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        self.accelerate_client.as_ref()?;
+
+        let presigning_config =
+            PresigningConfig::expires_in(expires_in).unwrap();
+
+        let resp = self
+            .accelerate_client
+            .as_ref()?
+            .get_object()
             .bucket(self.bucket.clone())
             .key(self.key_to_path(key))
             .presigned(presigning_config)
