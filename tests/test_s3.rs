@@ -154,7 +154,7 @@ async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     if creds.s3ta_enabled {
         eprintln!(
-            "Skipping test. CDN is required and not set in test credentials."
+            "Skipping test. S3 Transfer Acceleration is required and not set in test credentials config."
         );
         return Ok(());
     }
