@@ -33,11 +33,12 @@ pub enum Operation {
 }
 
 /// A transfer adaptor.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transfer {
     /// Basic transfer adapter.
     Basic,
+    LfsRs,
 
     LfsStandaloneFile,
 
