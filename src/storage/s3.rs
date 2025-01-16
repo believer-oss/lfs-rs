@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use aws_config::Region;
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
-use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_bucket::HeadBucketError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
-use aws_sdk_s3::operation::put_object::PutObjectError;
-use aws_sdk_s3::operation::upload_part::UploadPartError;
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadError,
+    create_multipart_upload::CreateMultipartUploadError,
+    get_object::GetObjectError, head_bucket::HeadBucketError,
+    head_object::HeadObjectError, put_object::PutObjectError,
+    upload_part::UploadPartError,
+};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
@@ -38,6 +38,9 @@ use futures::{stream, TryStreamExt};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
+
+#[cfg(feature = "otel")]
+use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 use derive_more::{Display, From};
@@ -51,7 +54,6 @@ pub enum Error {
     Upload(UploadPartError),
     CompleteMultipart(CompleteMultipartUploadError),
     Head(HeadObjectError),
-    Generic(String),
 
     Stream(std::io::Error),
 
@@ -102,13 +104,13 @@ impl ::std::error::Error for Error {}
 
 #[derive(Debug, Display)]
 pub enum InitError {
-    #[display(fmt = "Invalid S3 bucket name")]
+    #[display("Invalid S3 bucket name")]
     Bucket,
 
-    #[display(fmt = "Invalid S3 credentials")]
+    #[display("Invalid S3 credentials")]
     Credentials,
 
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     Other(String),
 }
 
@@ -158,6 +160,9 @@ pub struct Backend {
 
     /// URL for the CDN. Example: https://lfscdn.myawesomegit.com
     cdn: Option<String>,
+
+    /// S3 client for generating presigned URLs
+    accelerate_client: Option<Client>,
 }
 
 impl Backend {
@@ -165,31 +170,33 @@ impl Backend {
         bucket: String,
         mut prefix: String,
         cdn: Option<String>,
+        s3_accelerate: bool,
     ) -> Result<Self, Error> {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
             prefix.pop();
         }
 
-        let (region, endpoint_url) =
-            if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
-                // If a custom endpoint is set, do not use the AWS default
-                // (us-east-1). Instead, check environment variables for a region
-                // name.
-                let name = std::env::var("AWS_DEFAULT_REGION")
-                    .or_else(|_| std::env::var("AWS_REGION"))
-                    .map_err(|_| {
-                        InitError::Other(
+        let (region, endpoint_url) = if let Ok(endpoint) =
+            std::env::var("AWS_S3_ENDPOINT")
+        {
+            // If a custom endpoint is set, do not use the AWS default
+            // (us-east-1). Instead, check environment variables for a region
+            // name.
+            let name = std::env::var("AWS_DEFAULT_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .map_err(|_| {
+                    InitError::Other(
                         "$AWS_S3_ENDPOINT was set without $AWS_DEFAULT_REGION \
                          or $AWS_REGION being set. Custom endpoints don't \
                          make sense without also setting a region."
                             .into(),
                     )
-                    })?;
-                (Region::new(name), Some(endpoint))
-            } else {
-                (Region::new("us-east-1"), None)
-            };
+                })?;
+            (Region::new(name), Some(endpoint))
+        } else {
+            (Region::new("us-east-1"), None)
+        };
 
         let client: Client;
         let mut shared_config =
@@ -201,12 +208,24 @@ impl Backend {
         let sdk_config = shared_config.load().await;
         client = Client::new(&sdk_config);
 
+        // S3 client used for signing accelerate upload and download URLs.
+        let accelerate_client = if s3_accelerate {
+            let service_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+                .accelerate(true)
+                .build();
+            Some(Client::from_conf(service_config))
+        } else {
+            None
+        };
+
         // Perform a HEAD operation to check that the bucket exists and that
         // our credentials work. This helps catch very common errors early on
-        // in application startup.
+        // in application startup. Exit on error, since we can't do anything
+        // useful.
         let resp = client.head_bucket().bucket(bucket.clone()).send().await;
         if resp.is_err() {
             log::error!("Failed to connect to S3 bucket '{}'", bucket);
+            std::process::exit(1);
         } else {
             log::info!(
                 "Connecting to S3 bucket '{}' at region '{}'",
@@ -217,16 +236,59 @@ impl Backend {
             );
         }
 
+        // If we expect to use transfer acceleration, check that it is enabled.
+        if s3_accelerate {
+            let resp = client
+                .get_bucket_accelerate_configuration()
+                .bucket(bucket.clone())
+                .send()
+                .await;
+            if resp.is_err() {
+                log::error!(
+                    "Failed to check S3 transfer acceleration for bucket '{}'",
+                    bucket
+                );
+                std::process::exit(1);
+            } else {
+                let status = resp.unwrap().status.expect(
+                    "Unable to determine S3 transfer acceleration status",
+                );
+                match status.as_str() {
+                    "Enabled" => log::info!(
+                        "S3 transfer acceleration is enabled for bucket '{}'",
+                        bucket
+                    ),
+                    "Suspended" => {
+                        log::error!(
+                            "S3 transfer acceleration is suspended for bucket \
+                             '{}'",
+                            bucket
+                        );
+                        log::error!(
+                            "Please enable S3 transfer acceleration for this \
+                             bucket or disable configuration"
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => log::warn!(
+                        "S3 transfer acceleration is in an unknown state '{}' \
+                         for bucket '{}'",
+                        status,
+                        bucket
+                    ),
+                }
+            }
+        }
+
         Ok(Backend {
             client,
             bucket,
             prefix,
             cdn,
+            accelerate_client,
         })
     }
-}
 
-impl Backend {
     fn key_to_path(&self, key: &StorageKey) -> String {
         format!("{}/{}/{}", self.prefix, key.namespace(), key.oid().path())
     }
@@ -236,6 +298,7 @@ impl Backend {
 impl Storage for Backend {
     type Error = Error;
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn get(
         &self,
         key: &StorageKey,
@@ -266,6 +329,7 @@ impl Storage for Backend {
         Ok(resp)
     }
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn put(
         &self,
         key: StorageKey,
@@ -273,7 +337,8 @@ impl Storage for Backend {
     ) -> Result<(), Self::Error> {
         let (_len, stream) = value.into_parts();
 
-        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload to upload the file.
+        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload
+        // to upload the file.
         let multipart_upload_resp = self
             .client
             .create_multipart_upload()
@@ -351,6 +416,7 @@ impl Storage for Backend {
         Ok(())
     }
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         let resp = self
             .client
@@ -386,25 +452,71 @@ impl Storage for Backend {
         Box::pin(stream::empty())
     }
 
+    // Public URL is used to send a static download URL to the client for the
+    // CDN config
     fn public_url(&self, key: &StorageKey) -> Option<String> {
         self.cdn
             .as_ref()
             .map(|cdn| format!("{}/{}", cdn, self.key_to_path(key)))
     }
 
+    // Upload URL is used for the CDN config and the S3 Transfer Acceleration
+    // config.
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn upload_url(
         &self,
         key: &StorageKey,
         expires_in: Duration,
     ) -> Option<String> {
-        // Don't use a presigned URL if we're not using a CDN. Otherwise,
-        // uploads will bypass the encryption process and fail to download.
-        self.cdn.as_ref()?;
+        // Don't use a presigned URL if we're not using a CDN or S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        if self.cdn.is_none() && self.accelerate_client.is_none() {
+            return None;
+        }
 
         let presigning_config =
             PresigningConfig::expires_in(expires_in).unwrap();
+
+        let client = if let Some(client) = &self.accelerate_client {
+            client
+        } else {
+            &self.client
+        };
+
+        let resp = client
+            .put_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .presigned(presigning_config)
+            .await;
+
+        let presigned_url = match resp {
+            Ok(presigned_request) => presigned_request.uri().to_string(),
+            _ => return None,
+        };
+
+        Some(presigned_url)
+    }
+
+    // Download URL is only used when S3 Transfer Acceleration is enabled.
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        // Don't use a presigned URL if we're not using S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        self.accelerate_client.as_ref()?;
+
+        let presigning_config =
+            PresigningConfig::expires_in(expires_in).unwrap();
+
         let resp = self
-            .client
+            .accelerate_client
+            .as_ref()?
             .get_object()
             .bucket(self.bucket.clone())
             .key(self.key_to_path(key))

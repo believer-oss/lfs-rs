@@ -25,7 +25,8 @@ pub struct OtelGuard {
     meter_provider: SdkMeterProvider,
 }
 
-// Create a Resource that captures information about the entity for which telemetry is recorded.
+// Create a Resource that captures information about the entity for which
+// telemetry is recorded.
 fn resource() -> Resource {
     Resource::from_schema_url(
         [

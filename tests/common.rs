@@ -3,11 +3,16 @@
 
 // mod common;
 use base64::Engine;
+use bytes::Bytes;
 use duct::cmd;
 use futures::future::Either;
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use lfs_rs::{
     into_json, CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter,
-    LockStorage, ReleaseLockBatchRequest, Server,
+    LockStorage, ReleaseLockBatchRequest,
 };
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -18,6 +23,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Output;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::span::EnteredSpan;
 use wiremock::matchers::{header, method, path};
@@ -33,6 +39,19 @@ use opentelemetry_sdk::runtime;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{prelude::*, Registry};
 
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>;
+
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn empty() -> BoxBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
 /// A temporary git repository.
 pub struct GitRepo {
     repo: tempfile::TempDir,
@@ -191,7 +210,7 @@ impl GitRepo {
 
     async fn send_lock_request(
         uri: String,
-        json: hyper::body::Body,
+        json: Bytes,
         user: u32,
         expected_failures: Vec<&str>,
     ) -> anyhow::Result<()> {
@@ -200,14 +219,17 @@ impl GitRepo {
 
         let request = hyper::Request::post(uri)
             .header("authorization", format!("Basic {}", auth))
-            .body(json)
+            .body(Full::new(json))
             .unwrap();
 
-        let client = hyper::Client::new();
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build_http();
+
         let resp = client.request(request).await?;
         let status = resp.status();
 
-        let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+        let body_bytes = resp.into_body().collect().await?.to_bytes();
 
         assert!(
             status.is_success(),
@@ -533,7 +555,9 @@ pub fn init_logger() {
     let telemetry = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    Registry::default().with(telemetry).init();
+    let subscriber = Registry::default().with(telemetry);
+    // ignore any errors if we fail to set the global default
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 pub fn startup() -> EnteredSpan {
@@ -554,13 +578,11 @@ pub async fn smoke_test(
 
     let mock = GitRepo::setup_mock_gh_auth().await;
 
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = LocalServerBuilder::new(data.path().into(), key);
     server.authenticated(true);
     server.authentication_server(mock.uri());
-    let server = server
-        .spawn(SocketAddr::from(([127, 0, 0, 1], 0)), locks)
-        .await?;
-    let addr = server.addr();
+    let (server, addr) = server.spawn(addr, locks).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 

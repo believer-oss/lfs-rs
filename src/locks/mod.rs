@@ -18,14 +18,22 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum LockStoreError {
     #[error("already created lock")]
     CreateConflict(Lock),
     #[error("not implemented")]
     NotImplemented,
-    #[error("internal server error")]
-    InternalServerError,
+    #[error("internal server error: {0}")]
+    InternalServerError(String),
+    #[error("deleting key that does not exist: {0}")]
+    DeleteNotFound(String),
+    #[error("lock not found: {0}")]
+    LockNotFound(String),
+    #[cfg(feature = "redis")]
+    #[error("redis error: {0}")]
+    RedisError(#[from] redis::RedisError),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

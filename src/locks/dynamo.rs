@@ -340,6 +340,10 @@ impl LockStorage for DynamoLockStore {
         }
     }
 
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", skip(self), ret)
+    )]
     async fn create_locks(
         &self,
         repo: String,
@@ -499,7 +503,7 @@ impl LockStorage for DynamoLockStore {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(level = "info", skip(self))
     )]
     async fn verify_locks(
         &self,
@@ -598,7 +602,7 @@ impl LockStorage for DynamoLockStore {
                 ":repo",
                 AttributeValue::S(repo.clone()),
             )
-            .expression_attribute_values(":id", AttributeValue::S(id));
+            .expression_attribute_values(":id", AttributeValue::S(id.clone()));
 
         let output = request.send().await?;
 
@@ -626,10 +630,14 @@ impl LockStorage for DynamoLockStore {
 
             Ok(lock)
         } else {
-            Err(anyhow!(super::LockStoreError::InternalServerError))
+            Err(anyhow!(super::LockStoreError::DeleteNotFound(id)))
         }
     }
 
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", skip(self), ret)
+    )]
     async fn release_locks(
         &self,
         repo: String,

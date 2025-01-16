@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use futures::future::Either;
-use lfs_rs::{LocalServerBuilder, Server};
+use lfs_rs::LocalServerBuilder;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -47,10 +47,9 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let locks = lfs_rs::NoneLs::new();
 
     let server = LocalServerBuilder::new(data.path().into(), key);
-    let server = server
+    let (server, addr) = server
         .spawn(SocketAddr::from(([0, 0, 0, 0], 0)), locks)
         .await?;
-    let addr = server.addr();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
