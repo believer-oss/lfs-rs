@@ -340,6 +340,10 @@ impl LockStorage for DynamoLockStore {
         }
     }
 
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", skip(self), ret)
+    )]
     async fn create_locks(
         &self,
         repo: String,
@@ -499,7 +503,7 @@ impl LockStorage for DynamoLockStore {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(level = "info", skip(self))
     )]
     async fn verify_locks(
         &self,
@@ -630,6 +634,10 @@ impl LockStorage for DynamoLockStore {
         }
     }
 
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", skip(self), ret)
+    )]
     async fn release_locks(
         &self,
         repo: String,
