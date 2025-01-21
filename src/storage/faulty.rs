@@ -129,10 +129,18 @@ where
     ) -> Option<String> {
         self.storage.upload_url(key, expires_in).await
     }
+
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        self.storage.download_url(key, expires_in).await
+    }
 }
 
 #[derive(Debug, Display)]
-#[display(fmt = "injected fault")]
+#[display("injected fault")]
 pub struct FaultError;
 
 impl std::error::Error for FaultError {}
