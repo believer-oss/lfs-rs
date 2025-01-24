@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Jason White
+// Copyright (c) 2020 Jason White
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,43 +18,42 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 use async_trait::async_trait;
-use backoff::future::retry;
-use backoff::ExponentialBackoff;
-use bytes::{Bytes, BytesMut};
-use derive_more::{Display, From};
-use futures::{stream, stream::TryStreamExt};
-use http::{HeaderMap, StatusCode};
-use rusoto_core::request::BufferedHttpResponse;
-use rusoto_core::{HttpClient, Region, RusotoError};
-use rusoto_credential::{
-    AutoRefreshingProvider, DefaultCredentialsProvider, ProvideAwsCredentials,
+use aws_config::Region;
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadError,
+    create_multipart_upload::CreateMultipartUploadError,
+    get_object::GetObjectError, head_bucket::HeadBucketError,
+    head_object::HeadObjectError, put_object::PutObjectError,
+    upload_part::UploadPartError,
 };
-use rusoto_s3::{
-    CompleteMultipartUploadError, CompleteMultipartUploadRequest,
-    CompletedMultipartUpload, CompletedPart, CreateMultipartUploadError,
-    CreateMultipartUploadRequest, GetObjectError, GetObjectRequest,
-    HeadBucketError, HeadBucketRequest, HeadObjectError, HeadObjectRequest,
-    PutObjectError, PutObjectRequest, S3Client, StreamingBody, UploadPartError,
-    UploadPartRequest, S3,
-};
-use rusoto_sts::WebIdentityProvider;
+use aws_sdk_s3::presigning::PresigningConfig;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::Client;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::ByteStream;
+use bytes::BytesMut;
+use futures::{stream, TryStreamExt};
 use tokio::io::AsyncReadExt;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::io::ReaderStream;
+
+#[cfg(feature = "otel")]
+use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
-use rusoto_s3::util::{PreSignedRequest, PreSignedRequestOption};
+use derive_more::{Display, From};
 use std::time::Duration;
-
-type BoxedCredentialProvider =
-    Box<dyn ProvideAwsCredentials + Send + Sync + 'static>;
 
 #[derive(Debug, From, Display)]
 pub enum Error {
-    Get(RusotoError<GetObjectError>),
-    Put(RusotoError<PutObjectError>),
-    CreateMultipart(RusotoError<CreateMultipartUploadError>),
-    Upload(RusotoError<UploadPartError>),
-    CompleteMultipart(RusotoError<CompleteMultipartUploadError>),
-    Head(RusotoError<HeadObjectError>),
+    Get(GetObjectError),
+    Put(PutObjectError),
+    CreateMultipart(CreateMultipartUploadError),
+    Upload(UploadPartError),
+    CompleteMultipart(CompleteMultipartUploadError),
+    Head(HeadObjectError),
 
     Stream(std::io::Error),
 
@@ -63,23 +62,55 @@ pub enum Error {
 
     /// The uploaded object is too large.
     TooLarge(u64),
+}
 
-    Tls(rusoto_core::request::TlsError),
+impl From<SdkError<GetObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<GetObjectError, HttpResponse>) -> Self {
+        Error::Get(err.into_service_error())
+    }
+}
 
-    Credentials(rusoto_credential::CredentialsError),
+impl From<SdkError<PutObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<PutObjectError, HttpResponse>) -> Self {
+        Error::Put(err.into_service_error())
+    }
+}
+
+impl From<SdkError<CreateMultipartUploadError, HttpResponse>> for Error {
+    fn from(err: SdkError<CreateMultipartUploadError, HttpResponse>) -> Self {
+        Error::CreateMultipart(err.into_service_error())
+    }
+}
+
+impl From<SdkError<UploadPartError, HttpResponse>> for Error {
+    fn from(err: SdkError<UploadPartError, HttpResponse>) -> Self {
+        Error::Upload(err.into_service_error())
+    }
+}
+
+impl From<SdkError<CompleteMultipartUploadError, HttpResponse>> for Error {
+    fn from(err: SdkError<CompleteMultipartUploadError, HttpResponse>) -> Self {
+        Error::CompleteMultipart(err.into_service_error())
+    }
+}
+
+impl From<SdkError<HeadObjectError, HttpResponse>> for Error {
+    fn from(err: SdkError<HeadObjectError, HttpResponse>) -> Self {
+        Error::Head(err.into_service_error())
+    }
 }
 
 impl ::std::error::Error for Error {}
 
 #[derive(Debug, Display)]
 pub enum InitError {
-    #[display(fmt = "Invalid S3 bucket name")]
+    #[display("Invalid S3 bucket name")]
     Bucket,
 
-    #[display(fmt = "Invalid S3 credentials")]
+    #[display("Invalid S3 credentials")]
     Credentials,
 
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     Other(String),
 }
 
@@ -101,37 +132,25 @@ impl InitError {
     }
 }
 
-impl From<RusotoError<HeadBucketError>> for InitError {
-    fn from(err: RusotoError<HeadBucketError>) -> Self {
+impl From<HeadBucketError> for InitError {
+    fn from(err: HeadBucketError) -> Self {
         match err {
-            RusotoError::Credentials(_) => InitError::Credentials,
-            RusotoError::Unknown(r) => {
-                // Rusoto really sucks at correctly reporting errors.
-                // Lets work around that here.
-                match r.status {
-                    StatusCode::NOT_FOUND => InitError::Bucket,
-                    StatusCode::FORBIDDEN => InitError::Credentials,
-                    _ => InitError::Other(format!(
-                        "S3 returned HTTP status {}",
-                        r.status
-                    )),
-                }
-            }
-            RusotoError::Service(HeadBucketError::NoSuchBucket(_)) => {
-                InitError::Bucket
-            }
-            x => InitError::Other(x.to_string()),
+            HeadBucketError::NotFound(_not_found) => InitError::Bucket,
+            x => match x.meta().code() {
+                Some(status) => InitError::Other(format!(
+                    "S3 returned HTTP status {}",
+                    status
+                )),
+                None => InitError::Other(x.to_string()),
+            },
         }
     }
 }
 
 /// Amazon S3 storage backend.
-pub struct Backend<C = S3Client> {
+pub struct Backend {
     /// S3 client.
-    client: C,
-
-    // AWS Credentials. Used for signing URLs.
-    credential_provider: BoxedCredentialProvider,
+    client: Client,
 
     /// Name of the bucket to use.
     bucket: String,
@@ -142,7 +161,8 @@ pub struct Backend<C = S3Client> {
     /// URL for the CDN. Example: https://lfscdn.myawesomegit.com
     cdn: Option<String>,
 
-    region: Region,
+    /// S3 client for generating presigned URLs
+    accelerate_client: Option<Client>,
 }
 
 impl Backend {
@@ -150,13 +170,16 @@ impl Backend {
         bucket: String,
         mut prefix: String,
         cdn: Option<String>,
+        s3_accelerate: bool,
     ) -> Result<Self, Error> {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
             prefix.pop();
         }
 
-        let region = if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
+        let (region, endpoint_url) = if let Ok(endpoint) =
+            std::env::var("AWS_S3_ENDPOINT")
+        {
             // If a custom endpoint is set, do not use the AWS default
             // (us-east-1). Instead, check environment variables for a region
             // name.
@@ -170,93 +193,99 @@ impl Backend {
                             .into(),
                     )
                 })?;
-
-            Region::Custom { name, endpoint }
+            (Region::new(name), Some(endpoint))
         } else {
-            Region::default()
+            (Region::new("us-east-1"), None)
         };
 
-        log::info!(
-            "Connecting to S3 bucket '{}' at region '{}'",
-            bucket,
-            region.name()
-        );
+        let client: Client;
+        let mut shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+        if endpoint_url.is_some() {
+            shared_config = shared_config.endpoint_url(endpoint_url.unwrap());
+            shared_config = shared_config.region(region.clone());
+        }
+        let sdk_config = shared_config.load().await;
+        client = Client::new(&sdk_config);
 
-        // Check if there is any k8s credential provider. If there is, use it.
-        let k8s_provider = WebIdentityProvider::from_k8s_env();
+        // S3 client used for signing accelerate upload and download URLs.
+        let accelerate_client = if s3_accelerate {
+            let service_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+                .accelerate(true)
+                .build();
+            Some(Client::from_conf(service_config))
+        } else {
+            None
+        };
 
-        let (client, credential_provider): (_, BoxedCredentialProvider) =
-            if k8s_provider.credentials().await.is_ok() {
-                log::info!("Using credentials from Kubernetes");
-                let provider = AutoRefreshingProvider::new(k8s_provider)?;
-                let client = S3Client::new_with(
-                    HttpClient::new()?,
-                    provider.clone(),
-                    region.clone(),
-                );
-                (client, Box::new(provider))
-            } else {
-                let client = S3Client::new(region.clone());
-                let provider = DefaultCredentialsProvider::new()?;
-                (client, Box::new(provider))
-            };
-
-        Backend::with_client(
-            client,
-            bucket,
-            prefix,
-            cdn,
-            region,
-            credential_provider,
-        )
-        .await
-    }
-}
-
-impl<C> Backend<C> {
-    pub async fn with_client(
-        client: C,
-        bucket: String,
-        prefix: String,
-        cdn: Option<String>,
-        region: Region,
-        credential_provider: BoxedCredentialProvider,
-    ) -> Result<Self, Error>
-    where
-        C: S3 + Clone,
-    {
         // Perform a HEAD operation to check that the bucket exists and that
         // our credentials work. This helps catch very common errors early on
-        // in application startup.
-        let req = HeadBucketRequest {
-            bucket: bucket.clone(),
-            ..Default::default()
-        };
+        // in application startup. Exit on error, since we can't do anything
+        // useful.
+        let resp = client.head_bucket().bucket(bucket.clone()).send().await;
+        if resp.is_err() {
+            log::error!("Failed to connect to S3 bucket '{}'", bucket);
+            std::process::exit(1);
+        } else {
+            log::info!(
+                "Connecting to S3 bucket '{}' at region '{}'",
+                bucket,
+                sdk_config
+                    .region()
+                    .unwrap_or(&aws_config::Region::new("us-east-1"))
+            );
+        }
 
-        let c = client.clone();
-
-        // We need to retry here so that any fake S3 services have a chance to
-        // start up alongside Rudolfs.
-        retry(ExponentialBackoff::default(), || async {
-            // Note that we don't retry certain failures, like credential or
-            // missing bucket errors. These are unlikely to be transient
-            // errors.
-            c.head_bucket(req.clone())
-                .await
-                .map_err(InitError::from)
-                .map_err(InitError::into_backoff)
-        })
-        .await?;
-
-        log::info!("Successfully authorized with AWS");
+        // If we expect to use transfer acceleration, check that it is enabled.
+        if s3_accelerate {
+            let resp = client
+                .get_bucket_accelerate_configuration()
+                .bucket(bucket.clone())
+                .send()
+                .await;
+            if resp.is_err() {
+                log::error!(
+                    "Failed to check S3 transfer acceleration for bucket '{}'",
+                    bucket
+                );
+                std::process::exit(1);
+            } else {
+                let status = resp.unwrap().status.expect(
+                    "Unable to determine S3 transfer acceleration status",
+                );
+                match status.as_str() {
+                    "Enabled" => log::info!(
+                        "S3 transfer acceleration is enabled for bucket '{}'",
+                        bucket
+                    ),
+                    "Suspended" => {
+                        log::error!(
+                            "S3 transfer acceleration is suspended for bucket \
+                             '{}'",
+                            bucket
+                        );
+                        log::error!(
+                            "Please enable S3 transfer acceleration for this \
+                             bucket or disable configuration"
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => log::warn!(
+                        "S3 transfer acceleration is in an unknown state '{}' \
+                         for bucket '{}'",
+                        status,
+                        bucket
+                    ),
+                }
+            }
+        }
 
         Ok(Backend {
             client,
             bucket,
             prefix,
             cdn,
-            region,
-            credential_provider,
+            accelerate_client,
         })
     }
 
@@ -266,33 +295,41 @@ impl<C> Backend<C> {
 }
 
 #[async_trait]
-impl<C> Storage for Backend<C>
-where
-    C: S3 + Send + Sync,
-{
+impl Storage for Backend {
     type Error = Error;
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn get(
         &self,
         key: &StorageKey,
     ) -> Result<Option<LFSObject>, Self::Error> {
-        let request = GetObjectRequest {
-            bucket: self.bucket.clone(),
-            key: self.key_to_path(key),
-            response_content_type: Some("application/octet-stream".into()),
-            ..Default::default()
-        };
-
-        Ok(match self.client.get_object(request).await {
-            Ok(object) => Ok(Some(LFSObject::new(
-                object.content_length.unwrap() as u64,
-                Box::pin(object.body.unwrap().map_ok(Bytes::from)),
+        let resp = match self
+            .client
+            .get_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .send()
+            .await
+        {
+            Ok(get_object_output) => Ok(Some(LFSObject::new(
+                get_object_output.content_length.unwrap() as u64,
+                Box::pin(ReaderStream::new(
+                    get_object_output.body.into_async_read(),
+                )),
             ))),
-            Err(RusotoError::Service(GetObjectError::NoSuchKey(_))) => Ok(None),
-            Err(err) => Err(err),
-        }?)
+            Err(e) => {
+                let e = e.into_service_error();
+                if let GetObjectError::NoSuchKey(_) = e {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }?;
+        Ok(resp)
     }
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn put(
         &self,
         key: StorageKey,
@@ -300,29 +337,28 @@ where
     ) -> Result<(), Self::Error> {
         let (_len, stream) = value.into_parts();
 
-        let mu_response = retry(ExponentialBackoff::default(), || async {
-            Ok(self
-                .client
-                .create_multipart_upload(CreateMultipartUploadRequest {
-                    bucket: self.bucket.clone(),
-                    key: self.key_to_path(&key),
-                    ..Default::default()
-                })
-                .await?)
-        })
-        .await?;
+        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload
+        // to upload the file.
+        let multipart_upload_resp = self
+            .client
+            .create_multipart_upload()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(&key))
+            .send()
+            .await
+            .map_err(Error::from)?;
 
-        // Okay to unwrap. This would only be None  there is a bug in either
-        // Rusoto or S3 itself.
-        let upload_id = mu_response.upload_id.unwrap();
+        // Okay to unwrap. This would only be None there is a bug in S3
+        let upload_id = multipart_upload_resp.upload_id.unwrap();
 
         // 100 MB
         const CHUNK_SIZE: usize = 100 * 1024 * 1024;
 
         let mut buffer = BytesMut::with_capacity(CHUNK_SIZE);
         let mut part_number = 1;
-        let mut completed_parts = Vec::new();
-        let mut streaming_body = StreamingBody::new(stream).into_async_read();
+        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
+            Vec::new();
+        let mut streaming_body = stream.into_async_read().compat();
 
         loop {
             let size = streaming_body.read_buf(&mut buffer).await?;
@@ -333,98 +369,76 @@ where
 
             let chunk = buffer.split().freeze();
 
-            let up_response = retry(ExponentialBackoff::default(), || async {
-                let chunk = chunk.clone();
-                let chunk_len = chunk.len();
-                let body =
-                    StreamingBody::new(Box::pin(stream::once(async move {
-                        Ok(chunk)
-                    })));
+            let stream = ByteStream::new(SdkBody::from(chunk));
 
-                let req = UploadPartRequest {
-                    content_length: Some(chunk_len as i64),
-                    body: Some(body),
-                    bucket: self.bucket.clone(),
-                    key: self.key_to_path(&key),
-                    part_number,
-                    upload_id: upload_id.clone(),
-                    ..Default::default()
-                };
-                Ok(self.client.upload_part(req).await?)
-            })
-            .await?;
+            let upload_part_resp = self
+                .client
+                .upload_part()
+                .bucket(self.bucket.clone())
+                .key(self.key_to_path(&key))
+                .part_number(part_number)
+                .upload_id(upload_id.clone())
+                .body(stream)
+                .send()
+                .await
+                .map_err(Error::from)?;
 
-            completed_parts.push(CompletedPart {
-                e_tag: up_response.e_tag.clone(),
-                part_number: Some(part_number),
-            });
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(upload_part_resp.e_tag.unwrap_or_default())
+                    .build(),
+            );
 
             if size == 0 {
                 // The stream has ended.
                 break;
             } else {
                 part_number += 1;
-            }
+            };
         }
 
-        // Complete the upload.
-        retry(ExponentialBackoff::default(), || async {
-            let req = CompleteMultipartUploadRequest {
-                bucket: self.bucket.clone(),
-                key: self.key_to_path(&key),
-                multipart_upload: Some(CompletedMultipartUpload {
-                    parts: Some(completed_parts.clone()),
-                }),
-                upload_id: upload_id.clone(),
-                ..Default::default()
-            };
+        let completed_multipart_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
 
-            let output = self.client.complete_multipart_upload(req).await?;
-
-            // Workaround: https://github.com/rusoto/rusoto/issues/1936
-            // Rusoto may return `Ok` when there is a failure.
-            if output.location.is_none()
-                && output.e_tag.is_none()
-                && output.bucket.is_none()
-                && output.key.is_none()
-            {
-                return Err(RusotoError::Unknown(BufferedHttpResponse {
-                    status: StatusCode::from_u16(500).unwrap(),
-                    headers: HeaderMap::with_capacity(0),
-                    body: Bytes::from_static(b"HTTP 500 internal error"),
-                })
-                .into());
-            }
-
-            Ok(())
-        })
-        .await?;
+        let _complete_multipart_upload_resp = self
+            .client
+            .complete_multipart_upload()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(&key))
+            .multipart_upload(completed_multipart_upload)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(Error::from)?;
 
         Ok(())
     }
 
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
-        let request = HeadObjectRequest {
-            bucket: self.bucket.clone(),
-            key: self.key_to_path(key),
-            ..Default::default()
-        };
+        let resp = self
+            .client
+            .head_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .send()
+            .await;
 
-        Ok(match self.client.head_object(request).await {
-            Ok(object) => Ok(Some(object.content_length.unwrap() as u64)),
-            Err(RusotoError::Unknown(e)) if e.status == 404 => {
-                // There is a bug in Rusoto that causes it to always return an
-                // "unknown" error when the key does not exist. Thus we must
-                // check the error code manually.
-                //
-                // See: https://github.com/rusoto/rusoto/issues/716
-                Ok(None)
+        match resp {
+            Ok(head_object_output) => {
+                Ok(Some(head_object_output.content_length.unwrap() as u64))
             }
-            Err(RusotoError::Service(HeadObjectError::NoSuchKey(_))) => {
-                Ok(None)
+            Err(e) => {
+                let e = e.into_service_error();
+                if let HeadObjectError::NotFound(_) = e {
+                    Ok(None)
+                } else {
+                    Err(Error::Head(e))
+                }
             }
-            Err(err) => Err(err),
-        }?)
+        }
     }
 
     /// This never deletes objects from S3 and always returns success. This may
@@ -438,32 +452,82 @@ where
         Box::pin(stream::empty())
     }
 
+    // Public URL is used to send a static download URL to the client for the
+    // CDN config
     fn public_url(&self, key: &StorageKey) -> Option<String> {
         self.cdn
             .as_ref()
             .map(|cdn| format!("{}/{}", cdn, self.key_to_path(key)))
     }
 
+    // Upload URL is used for the CDN config and the S3 Transfer Acceleration
+    // config.
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn upload_url(
         &self,
         key: &StorageKey,
         expires_in: Duration,
     ) -> Option<String> {
-        // Don't use a presigned URL if we're not using a CDN. Otherwise,
-        // uploads will bypass the encryption process and fail to download.
-        self.cdn.as_ref()?;
+        // Don't use a presigned URL if we're not using a CDN or S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        if self.cdn.is_none() && self.accelerate_client.is_none() {
+            return None;
+        }
 
-        let request = PutObjectRequest {
-            bucket: self.bucket.clone(),
-            key: self.key_to_path(key),
-            ..Default::default()
+        let presigning_config =
+            PresigningConfig::expires_in(expires_in).unwrap();
+
+        let client = if let Some(client) = &self.accelerate_client {
+            client
+        } else {
+            &self.client
         };
-        let credentials = self.credential_provider.credentials().await.ok()?;
-        let presigned_url = request.get_presigned_url(
-            &self.region,
-            &credentials,
-            &PreSignedRequestOption { expires_in },
-        );
+
+        let resp = client
+            .put_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .presigned(presigning_config)
+            .await;
+
+        let presigned_url = match resp {
+            Ok(presigned_request) => presigned_request.uri().to_string(),
+            _ => return None,
+        };
+
+        Some(presigned_url)
+    }
+
+    // Download URL is only used when S3 Transfer Acceleration is enabled.
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    async fn download_url(
+        &self,
+        key: &StorageKey,
+        expires_in: Duration,
+    ) -> Option<String> {
+        // Don't use a presigned URL if we're not using S3 Transfer
+        // Acceleration. Otherwise, uploads will bypass the encryption
+        // process and fail to download.
+        self.accelerate_client.as_ref()?;
+
+        let presigning_config =
+            PresigningConfig::expires_in(expires_in).unwrap();
+
+        let resp = self
+            .accelerate_client
+            .as_ref()?
+            .get_object()
+            .bucket(self.bucket.clone())
+            .key(self.key_to_path(key))
+            .presigned(presigning_config)
+            .await;
+
+        let presigned_url = match resp {
+            Ok(presigned_request) => presigned_request.uri().to_string(),
+            _ => return None,
+        };
+
         Some(presigned_url)
     }
 }

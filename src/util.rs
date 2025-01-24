@@ -18,22 +18,28 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::error::Error;
-use core::mem;
-use core::ops::Deref;
-use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::{
+    fmt, mem,
+    ops::Deref,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use futures::TryStreamExt;
-use hyper::body::Body;
-use serde::Deserialize;
-use serde::Serialize;
-
 use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use http::HeaderMap;
+use http_body_util::{BodyExt, BodyStream, Full};
+use hyper::body::Incoming;
+use serde::{Deserialize, Serialize};
 
 use tokio::{
     fs,
     io::{self, AsyncRead, AsyncWrite, ReadBuf},
 };
+
+use crate::app::BoxBody;
+use crate::error::Error;
 
 /// A temporary file path. When dropped, the file is deleted.
 #[derive(Debug)]
@@ -162,23 +168,55 @@ impl AsyncWrite for NamedTempFile {
     }
 }
 
-pub async fn from_json<T>(mut body: Body) -> Result<T, Error>
+pub async fn from_json<T>(body: Incoming) -> Result<T, Error>
 where
     T: for<'de> Deserialize<'de>,
 {
     let mut buf = Vec::new();
+    let mut stream = BodyStream::new(body);
 
-    while let Some(chunk) = body.try_next().await? {
-        buf.extend(chunk);
+    while let Some(chunk) = stream.try_next().await? {
+        if chunk.is_data() {
+            buf.extend_from_slice(chunk.into_data().unwrap().as_ref());
+        }
     }
 
     Ok(serde_json::from_slice(&buf)?)
 }
 
-pub fn into_json<T>(value: &T) -> Result<Body, Error>
+#[allow(clippy::result_large_err)]
+pub fn into_json<T>(value: &T) -> Result<Bytes, Error>
 where
     T: Serialize,
 {
     let bytes = serde_json::to_vec_pretty(value)?;
     Ok(bytes.into())
+}
+
+pub fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+pub fn empty() -> BoxBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+pub struct RedactedHeaders(pub HeaderMap);
+
+// Redact the Authorization header.
+impl fmt::Display for RedactedHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (key, value) in &self.0 {
+            if key == "authorization" {
+                writeln!(f, "{}: [REDACTED]", key)?;
+            } else {
+                writeln!(f, "{}: {}", key, value.to_str().unwrap_or_default())?;
+            }
+        }
+        Ok(())
+    }
 }

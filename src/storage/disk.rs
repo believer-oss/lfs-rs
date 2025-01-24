@@ -261,6 +261,14 @@ impl Storage for Backend {
     ) -> Option<String> {
         None
     }
+
+    async fn download_url(
+        &self,
+        _key: &StorageKey,
+        _expires_in: Duration,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// A simple bytes codec that keeps track of its length.

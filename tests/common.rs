@@ -3,11 +3,16 @@
 
 // mod common;
 use base64::Engine;
+use bytes::Bytes;
 use duct::cmd;
 use futures::future::Either;
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use lfs_rs::{
     into_json, CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter,
-    LockStorage, ReleaseLockBatchRequest, Server,
+    LockStorage, ReleaseLockBatchRequest,
 };
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -18,6 +23,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Output;
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::span::EnteredSpan;
 use wiremock::matchers::{header, method, path};
@@ -29,11 +35,23 @@ use aws_sdk_dynamodb::types::{
 };
 
 #[cfg(feature = "otel")]
+use opentelemetry_sdk::runtime;
+#[cfg(feature = "otel")]
 use tracing_subscriber::{prelude::*, Registry};
 
-#[cfg(feature = "otel")]
-use opentelemetry_otlp::WithExportConfig;
+type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>;
 
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn empty() -> BoxBody {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
 /// A temporary git repository.
 pub struct GitRepo {
     repo: tempfile::TempDir,
@@ -192,7 +210,7 @@ impl GitRepo {
 
     async fn send_lock_request(
         uri: String,
-        json: hyper::body::Body,
+        json: Bytes,
         user: u32,
         expected_failures: Vec<&str>,
     ) -> anyhow::Result<()> {
@@ -201,14 +219,17 @@ impl GitRepo {
 
         let request = hyper::Request::post(uri)
             .header("authorization", format!("Basic {}", auth))
-            .body(json)
+            .body(Full::new(json))
             .unwrap();
 
-        let client = hyper::Client::new();
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build_http();
+
         let resp = client.request(request).await?;
         let status = resp.status();
 
-        let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+        let body_bytes = resp.into_body().collect().await?.to_bytes();
 
         assert!(
             status.is_success(),
@@ -355,10 +376,10 @@ impl GitRepo {
         table: &str,
         endpoint_url: &str,
     ) -> anyhow::Result<()> {
-        let sdk_config = aws_config::from_env()
-            .endpoint_url(endpoint_url)
-            .load()
-            .await;
+        let shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+        let shared_config = shared_config.endpoint_url(endpoint_url);
+        let sdk_config = shared_config.load().await;
 
         let client = aws_sdk_dynamodb::Client::new(&sdk_config);
         match client.describe_table().table_name(table).send().await {
@@ -388,29 +409,29 @@ impl GitRepo {
                 AttributeDefinition::builder()
                     .attribute_name("repo")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("id")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("path")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
                 AttributeDefinition::builder()
                     .attribute_name("locked_at")
                     .attribute_type("S".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_key_schema(Some(vec![
                 KeySchemaElement::builder()
                     .attribute_name("repo")
                     .key_type("HASH".into())
-                    .build(),
+                    .build()?,
                 KeySchemaElement::builder()
                     .attribute_name("path")
                     .key_type("RANGE".into())
-                    .build(),
+                    .build()?,
             ]))
             .set_local_secondary_indexes(Some(vec![
                 LocalSecondaryIndex::builder()
@@ -419,11 +440,11 @@ impl GitRepo {
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("id")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -432,18 +453,18 @@ impl GitRepo {
                             .non_key_attributes("locked_at")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
                 LocalSecondaryIndex::builder()
                     .index_name("creation-index")
                     .set_key_schema(Some(vec![
                         KeySchemaElement::builder()
                             .attribute_name("repo")
                             .key_type("HASH".into())
-                            .build(),
+                            .build()?,
                         KeySchemaElement::builder()
                             .attribute_name("locked_at")
                             .key_type("RANGE".into())
-                            .build(),
+                            .build()?,
                     ]))
                     .projection(
                         Projection::builder()
@@ -453,7 +474,7 @@ impl GitRepo {
                             .non_key_attributes("owner")
                             .build(),
                     )
-                    .build(),
+                    .build()?,
             ]))
             .billing_mode("PAY_PER_REQUEST".into())
             .send()
@@ -515,17 +536,28 @@ pub fn init_logger() {
 
 #[cfg(feature = "otel")]
 pub fn init_logger() {
-    let exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
-    let pipeline = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .install_batch(opentelemetry::runtime::Tokio)
+    use opentelemetry::trace::TracerProvider as _;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
         .unwrap();
 
+    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_id_generator(
+            opentelemetry_sdk::trace::RandomIdGenerator::default(),
+        )
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .build();
+
+    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+
     let telemetry = tracing_opentelemetry::layer()
-        .with_tracer(pipeline)
+        .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    Registry::default().with(telemetry).init();
+    let subscriber = Registry::default().with(telemetry);
+    // ignore any errors if we fail to set the global default
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 pub fn startup() -> EnteredSpan {
@@ -546,13 +578,11 @@ pub async fn smoke_test(
 
     let mock = GitRepo::setup_mock_gh_auth().await;
 
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = LocalServerBuilder::new(data.path().into(), key);
     server.authenticated(true);
     server.authentication_server(mock.uri());
-    let server = server
-        .spawn(SocketAddr::from(([127, 0, 0, 1], 0)), locks)
-        .await?;
-    let addr = server.addr();
+    let (server, addr) = server.spawn(addr, locks).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 

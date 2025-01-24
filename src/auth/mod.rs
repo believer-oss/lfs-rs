@@ -1,20 +1,31 @@
-use crate::error::Error;
-use crate::storage::Namespace;
-use base64::{engine::general_purpose, Engine as _};
 use core::task::{Context, Poll};
 use futures::future::BoxFuture;
+use std::{sync::Arc, time::Instant};
+
+use crate::storage::Namespace;
+use crate::util::{empty, full};
+use crate::{app::BoxBody, error::Error};
+
 use http::{self, header, HeaderMap, HeaderValue, StatusCode};
+use http_body_util::BodyExt;
 use hyper::{
-    self, body::Body, body::Buf, service::Service, Client, Request, Response,
+    self,
+    body::{Buf, Incoming},
+    Request, Response,
 };
 use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use tower::Service;
+
+use base64::{engine::general_purpose, Engine as _};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Instant};
+
 #[cfg(feature = "otel")]
-use tracing::instrument;
+use tracing::{instrument, Instrument as _};
+
 use tracing::{event, Level};
 
 type GithubAuthCache = Arc<RwLock<LinkedHashMap<String, AuthCacheEntry>>>;
@@ -55,7 +66,9 @@ pub struct UserRepoInfo {
     pub username: Option<String>,
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Default,
+)]
 pub struct Permissions {
     #[serde(default)]
     pub admin: bool,
@@ -110,7 +123,7 @@ impl<S> Auth<S> {
                 event!(
                     Level::DEBUG,
                     message = "cache hit",
-                    key = key,
+                    key = format!("{}", &key[0..4]),
                     age = entry.timestamp.elapsed().as_secs()
                 );
 
@@ -120,7 +133,8 @@ impl<S> Auth<S> {
                 }
             }
 
-            let client = Client::builder().build(HttpsConnector::new());
+            let client = Client::builder(TokioExecutor::new())
+                .build(HttpsConnector::new());
 
             let url = format!(
                 "{}/repos/{}/{}",
@@ -133,14 +147,14 @@ impl<S> Auth<S> {
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header(header::AUTHORIZATION, auth)
                 .header(header::USER_AGENT, "rudolfs")
-                .body(Body::empty())?;
+                .body(empty())?;
 
             let res = client.request(req).await?;
 
             event!(Level::INFO, status = ?res.status(), url = %url);
 
             if res.status() == StatusCode::OK {
-                let body = hyper::body::aggregate(res).await?;
+                let body = res.collect().await?.aggregate();
                 let repository: Repository =
                     serde_json::from_reader(body.reader())?;
 
@@ -175,18 +189,19 @@ impl<S> Auth<S> {
         auth: &HeaderValue,
         server: &str,
     ) -> Result<Option<String>, Error> {
-        let client = Client::builder().build(HttpsConnector::new());
+        let client =
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::new());
 
         let req = Request::get(format!("{}/user", server))
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::AUTHORIZATION, auth)
             .header(header::USER_AGENT, "rudolfs")
-            .body(Body::empty())?;
+            .body(empty())?;
 
         let res = client.request(req).await?;
 
         if res.status() == StatusCode::OK {
-            let body = hyper::body::aggregate(res).await?;
+            let body = res.collect().await?.aggregate();
             let user_info: UserResp = serde_json::from_reader(body.reader())?;
 
             if let Some(username) = user_info.login {
@@ -206,9 +221,11 @@ impl<S> Auth<S> {
     }
 }
 
-impl<S> Service<Request<Body>> for Auth<S>
+type Req = Request<Incoming>;
+
+impl<S> Service<Req> for Auth<S>
 where
-    S: Service<Request<Body>, Response = Response<Body>>
+    S: Service<Req, Response = Response<BoxBody>>
         + Send
         + Sync
         + Clone
@@ -227,16 +244,35 @@ where
         self.service.poll_ready(cx)
     }
 
-    #[cfg_attr(feature = "otel", instrument(level = "debug", skip_all))]
-    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
-        event!(Level::DEBUG, path = ?req.uri().path());
+    #[cfg_attr(
+        feature = "otel",
+        instrument(
+            name = "auth.call",
+            level = "debug",
+            skip_all,
+            fields(authenticated, cache.entries, server)
+        )
+    )]
+    fn call(&mut self, mut req: Req) -> Self::Future {
+        log::debug!("checking auth for {}", &req.uri());
 
         if (!self.authenticated) || (!req.uri().path().starts_with("/api/")) {
+            log::trace!("skipping auth");
             return Box::pin(self.service.call(req));
         };
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("authenticated", true);
+
         let mut service = self.service.clone();
+
         let cache = Arc::clone(&self.cache);
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("cache.entries", cache.read().len());
+
         let server = self.server.clone();
+        #[cfg(feature = "otel")]
+        tracing::Span::current().record("server", &server);
+
         let auth_fut = async move {
             let mut parts =
                 req.uri().path().split('/').filter(|s| !s.is_empty());
@@ -252,7 +288,7 @@ where
                 _ => {
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
-                        .body(Body::from("Missing org/project in URL"))?)
+                        .body(full("Missing org/project in URL"))?)
                 }
             };
 
@@ -262,18 +298,21 @@ where
 
             // All endpoints require authentication, so return early
             // if we have no user or permissions.
-            #[allow(clippy::unnecessary_unwrap)]
             if user.is_none() || user.as_ref().unwrap().permissions.is_none() {
                 Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-                    .body(Body::empty())?)
+                    .body(empty())?)
             } else {
                 let ext = req.extensions_mut();
                 ext.insert(user.unwrap());
                 service.call(req).await
             }
         };
+
+        #[cfg(feature = "otel")]
+        let auth_fut = auth_fut.instrument(tracing::info_span!("auth"));
+
         Box::pin(auth_fut)
     }
 }

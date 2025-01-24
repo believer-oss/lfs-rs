@@ -30,10 +30,13 @@ use lfs_rs::{LocalLs, NoneLs};
 use lfs_rs::DynamoLs;
 #[cfg(feature = "redis")]
 use lfs_rs::RedisLs;
+
 #[cfg(feature = "otel")]
-use opentelemetry_otlp::WithExportConfig;
+mod init_tracing;
 #[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
+use init_tracing::setup_tracing;
+#[cfg(feature = "otel")]
+use tracing::{field, instrument, span};
 
 // Additional help to append to the end when `--help` is specified.
 static AFTER_HELP: &str = include_str!("help.md");
@@ -62,7 +65,7 @@ enum Backend {
     Local(LocalArgs),
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct GlobalArgs {
     /// The host or address to listen on. If this is not specified, then
     /// `0.0.0.0` is used where the port can be specified with `--port`
@@ -106,7 +109,7 @@ fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
     FromHex::from_hex(s)
 }
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Debug)]
 enum LockBackend {
     /// Starts the server with DynamoDB as the lock backend.
     #[cfg(feature = "dynamodb")]
@@ -141,7 +144,7 @@ impl From<&str> for LockBackend {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 pub struct LockArgs {
     /// Locking backend to use
     #[clap(
@@ -189,7 +192,7 @@ pub struct LockArgs {
     dynamodb_table: Option<String>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct S3Args {
     /// Amazon S3 bucket to use.
     #[clap(long, env = "RUDOLFS_S3_BUCKET")]
@@ -203,6 +206,11 @@ struct S3Args {
     /// prefixed with this URL.
     #[clap(long = "cdn", env = "RUDOLFS_S3_CDN")]
     cdn: Option<String>,
+
+    /// Use AWS S3 Transfer Acceleration endpoints. The endpoint must have
+    /// transfer acceleration enabled.
+    #[clap(long = "s3ta", env = "RUDOLFS_S3TA")]
+    s3_accelerate: bool,
 }
 
 #[derive(Parser)]
@@ -225,21 +233,16 @@ impl Args {
             logger_builder.parse_filters(&env);
         }
 
+        #[cfg(not(feature = "otel"))]
+        logger_builder.init();
         #[cfg(feature = "otel")]
-        {
-            let exporter =
-                opentelemetry_otlp::new_exporter().tonic().with_env();
-            let pipeline = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(exporter)
-                .install_batch(opentelemetry::runtime::Tokio)?;
-            let telemetry = tracing_opentelemetry::layer()
-                .with_tracer(pipeline)
-                .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-            Registry::default().with(telemetry).init();
-        }
+        let _guard = setup_tracing(self.global.log_level);
 
-        // logger_builder.init();
+        #[cfg(feature = "otel")]
+        let server_span =
+            span!(tracing::Level::INFO, "server", local_addr = field::Empty);
+
+        log::info!("Starting server...");
 
         // Find a socket address to bind to. This will resolve domain names.
         let addr = match self.global.host {
@@ -249,6 +252,9 @@ impl Args {
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8080))),
             None => SocketAddr::from(([0, 0, 0, 0], self.global.port)),
         };
+
+        #[cfg(feature = "otel")]
+        server_span.record("local_addr", addr.to_string());
 
         log::info!("Initializing storage...");
 
@@ -266,6 +272,10 @@ impl Args {
 }
 
 impl S3Args {
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "info", name = "s3args.run")
+    )]
     async fn run(
         self,
         addr: SocketAddr,
@@ -278,6 +288,10 @@ impl S3Args {
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);
+        }
+
+        if self.s3_accelerate {
+            builder.s3_accelerate(self.s3_accelerate);
         }
 
         if let Some(cache_dir) = global_args.cache_dir {
@@ -314,6 +328,10 @@ impl S3Args {
 }
 
 impl LocalArgs {
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "info", skip(self), name = "http.request")
+    )]
     async fn run(
         self,
         addr: SocketAddr,

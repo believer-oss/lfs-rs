@@ -142,7 +142,7 @@ impl LocalFsLockFile {
         key: LocalFsKey,
         path_key: LocalFsPathKey,
         lock: Lock,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Error> {
         match self.locks.get(&key) {
             Some(v) => {
                 Err(anyhow!(super::LockStoreError::CreateConflict(v.clone())))
@@ -163,12 +163,11 @@ impl LocalFsLockFile {
         key: &LocalFsKey,
         owner: String,
         force: Option<bool>,
-    ) -> anyhow::Result<Lock> {
+    ) -> Result<Lock, Error> {
         let force = force.unwrap_or(false);
-        let lock_ref = self
-            .locks
-            .get(key)
-            .context("deleting key that doesn't exist")?;
+        let lock_ref = self.locks.get(key).ok_or_else(|| {
+            super::LockStoreError::DeleteNotFound(key.to_string())
+        })?;
 
         let lock: Lock;
         if let Some(o) = lock_ref.owner.clone() {
@@ -217,7 +216,7 @@ impl LocalFsLockStore {
     async fn load_store(
         path: PathBuf,
         create: bool,
-    ) -> anyhow::Result<LocalFsLockFile> {
+    ) -> Result<LocalFsLockFile, Error> {
         let lockfile: LocalFsLockFile = match File::open(path.clone()).await {
             Ok(f) => {
                 let mut reader = BufReader::new(f);
@@ -244,7 +243,7 @@ impl LocalFsLockStore {
         Ok(lockfile)
     }
 
-    async fn save_store(&self) -> anyhow::Result<()> {
+    async fn save_store(&self) -> Result<(), Error> {
         let s: String;
         {
             let lockfile =

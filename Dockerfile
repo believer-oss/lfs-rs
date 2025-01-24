@@ -1,12 +1,12 @@
-FROM rust:1.78 as build
+FROM rust:1.83 as build
 
 ENV CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN \
-	apt-get update && \
-	apt-get -y install ca-certificates musl-tools && \
-	rustup target add ${CARGO_BUILD_TARGET}
+  apt-get update && \
+  apt-get -y install ca-certificates musl-tools && \
+  rustup target add ${CARGO_BUILD_TARGET}
 
 ENV PKG_CONFIG_ALLOW_CROSS=1
 
@@ -27,9 +27,9 @@ COPY ./ ./
 RUN cargo build --release
 
 RUN \
-	mkdir -p /build && \
-	cp target/${CARGO_BUILD_TARGET}/release/lfs-rs /build/ && \
-	strip /build/lfs-rs
+  mkdir -p /build && \
+  cp target/${CARGO_BUILD_TARGET}/release/lfs-rs /build/ && \
+  strip /build/lfs-rs
 
 # Use scratch so we can get an itty-bitty-teeny-tiny image. This requires us to
 # use musl when building the application.
