@@ -804,11 +804,10 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "chacha"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddf3c081b5fba1e5615640aae998e0fbd10c24cbd897ee39ed754a77601a4862"
+checksum = "3a4d0c4741f6b1d67dc11a9926348a2bbe4fcdb9693dd56ff9bd1f9bf8a13c30"
 dependencies = [
- "byteorder",
  "keystream",
 ]
 

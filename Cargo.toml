@@ -28,7 +28,7 @@ aws-smithy-types = { version = "1.2" }
 aws-smithy-http = "0.60"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1"
-chacha = "0.3"
+chacha = "0.4"
 chrono = "0.4"
 derive_more = { version = "1.0", features = ["display", "from"] }
 futures = "0.3"
