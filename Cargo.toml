@@ -25,7 +25,7 @@ aws-config = { version = "1.5" }
 aws-sdk-dynamodb = { version = "1.56", optional = true }
 aws-sdk-s3 = { version = "1.66", features = ["rt-tokio"] }
 aws-smithy-types = { version = "1.2" }
-aws-smithy-http = "0.60"
+aws-smithy-http = "0.62"
 backoff = { version = "0.4", features = ["tokio"] }
 bytes = "1"
 chacha = "0.4"
