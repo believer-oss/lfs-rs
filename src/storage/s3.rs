@@ -120,16 +120,17 @@ pub struct Backend {
     /// S3 client for generating presigned URLs
     accelerate_client: Option<Client>,
 
-    /// LRU cache for object sizes to avoid repeated HEAD requests
-    size_cache: Arc<Mutex<lru::Cache<StorageKey>>>,
+    /// LRU cache for object sizes to avoid repeated HEAD requests.
+    /// None if caching is disabled.
+    size_cache: Option<Arc<Mutex<lru::Cache<StorageKey>>>>,
 
     /// Maximum number of entries in the size cache
-    max_cache_entries: usize,
+    max_cache_entries: Option<usize>,
 
-    /// Number of cache hits
+    /// Number of cache hits (only tracked when cache is enabled)
     cache_hits: AtomicUsize,
 
-    /// Number of cache misses
+    /// Number of cache misses (only tracked when cache is enabled)
     cache_misses: AtomicUsize,
 }
 
@@ -246,16 +247,19 @@ impl Backend {
         }
 
         // Initialize the size cache
-        let size_cache = Arc::new(Mutex::new(lru::Cache::new()));
-
-        if size_cache_entries > 0 {
+        let (size_cache, max_cache_entries) = if size_cache_entries > 0 {
             tracing::info!(
                 "Initialized S3 size cache with capacity for {} entries",
                 size_cache_entries
             );
+            (
+                Some(Arc::new(Mutex::new(lru::Cache::new()))),
+                Some(size_cache_entries),
+            )
         } else {
             tracing::info!("S3 size cache is disabled");
-        }
+            (None, None)
+        };
 
         Ok(Backend {
             client,
@@ -264,7 +268,7 @@ impl Backend {
             cdn,
             accelerate_client,
             size_cache,
-            max_cache_entries: size_cache_entries,
+            max_cache_entries,
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
         })
@@ -275,10 +279,15 @@ impl Backend {
     }
 
     /// Returns cache statistics: (hits, misses, current_entries)
+    /// Returns (0, 0, 0) if caching is disabled.
     pub fn cache_stats(&self) -> (usize, usize, usize) {
         let hits = self.cache_hits.load(Ordering::Relaxed);
         let misses = self.cache_misses.load(Ordering::Relaxed);
-        let entries = self.size_cache.lock().len();
+        let entries = self
+            .size_cache
+            .as_ref()
+            .map(|c| c.lock().len())
+            .unwrap_or(0);
         (hits, misses, entries)
     }
 }
@@ -408,8 +417,8 @@ impl Storage for Backend {
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         // Check cache first if enabled
-        if self.max_cache_entries > 0 {
-            if let Some(size) = self.size_cache.lock().get_refresh(key) {
+        if let Some(cache) = &self.size_cache {
+            if let Some(size) = cache.lock().get_refresh(key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("S3 size cache hit for {}", key.oid());
                 return Ok(Some(size));
@@ -431,12 +440,14 @@ impl Storage for Backend {
                 let size = head_object_output.content_length.unwrap() as u64;
 
                 // Cache the size if caching is enabled
-                if self.max_cache_entries > 0 {
-                    let mut cache = self.size_cache.lock();
+                if let (Some(cache), Some(max_entries)) =
+                    (&self.size_cache, self.max_cache_entries)
+                {
+                    let mut cache = cache.lock();
                     cache.push(key.clone(), size);
 
                     // Prune cache by entry count if needed
-                    while cache.len() > self.max_cache_entries {
+                    while cache.len() > max_entries {
                         cache.pop();
                     }
                 }
