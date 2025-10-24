@@ -209,3 +209,204 @@ async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
+    use lfs_rs::storage::{Storage, StorageKey};
+    use lfs_rs::Oid;
+
+    let _guard = init_logger();
+
+    let config = match fs::read("tests/.test_credentials.toml") {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("Skipping test. No S3 credentials available: {}", err);
+            return Ok(());
+        }
+    };
+
+    let creds: Credentials =
+        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
+
+    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
+    std::env::set_var(
+        "AWS_SESSION_TOKEN",
+        creds.session_token.unwrap_or_default(),
+    );
+    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
+
+    // Create S3 backend with a very small cache (3 entries) to test eviction
+    let backend = lfs_rs::storage::S3::new(
+        creds.bucket,
+        "test_lfs_cache".to_string(),
+        None,
+        false,
+        3, // Small cache size for testing
+    )
+    .await?;
+
+    let mut rng = StdRng::seed_from_u64(123);
+    let namespace = lfs_rs::storage::Namespace::new(
+        "test".to_string(),
+        "cache-test".to_string(),
+    );
+
+    // Upload 5 test objects to S3
+    let mut keys = Vec::new();
+    let mut sizes = Vec::new();
+    for i in 0..5 {
+        let size = (i + 1) * 1024; // 1KB, 2KB, 3KB, 4KB, 5KB
+        let mut data = vec![0u8; size];
+        rng.fill(&mut data[..]);
+
+        // Hash the data to create an Oid
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&data);
+        let hash_result = hasher.finalize();
+        let oid = Oid::from(hash_result);
+
+        let key = StorageKey::new(namespace.clone(), oid);
+
+        // Upload the object
+        let stream = Box::pin(futures::stream::once(async move {
+            Ok(bytes::Bytes::from(data))
+        }));
+        let obj = lfs_rs::storage::LFSObject::new(size as u64, stream);
+        backend.put(key.clone(), obj).await?;
+
+        keys.push(key);
+        sizes.push(size as u64);
+    }
+
+    eprintln!("✓ Uploaded 5 test objects");
+
+    // Test 1: First access should populate cache (3 misses)
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (0, 0, 0),
+        "Cache should start empty"
+    );
+
+    for (key, expected_size) in keys.iter().zip(sizes.iter()).take(3) {
+        let size = backend.size(key).await?;
+        assert_eq!(
+            size,
+            Some(*expected_size),
+            "Size mismatch for {}",
+            key.oid()
+        );
+    }
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (0, 3, 3),
+        "Should have 3 misses, cache full"
+    );
+    eprintln!("✓ Test 1: Cache populated with 3 entries (3 misses)");
+
+    // Test 2: Access the same 3 keys again - should hit cache (3 hits)
+    for (key, expected_size) in keys.iter().zip(sizes.iter()).take(3) {
+        let size = backend.size(key).await?;
+        assert_eq!(
+            size,
+            Some(*expected_size),
+            "Cached size mismatch for {}",
+            key.oid()
+        );
+    }
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (3, 3, 3),
+        "Should have 3 hits total"
+    );
+    eprintln!("✓ Test 2: Cache hits work correctly (3 hits, 3 misses total)");
+
+    // Test 3: Access keys 4 and 5, which should evict keys 1 and 2 (LRU)
+    // This adds 2 new entries (2 more misses)
+    for (key, expected_size) in keys.iter().zip(sizes.iter()).skip(3).take(2) {
+        let size = backend.size(key).await?;
+        assert_eq!(
+            size,
+            Some(*expected_size),
+            "Size mismatch for {}",
+            key.oid()
+        );
+    }
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (3, 5, 3),
+        "Should have 2 more misses, cache still at capacity"
+    );
+    eprintln!(
+        "✓ Test 3: Added 2 new entries, evicting LRU items (3 hits, 5 misses)"
+    );
+
+    // Test 4: Access key 3 again (should still be in cache since we only added
+    // 2 new entries) Cache should contain: key3, key4, key5
+    let size = backend.size(&keys[2]).await?;
+    assert_eq!(size, Some(sizes[2]), "Key 3 should still be cached");
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (4, 5, 3),
+        "Key 3 should be a cache hit"
+    );
+    eprintln!("✓ Test 4: Key 3 still cached (4 hits, 5 misses)");
+
+    // Test 5: Verify key 1 is still accessible but will be a cache miss (was
+    // evicted)
+    let size = backend.size(&keys[0]).await?;
+    assert_eq!(
+        size,
+        Some(sizes[0]),
+        "Key 1 should still be accessible from S3"
+    );
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (4, 6, 3),
+        "Key 1 should be a cache miss"
+    );
+    eprintln!(
+        "✓ Test 5: Key 1 evicted but accessible from S3 (4 hits, 6 misses)"
+    );
+
+    // Test 6: Verify key 2 is also a cache miss (was evicted)
+    let size = backend.size(&keys[1]).await?;
+    assert_eq!(
+        size,
+        Some(sizes[1]),
+        "Key 2 should still be accessible from S3"
+    );
+
+    let (hits, misses, entries) = backend.cache_stats();
+    assert_eq!(
+        (hits, misses, entries),
+        (4, 7, 3),
+        "Key 2 should be a cache miss"
+    );
+    eprintln!(
+        "✓ Test 6: Key 2 evicted but accessible from S3 (4 hits, 7 misses)"
+    );
+
+    // Clean up - delete test objects
+    for key in &keys {
+        let _ = backend.delete(key).await;
+    }
+
+    eprintln!(
+        "✓ All cache tests passed! Final stats: {} hits, {} misses, {} entries",
+        hits, misses, entries
+    );
+    Ok(())
+}

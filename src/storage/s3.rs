@@ -43,7 +43,11 @@ use tokio_util::io::ReaderStream;
 use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
+use crate::lru;
 use derive_more::{Display, From};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, From, Display)]
@@ -115,6 +119,18 @@ pub struct Backend {
 
     /// S3 client for generating presigned URLs
     accelerate_client: Option<Client>,
+
+    /// LRU cache for object sizes to avoid repeated HEAD requests
+    size_cache: Arc<Mutex<lru::Cache<StorageKey>>>,
+
+    /// Maximum number of entries in the size cache
+    max_cache_entries: usize,
+
+    /// Number of cache hits
+    cache_hits: AtomicUsize,
+
+    /// Number of cache misses
+    cache_misses: AtomicUsize,
 }
 
 impl Backend {
@@ -123,6 +139,7 @@ impl Backend {
         mut prefix: String,
         cdn: Option<String>,
         s3_accelerate: bool,
+        size_cache_entries: usize,
     ) -> Result<Self, anyhow::Error> {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
@@ -228,17 +245,41 @@ impl Backend {
             }
         }
 
+        // Initialize the size cache
+        let size_cache = Arc::new(Mutex::new(lru::Cache::new()));
+
+        if size_cache_entries > 0 {
+            tracing::info!(
+                "Initialized S3 size cache with capacity for {} entries",
+                size_cache_entries
+            );
+        } else {
+            tracing::info!("S3 size cache is disabled");
+        }
+
         Ok(Backend {
             client,
             bucket,
             prefix,
             cdn,
             accelerate_client,
+            size_cache,
+            max_cache_entries: size_cache_entries,
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
         })
     }
 
     fn key_to_path(&self, key: &StorageKey) -> String {
         format!("{}/{}/{}", self.prefix, key.namespace(), key.oid().path())
+    }
+
+    /// Returns cache statistics: (hits, misses, current_entries)
+    pub fn cache_stats(&self) -> (usize, usize, usize) {
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let misses = self.cache_misses.load(Ordering::Relaxed);
+        let entries = self.size_cache.lock().len();
+        (hits, misses, entries)
     }
 }
 
@@ -366,6 +407,17 @@ impl Storage for Backend {
 
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
+        // Check cache first if enabled
+        if self.max_cache_entries > 0 {
+            if let Some(size) = self.size_cache.lock().get_refresh(key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("S3 size cache hit for {}", key.oid());
+                return Ok(Some(size));
+            }
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Cache miss - perform HEAD request
         let resp = self
             .client
             .head_object()
@@ -376,11 +428,25 @@ impl Storage for Backend {
 
         match resp {
             Ok(head_object_output) => {
-                Ok(Some(head_object_output.content_length.unwrap() as u64))
+                let size = head_object_output.content_length.unwrap() as u64;
+
+                // Cache the size if caching is enabled
+                if self.max_cache_entries > 0 {
+                    let mut cache = self.size_cache.lock();
+                    cache.push(key.clone(), size);
+
+                    // Prune cache by entry count if needed
+                    while cache.len() > self.max_cache_entries {
+                        cache.pop();
+                    }
+                }
+
+                Ok(Some(size))
             }
             Err(e) => {
                 let e = e.into_service_error();
                 if let HeadObjectError::NotFound(_) = e {
+                    // Don't cache negative results
                     Ok(None)
                 } else {
                     Err(Error::Head(e))
