@@ -1,6 +1,6 @@
 [package]
 name = "lfs-rs"
-version = "0.3.6"
+version = "0.3.8"
 authors = [
   "Jason White <rust@jasonwhite.io>",
   "The Believer Company <believeross@believer.gg>",
@@ -43,8 +43,6 @@ hyper-util = { version = "0.1", features = ["full"] }
 hyper-tls = { version = "0.6", features = ["vendored"] }
 tower = { version = "0.5", features = ["util"] }
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
-log = "0.4"
-pretty_env_logger = "0.5"
 rand = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -76,24 +74,23 @@ opentelemetry-appender-tracing = { version = "0.27", optional = true }
 opentelemetry-semantic-conventions = { version = "0.27", optional = true }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-opentelemetry = { version = "0.28", optional = true }
-tracing-log = { version = "0.2", optional = true }
+tracing-log = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = [
   "env-filter",
   "json",
   "registry",
-], optional = true }
+] }
 opentelemetry-stdout = "0.27"
 
 [dev-dependencies]
 rand = "0.8"
 tempfile = "3"
 duct = "0.13"
-env_logger = "0.11"
 toml = "0.8"
 wiremock = "0.6"
 
 [features]
-default = ["dynamodb", "redis", "otel"]
+default = ["dynamodb", "otel"]
 # If the "faulty" feature is enabled, random failures are injected into the byte
 # stream.
 faulty = ["rand"]
@@ -107,6 +104,4 @@ otel = [
   "dep:opentelemetry-appender-tracing",
   "dep:opentelemetry-semantic-conventions",
   "dep:tracing-opentelemetry",
-  "dep:tracing-log",
-  "dep:tracing-subscriber",
 ]

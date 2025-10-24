@@ -420,7 +420,7 @@ where
         let body = req.into_body();
         let stream = BodyDataStream::new(body)
             .try_filter_map(|chunk| async { Ok(Some(chunk)) })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            .map_err(std::io::Error::other);
 
         let object = LFSObject::new(len, Box::pin(stream));
 
@@ -811,7 +811,7 @@ where
     let size = match size {
         Ok(size) => size,
         Err(err) => {
-            log::error!("batch response error: {}", err);
+            tracing::error!("batch response error: {err}");
 
             // Return a generic "500 - Internal Server Error" for objects that
             // we failed to get the size of. This is usually caused by some

@@ -92,7 +92,7 @@ where
                 let stream = stream.map_err(move |err| {
                     match err {
                         Error::Verify(err) => {
-                            log::error!(
+                            tracing::error!(
                                 "Found corrupted object {} ({})",
                                 key.oid(),
                                 err
@@ -106,10 +106,7 @@ where
                                 async move { storage.delete(&key).await },
                             );
 
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                "found corrupted object",
-                            )
+                            io::Error::other("found corrupted object")
                         }
                         Error::Io(err) => err,
                     }
@@ -131,10 +128,8 @@ where
         let stream =
             VerifyStream::new(stream.map_err(Error::from), len, *key.oid())
                 .map_err(move |err| match err {
-                    Error::Verify(err) => {
-                        io::Error::new(io::ErrorKind::Other, err)
-                    }
-                    Error::Io(err) => io::Error::new(io::ErrorKind::Other, err),
+                    Error::Verify(err) => io::Error::other(err),
+                    Error::Io(err) => io::Error::other(err),
                 });
 
         self.storage

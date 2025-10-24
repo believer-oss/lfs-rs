@@ -17,6 +17,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+use anyhow::Context;
 use async_trait::async_trait;
 use aws_config::Region;
 use aws_sdk_s3::config::http::HttpResponse;
@@ -24,9 +25,8 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{
     complete_multipart_upload::CompleteMultipartUploadError,
     create_multipart_upload::CreateMultipartUploadError,
-    get_object::GetObjectError, head_bucket::HeadBucketError,
-    head_object::HeadObjectError, put_object::PutObjectError,
-    upload_part::UploadPartError,
+    get_object::GetObjectError, head_object::HeadObjectError,
+    put_object::PutObjectError, upload_part::UploadPartError,
 };
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -56,9 +56,6 @@ pub enum Error {
     Head(HeadObjectError),
 
     Stream(std::io::Error),
-
-    /// Initialization error.
-    Init(InitError),
 
     /// The uploaded object is too large.
     TooLarge(u64),
@@ -102,51 +99,6 @@ impl From<SdkError<HeadObjectError, HttpResponse>> for Error {
 
 impl ::std::error::Error for Error {}
 
-#[derive(Debug, Display)]
-pub enum InitError {
-    #[display("Invalid S3 bucket name")]
-    Bucket,
-
-    #[display("Invalid S3 credentials")]
-    Credentials,
-
-    #[display("{}", _0)]
-    Other(String),
-}
-
-impl InitError {
-    /// Converts the initialization error into a backoff error. Useful for not
-    /// retrying certain errors.
-    pub fn into_backoff(self) -> backoff::Error<InitError> {
-        // Certain types of errors should never be retried.
-        match self {
-            InitError::Bucket | InitError::Credentials => {
-                backoff::Error::Permanent(self)
-            }
-            _ => backoff::Error::Transient {
-                err: self,
-                retry_after: None, /* NOTE: None causes us to follow retry
-                                    * policy here */
-            },
-        }
-    }
-}
-
-impl From<HeadBucketError> for InitError {
-    fn from(err: HeadBucketError) -> Self {
-        match err {
-            HeadBucketError::NotFound(_not_found) => InitError::Bucket,
-            x => match x.meta().code() {
-                Some(status) => InitError::Other(format!(
-                    "S3 returned HTTP status {}",
-                    status
-                )),
-                None => InitError::Other(x.to_string()),
-            },
-        }
-    }
-}
-
 /// Amazon S3 storage backend.
 pub struct Backend {
     /// S3 client.
@@ -171,38 +123,34 @@ impl Backend {
         mut prefix: String,
         cdn: Option<String>,
         s3_accelerate: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, anyhow::Error> {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
             prefix.pop();
         }
 
-        let (region, endpoint_url) = if let Ok(endpoint) =
-            std::env::var("AWS_S3_ENDPOINT")
-        {
-            // If a custom endpoint is set, do not use the AWS default
-            // (us-east-1). Instead, check environment variables for a region
-            // name.
-            let name = std::env::var("AWS_DEFAULT_REGION")
-                .or_else(|_| std::env::var("AWS_REGION"))
-                .map_err(|_| {
-                    InitError::Other(
+        let (region, endpoint_url) =
+            if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
+                // If a custom endpoint is set, do not use the AWS default
+                // (us-east-1). Instead, check environment variables for a
+                // region name.
+                let name = std::env::var("AWS_DEFAULT_REGION")
+                    .or_else(|_| std::env::var("AWS_REGION"))
+                    .context(
                         "$AWS_S3_ENDPOINT was set without $AWS_DEFAULT_REGION \
                          or $AWS_REGION being set. Custom endpoints don't \
-                         make sense without also setting a region."
-                            .into(),
-                    )
-                })?;
-            (Region::new(name), Some(endpoint))
-        } else {
-            (Region::new("us-east-1"), None)
-        };
+                         make sense without also setting a region.",
+                    )?;
+                (Region::new(name), Some(endpoint))
+            } else {
+                (Region::new("us-east-1"), None)
+            };
 
         let client: Client;
         let mut shared_config =
             aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
-        if endpoint_url.is_some() {
-            shared_config = shared_config.endpoint_url(endpoint_url.unwrap());
+        if let Some(endpoint_url) = endpoint_url {
+            shared_config = shared_config.endpoint_url(endpoint_url);
             shared_config = shared_config.region(region.clone());
         }
         let sdk_config = shared_config.load().await;
@@ -224,10 +172,10 @@ impl Backend {
         // useful.
         let resp = client.head_bucket().bucket(bucket.clone()).send().await;
         if resp.is_err() {
-            log::error!("Failed to connect to S3 bucket '{}'", bucket);
+            tracing::error!("Failed to connect to S3 bucket '{}'", bucket);
             std::process::exit(1);
         } else {
-            log::info!(
+            tracing::info!(
                 "Connecting to S3 bucket '{}' at region '{}'",
                 bucket,
                 sdk_config
@@ -243,40 +191,40 @@ impl Backend {
                 .bucket(bucket.clone())
                 .send()
                 .await;
-            if resp.is_err() {
-                log::error!(
-                    "Failed to check S3 transfer acceleration for bucket '{}'",
-                    bucket
-                );
-                std::process::exit(1);
-            } else {
-                let status = resp.unwrap().status.expect(
+            if let Ok(resp) = resp {
+                let status = resp.status.expect(
                     "Unable to determine S3 transfer acceleration status",
                 );
                 match status.as_str() {
-                    "Enabled" => log::info!(
+                    "Enabled" => tracing::info!(
                         "S3 transfer acceleration is enabled for bucket '{}'",
                         bucket
                     ),
                     "Suspended" => {
-                        log::error!(
+                        tracing::error!(
                             "S3 transfer acceleration is suspended for bucket \
                              '{}'",
                             bucket
                         );
-                        log::error!(
+                        tracing::error!(
                             "Please enable S3 transfer acceleration for this \
                              bucket or disable configuration"
                         );
                         std::process::exit(1);
                     }
-                    _ => log::warn!(
+                    _ => tracing::warn!(
                         "S3 transfer acceleration is in an unknown state '{}' \
                          for bucket '{}'",
                         status,
                         bucket
                     ),
                 }
+            } else {
+                tracing::error!(
+                    "Failed to check S3 transfer acceleration for bucket '{}'",
+                    bucket
+                );
+                std::process::exit(1);
             }
         }
 

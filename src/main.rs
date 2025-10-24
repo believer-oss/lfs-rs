@@ -23,6 +23,10 @@ use std::path::PathBuf;
 use clap::Parser;
 use hex::FromHex;
 
+#[cfg(not(feature = "otel"))]
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
+
 use lfs_rs::{Cache, LocalServerBuilder, S3ServerBuilder};
 use lfs_rs::{LocalLs, NoneLs};
 
@@ -96,9 +100,9 @@ struct GlobalArgs {
     )]
     max_cache_size: human_size::Size,
 
-    /// Logging level to use.
+    /// Logging level to use. Example: "debug"
     #[clap(long = "log-level", default_value = "info", env = "RUDOLFS_LOG")]
-    log_level: log::LevelFilter,
+    log_level: LevelFilter,
 
     /// Pass authorization header to GitHub to check permissions
     #[clap(long)]
@@ -223,18 +227,23 @@ struct LocalArgs {
 
 impl Args {
     async fn main(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Initialize logging.
-        let mut logger_builder = pretty_env_logger::formatted_timed_builder();
-        logger_builder.filter_module("rudolfs", self.global.log_level);
-
-        if let Ok(env) = std::env::var("RUST_LOG") {
-            // Support the addition of RUST_LOG to help with debugging
-            // dependencies, such as Hyper.
-            logger_builder.parse_filters(&env);
-        }
-
         #[cfg(not(feature = "otel"))]
-        logger_builder.init();
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive(
+                    // Filter directive for this crate specifically. This will
+                    // not override any directives from RUST_LOG unless it
+                    // overlaps.
+                    format!(
+                        "{}={}",
+                        env!("CARGO_PKG_NAME"),
+                        self.global.log_level
+                    )
+                    .parse()?,
+                ),
+            )
+            .init();
+
         #[cfg(feature = "otel")]
         let _guard = setup_tracing(self.global.log_level);
 
@@ -242,7 +251,7 @@ impl Args {
         let server_span =
             span!(tracing::Level::INFO, "server", local_addr = field::Empty);
 
-        log::info!("Starting server...");
+        tracing::info!("Starting server...");
 
         // Find a socket address to bind to. This will resolve domain names.
         let addr = match self.global.host {
@@ -256,7 +265,7 @@ impl Args {
         #[cfg(feature = "otel")]
         server_span.record("local_addr", addr.to_string());
 
-        log::info!("Initializing storage...");
+        tracing::info!("Initializing storage...");
 
         match self.backend {
             Backend::S3(s3) => {
@@ -378,7 +387,7 @@ impl LocalArgs {
 #[tokio::main]
 async fn main() {
     let exit_code = if let Err(err) = Args::parse().main().await {
-        log::error!("{}", err);
+        tracing::error!("{err}");
         1
     } else {
         0

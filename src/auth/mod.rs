@@ -254,10 +254,10 @@ where
         )
     )]
     fn call(&mut self, mut req: Req) -> Self::Future {
-        log::debug!("checking auth for {}", &req.uri());
+        tracing::debug!("checking auth for {}", &req.uri());
 
         if (!self.authenticated) || (!req.uri().path().starts_with("/api/")) {
-            log::trace!("skipping auth");
+            tracing::trace!("skipping auth");
             return Box::pin(self.service.call(req));
         };
         #[cfg(feature = "otel")]

@@ -19,7 +19,6 @@
 // SOFTWARE.
 mod common;
 
-use std::net::SocketAddr;
 use std::path::Path;
 
 use futures::future::Either;
@@ -29,11 +28,12 @@ use rand::Rng;
 use rand::SeedableRng;
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo};
+use common::{init_logger, GitRepo, SERVER_ADDR};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    init_logger();
+    let _guard = init_logger();
+    let _startup_span = common::startup();
 
     // Make sure our seed is deterministic. This makes it easier to reproduce
     // the same repo every time.
@@ -45,9 +45,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let locks = lfs_rs::NoneLs::new();
 
     let server = LocalServerBuilder::new(data.path().into(), key);
-    let (server, addr) = server
-        .spawn(SocketAddr::from(([0, 0, 0, 0], 0)), locks)
-        .await?;
+    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
