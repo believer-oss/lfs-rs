@@ -58,20 +58,20 @@ redis = { version = "0.28", optional = true, features = ["aio", "tokio-comp"] }
 base64 = { version = "0.22" }
 parking_lot = { version = "0.12" }
 
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = [
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = [
   "rt-tokio",
 ], optional = true }
-opentelemetry-otlp = { version = "0.27", features = [
+opentelemetry-otlp = { version = "0.31", features = [
   "http-proto",
   "tls",
   "tls-roots",
   "tokio",
   "tonic",
 ], optional = true }
-opentelemetry-http = { version = "0.27", optional = true }
-opentelemetry-appender-tracing = { version = "0.27", optional = true }
-opentelemetry-semantic-conventions = { version = "0.27", optional = true }
+opentelemetry-http = { version = "0.31", optional = true }
+opentelemetry-appender-tracing = { version = "0.31", optional = true }
+opentelemetry-semantic-conventions = { version = "0.31", optional = true }
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-opentelemetry = { version = "0.28", optional = true }
 tracing-log = { version = "0.2" }
@@ -80,7 +80,7 @@ tracing-subscriber = { version = "0.3", features = [
   "json",
   "registry",
 ] }
-opentelemetry-stdout = "0.27"
+opentelemetry-stdout = "0.31"
 
 [dev-dependencies]
 rand = "0.8"
