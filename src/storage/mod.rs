@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // Copyright (c) 2019 Jason White
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy

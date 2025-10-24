@@ -28,6 +28,7 @@ use rand::{self, Rng};
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 
+#[allow(dead_code)]
 #[derive(Debug, Display, From)]
 enum Error {
     Fault(FaultError),
