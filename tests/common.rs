@@ -20,9 +20,12 @@ use rand::SeedableRng;
 use std::fs::{self, File};
 use std::io;
 use std::io::ErrorKind;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Output;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::span::EnteredSpan;
@@ -38,6 +41,11 @@ use aws_sdk_dynamodb::types::{
 use opentelemetry_sdk::runtime;
 #[cfg(feature = "otel")]
 use tracing_subscriber::{prelude::*, Registry};
+
+/// Bind test server to localhost port 0. We don't want this server to be
+/// externally visible.
+pub const SERVER_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
 
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>;
 
@@ -70,7 +78,9 @@ impl GitRepo {
         cmd!("git", "init", "--initial-branch=main", ".")
             .dir(path)
             .run()?;
-        cmd!("git", "lfs", "install").dir(path).run()?;
+
+        git_lfs_install(path)?;
+
         cmd!("git", "remote", "add", "origin", "fake_remote")
             .dir(path)
             .run()?;
@@ -384,7 +394,7 @@ impl GitRepo {
         let client = aws_sdk_dynamodb::Client::new(&sdk_config);
         match client.describe_table().table_name(table).send().await {
             Ok(_) => {
-                log::debug!("Table {} already exists", table);
+                tracing::debug!("Table {} already exists", table);
                 client.delete_table().table_name(table).send().await?;
 
                 // wait until the table has been deleted
@@ -398,8 +408,8 @@ impl GitRepo {
                 }
             }
             Err(e) => {
-                log::debug!("Table {} does not exist", table);
-                log::debug!("Error: {:?}", e.into_source());
+                tracing::debug!("Table {} does not exist", table);
+                tracing::debug!("Error: {:?}", e.into_source());
             }
         }
         let resp = client
@@ -524,18 +534,17 @@ where
 }
 
 #[cfg(not(feature = "otel"))]
-pub fn init_logger() {
-    let _ = env_logger::builder()
-        // Include all events in tests
-        .filter_module("rudolfs", log::LevelFilter::max())
-        // Ensure events are captured by `cargo test`
-        .is_test(true)
-        // Ignore errors initializing the logger if tests race to configure it
-        .try_init();
+/// Sets the default subscriber for the current thread until the guard is
+/// dropped.
+///
+/// NOTE: Use `cargo test -- --nocapture` to see server logs.
+pub fn init_logger() -> tracing::subscriber::DefaultGuard {
+    let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+    tracing::subscriber::set_default(subscriber)
 }
 
 #[cfg(feature = "otel")]
-pub fn init_logger() {
+pub fn init_logger() -> tracing::subscriber::DefaultGuard {
     use opentelemetry::trace::TracerProvider as _;
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -557,11 +566,10 @@ pub fn init_logger() {
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
     let subscriber = Registry::default().with(telemetry);
     // ignore any errors if we fail to set the global default
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    tracing::subscriber::set_default(subscriber)
 }
 
 pub fn startup() -> EnteredSpan {
-    init_logger();
     tracing::span!(tracing::Level::INFO, "test startup").entered()
 }
 
@@ -723,6 +731,19 @@ pub async fn smoke_test(
 
     #[cfg(feature = "otel")]
     opentelemetry::global::shutdown_tracer_provider();
+
+    Ok(())
+}
+
+/// Runs `git lfs install`, but serializes it across unit tests. Tests are flaky
+/// if this is not done because it tries to overwrite `~/.gitconfig` and races
+/// with itself.
+fn git_lfs_install(path: &Path) -> io::Result<()> {
+    static LFS_INSTALL: Mutex<()> = Mutex::new(());
+
+    let _guard = LFS_INSTALL.lock().unwrap();
+
+    cmd!("git", "lfs", "install").dir(path).run()?;
 
     Ok(())
 }

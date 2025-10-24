@@ -58,6 +58,7 @@ struct Credentials {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = common::init_logger();
     let startup_span = common::startup();
 
     let config = match fs::read("tests/.test_credentials.toml") {

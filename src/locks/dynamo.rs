@@ -200,7 +200,7 @@ impl DynamoLockStore {
                 let base_delay_ms: u64 = 100;
                 let total_delay_ms = base_delay_ms * iterations;
                 let delay = std::time::Duration::from_millis(total_delay_ms);
-                log::info!(
+                tracing::info!(
                     "get_locks_for_paths: Got {} unprocessed items, sleeping \
                      for {}ms",
                     keys_and_attributes.len(),
@@ -333,7 +333,11 @@ impl LockStorage for DynamoLockStore {
         {
             Err(e) => {
                 let unified_error: aws_sdk_dynamodb::Error = e.into();
-                log::error!("Errror locking file {}: {}", path, unified_error);
+                tracing::error!(
+                    "Errror locking file {}: {}",
+                    path,
+                    unified_error
+                );
                 Err(unified_error.into())
             }
             Ok(_) => Ok(lock),

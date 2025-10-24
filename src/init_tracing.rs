@@ -2,6 +2,7 @@ use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
@@ -96,7 +97,7 @@ fn init_tracer_provider() -> TracerProvider {
         .build()
 }
 
-pub fn setup_tracing(_level: log::LevelFilter) -> OtelGuard {
+pub fn setup_tracing(_level: LevelFilter) -> OtelGuard {
     // Setup tracing-log to emit log records as tracing spans
     LogTracer::init().expect("Failed to set default logger");
 

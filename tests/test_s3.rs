@@ -38,7 +38,6 @@
 mod common;
 
 use std::fs;
-use std::net::SocketAddr;
 use std::path::Path;
 
 use futures::future::Either;
@@ -49,7 +48,7 @@ use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo};
+use common::{init_logger, GitRepo, SERVER_ADDR};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Credentials {
@@ -64,7 +63,7 @@ struct Credentials {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    init_logger();
+    let _guard = init_logger();
 
     let config = match fs::read("tests/.test_credentials.toml") {
         Ok(bytes) => bytes,
@@ -100,9 +99,7 @@ async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let locks = lfs_rs::NoneLs::new();
 
-    let (server, addr) = server
-        .spawn(SocketAddr::from(([0, 0, 0, 0], 0)), locks)
-        .await?;
+    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -136,7 +133,7 @@ async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    init_logger();
+    let _guard = init_logger();
 
     let config = match fs::read("tests/.test_credentials.toml") {
         Ok(bytes) => bytes,
@@ -181,9 +178,7 @@ async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let locks = lfs_rs::NoneLs::new();
 
-    let (server, addr) = server
-        .spawn(SocketAddr::from(([0, 0, 0, 0], 0)), locks)
-        .await?;
+    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 

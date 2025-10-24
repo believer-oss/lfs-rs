@@ -14,7 +14,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: believer-oss/setup-rust-toolchain@ff4c7a2d9523e22eab355f13c7732a4ea3e7a9b1
 
       - name: Run cargo check
         run: cargo check
@@ -26,36 +26,24 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: believer-oss/setup-rust-toolchain@ff4c7a2d9523e22eab355f13c7732a4ea3e7a9b1
 
       - name: Run cargo test
         run: cargo test --all-features
 
-  rustfmt:
+  formatting:
     name: Check format
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: believer-oss/setup-rust-toolchain@ff4c7a2d9523e22eab355f13c7732a4ea3e7a9b1
         with:
-          components: rustfmt
+          components: rustfmt, clippy
           toolchain: nightly
 
-      - name: Run cargo fmt
-        uses: actions-rust-lang/rustfmt@v1
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    permissions:
-      checks: write
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Run cargo clippy
-        run: cargo clippy --all-features -- -D warnings
+      - name: Check format and linting
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-features

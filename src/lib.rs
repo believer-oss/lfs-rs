@@ -170,13 +170,13 @@ impl S3ServerBuilder {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
 
         if self.cdn.is_some() {
-            log::warn!(
+            tracing::warn!(
                 "A CDN was specified. Since uploads and downloads do not flow \
                  through Rudolfs in this case, they will *not* be encrypted."
             );
 
             if self.cache.take().is_some() {
-                log::warn!(
+                tracing::warn!(
                     "A local disk cache does not work with a CDN and will be \
                      disabled."
                 );
@@ -208,7 +208,7 @@ impl S3ServerBuilder {
                         Either::Left(Verify::new(Encrypted::new(key, cache)))
                     }
                     None => {
-                        log::warn!("Not encrypting cache");
+                        tracing::warn!("Not encrypting cache");
                         Either::Right(Verify::new(cache))
                     }
                 });
@@ -253,7 +253,7 @@ impl S3ServerBuilder {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (server, addr) = self.spawn(addr, lock).await?;
 
-        log::info!("Listening on {}", addr);
+        tracing::info!("Listening on {}", addr);
 
         server.await?;
         Ok(())
@@ -329,12 +329,12 @@ impl LocalServerBuilder {
                 Either::Left(Verify::new(Encrypted::new(key, storage)))
             }
             None => {
-                log::warn!("Not encrypting cache");
+                tracing::warn!("Not encrypting cache");
                 Either::Right(Verify::new(storage))
             }
         });
 
-        log::info!("Local disk storage initialized.");
+        tracing::info!("Local disk storage initialized.");
 
         let (fut, addr) = spawn_server(
             storage,
@@ -357,7 +357,7 @@ impl LocalServerBuilder {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (server, addr) = self.spawn(addr, locks).await?;
 
-        log::info!("Listening on {}", addr);
+        tracing::info!("Listening on {}", addr);
 
         server.await?;
         Ok(())
@@ -398,7 +398,7 @@ where
                         let (stream, peer_addr) = match conn {
                             Ok(conn) => conn,
                             Err(e) => {
-                                log::error!("accept error: {}", e);
+                                tracing::error!("accept error: {}", e);
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 continue;
                             }
@@ -432,16 +432,16 @@ where
 
                         let handler = async move {
                             if let Err(err) = conn.await {
-                                log::error!("connection error: {}", err);
+                                tracing::error!("connection error: {}", err);
                             }
-                            log::debug!("connection dropped: {}", peer_addr);
+                            tracing::debug!("connection dropped: {}", peer_addr);
                         };
                         tokio::spawn(handler);
                     },
 
                     _ = ctrl_c.as_mut() => {
                         drop(listener);
-                        log::info!("Ctrl-C received, starting shutdown");
+                        tracing::info!("Ctrl-C received, starting shutdown");
                             break;
                     }
                 }
@@ -449,11 +449,11 @@ where
 
             tokio::select! {
                 _ = graceful.shutdown() => {
-                    log::info!("Gracefully shutdown!");
+                    tracing::info!("Gracefully shutdown!");
                     Ok(())
                 },
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                    log::info!("Waited 10 seconds for graceful shutdown, aborting...");
+                    tracing::info!("Waited 10 seconds for graceful shutdown, aborting...");
                     Ok(())
                 }
             }
