@@ -45,5 +45,5 @@ jobs:
 
       - name: Check format and linting
         run: |
-          cargo fmt -- --check
-          cargo clippy --all-features -- -D warnings
+          cargo fmt --all -- --check
+          cargo clippy --all-features

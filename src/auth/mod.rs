@@ -292,22 +292,28 @@ where
                 }
             };
 
-            let user =
-                Self::authorize(req.headers(), &namespace, cache, &server)
-                    .await?;
-
             // All endpoints require authentication, so return early
             // if we have no user or permissions.
-            if user.is_none() || user.as_ref().unwrap().permissions.is_none() {
-                Ok(Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-                    .body(empty())?)
-            } else {
-                let ext = req.extensions_mut();
-                ext.insert(user.unwrap());
-                service.call(req).await
-            }
+            let user = match Self::authorize(
+                req.headers(),
+                &namespace,
+                cache,
+                &server,
+            )
+            .await?
+            {
+                Some(user) if user.permissions.is_some() => user,
+                _ => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
+                        .body(empty())?);
+                }
+            };
+
+            let ext = req.extensions_mut();
+            ext.insert(user);
+            service.call(req).await
         };
 
         #[cfg(feature = "otel")]
