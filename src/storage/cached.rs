@@ -346,8 +346,12 @@ where
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         // Get just the size of an object without perturbing the LRU ordering.
         // Only downloads or uploads need to perturb the LRU ordering.
-        let lru = self.lru.lock().await;
-        if let Some(size) = lru.get(key) {
+        let cache_size = {
+            let lru = self.lru.lock().await;
+            lru.get(key)
+        }; // Lock dropped here
+
+        if let Some(size) = cache_size {
             // Cache hit!
             Ok(Some(size))
         } else {
