@@ -28,7 +28,8 @@ mod locks;
 mod logger;
 mod lru;
 mod sha256;
-mod storage;
+#[doc(hidden)]
+pub mod storage;
 mod util;
 
 use futures::future::{BoxFuture, Either, Future, TryFutureExt};
@@ -46,6 +47,7 @@ use linked_hash_map::LinkedHashMap;
 
 use crate::app::App;
 use crate::error::Error;
+pub use crate::lfs::Oid;
 pub use crate::locks::{
     CreateLockBatchRequest, LocalLs, LockBatch, LockBatchOuter, LockFailure,
     LockStorage, NoneLs, ReleaseLockBatchRequest,
@@ -88,6 +90,7 @@ pub struct S3ServerBuilder {
     cache: Option<Cache>,
     authenticated: bool,
     authentication_server: Option<String>,
+    size_cache_entries: usize,
 }
 
 impl S3ServerBuilder {
@@ -101,6 +104,7 @@ impl S3ServerBuilder {
             cache: None,
             authenticated: false,
             authentication_server: None,
+            size_cache_entries: 256000, // Default to 256k entries
         }
     }
 
@@ -157,6 +161,12 @@ impl S3ServerBuilder {
         self
     }
 
+    /// Sets the maximum number of entries in the S3 size cache.
+    pub fn size_cache_entries(&mut self, entries: usize) -> &mut Self {
+        self.size_cache_entries = entries;
+        self
+    }
+
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
     pub async fn spawn(
@@ -183,9 +193,15 @@ impl S3ServerBuilder {
             }
         }
 
-        let s3 = S3::new(self.bucket, prefix, self.cdn, self.s3_accelerate)
-            .map_err(Error::from)
-            .await?;
+        let s3 = S3::new(
+            self.bucket,
+            prefix,
+            self.cdn,
+            self.s3_accelerate,
+            self.size_cache_entries,
+        )
+        .map_err(Error::from)
+        .await?;
 
         // Retry certain operations to S3 to make it more reliable.
         let s3 = Retrying::new(s3);

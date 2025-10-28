@@ -215,6 +215,16 @@ struct S3Args {
     /// transfer acceleration enabled.
     #[clap(long = "s3ta", env = "RUDOLFS_S3TA")]
     s3_accelerate: bool,
+
+    /// Maximum number of entries in the S3 size cache. Set to 0 to disable
+    /// size caching. The cache stores object sizes to avoid repeated HEAD
+    /// requests.
+    #[clap(
+        long = "s3-size-cache-entries",
+        default_value = "256000",
+        env = "RUDOLFS_S3_SIZE_CACHE_ENTRIES"
+    )]
+    size_cache_entries: usize,
 }
 
 #[derive(Parser)]
@@ -294,6 +304,7 @@ impl S3Args {
         let mut builder = S3ServerBuilder::new(self.bucket, global_args.key);
         builder.prefix(self.prefix);
         builder.authenticated(global_args.github_auth);
+        builder.size_cache_entries(self.size_cache_entries);
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);

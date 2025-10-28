@@ -149,6 +149,10 @@ impl LFSObject {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn stream(self) -> ByteStream {
         self.stream
     }
