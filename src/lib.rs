@@ -28,6 +28,7 @@ mod locks;
 mod logger;
 mod lru;
 mod sha256;
+pub mod stats;
 #[doc(hidden)]
 pub mod storage;
 mod util;

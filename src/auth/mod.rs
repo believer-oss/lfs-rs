@@ -2,6 +2,7 @@ use core::task::{Context, Poll};
 use futures::future::BoxFuture;
 use std::{sync::Arc, time::Instant};
 
+use crate::stats::STATS;
 use crate::storage::Namespace;
 use crate::util::{empty, full};
 use crate::{app::BoxBody, error::Error};
@@ -129,7 +130,7 @@ impl<S> Auth<S> {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip_all, ret)
+        tracing::instrument(level = "info", skip_all, ret(level = "debug"))
     )]
     async fn authorize(
         headers: &HeaderMap,
@@ -152,6 +153,7 @@ impl<S> Auth<S> {
 
                 // todo: make this TTL configurable
                 if entry.timestamp.elapsed().as_secs() < 300 {
+                    STATS.github_auth_cache_hit();
                     return Ok(Some(entry.data.clone()));
                 }
             }
@@ -169,9 +171,10 @@ impl<S> Auth<S> {
                 .header(header::USER_AGENT, "rudolfs")
                 .body(empty())?;
 
+            STATS.github_api_call();
             let res = client.request(req).await?;
 
-            event!(Level::INFO, status = ?res.status(), url = %url);
+            event!(Level::DEBUG, status = ?res.status(), url = %url);
 
             if res.status() == StatusCode::OK {
                 let body = res.collect().await?.aggregate();
@@ -203,7 +206,7 @@ impl<S> Auth<S> {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip_all, ret)
+        tracing::instrument(level = "info", skip_all, ret(level = "debug"))
     )]
     async fn get_github_username(
         auth: &HeaderValue,
@@ -216,6 +219,7 @@ impl<S> Auth<S> {
             .header(header::USER_AGENT, "rudolfs")
             .body(empty())?;
 
+        STATS.github_api_call();
         let res = client.request(req).await?;
 
         if res.status() == StatusCode::OK {
@@ -335,9 +339,12 @@ where
                 }
             };
 
-            let ext = req.extensions_mut();
-            ext.insert(user);
-            service.call(req).await
+            // The request carries the user to the app, and the response
+            // carries it back out to the request log.
+            req.extensions_mut().insert(user.clone());
+            let mut response = service.call(req).await?;
+            response.extensions_mut().insert(user);
+            Ok(response)
         };
 
         #[cfg(feature = "otel")]

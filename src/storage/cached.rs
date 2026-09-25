@@ -32,6 +32,7 @@ use futures::{
 use tokio::{self, sync::Mutex};
 
 use crate::lru;
+use crate::stats::STATS;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 
@@ -122,6 +123,7 @@ where
         if count > 0 {
             tracing::info!("Pruned {} entries from the cache", count);
         }
+        STATS.disk_cache_size(lru.lock().await.size(), max_size);
 
         Ok(Backend {
             lru,
@@ -159,6 +161,8 @@ where
         }
     }
 
+    STATS.disk_cache_size(lru.size(), max_size);
+
     Ok(deleted)
 }
 
@@ -185,6 +189,7 @@ where
     {
         let mut lru = lru.lock().await;
         lru.push(key, len);
+        STATS.disk_cache_size(lru.size(), max_size);
     }
 
     match prune_cache(lru, max_size, cache).await {
@@ -226,13 +231,18 @@ where
             let obj = self.cache.get(key).await.map_err(Error::from_cache)?;
 
             return match obj {
-                Some(obj) => Ok(Some(obj)),
+                Some(obj) => {
+                    STATS.disk_cache_hit();
+                    Ok(Some(obj))
+                }
                 None => {
+                    STATS.disk_cache_miss();
                     // If the cache doesn't actually have it, delete the entry
                     // from our LRU. This can happen if the cache is cleared out
                     // manually.
                     let mut lru = self.lru.lock().await;
                     lru.remove(key);
+                    STATS.disk_cache_size(lru.size(), self.max_size);
 
                     // Fall back to permanent storage. Note that this won't
                     // actually cache the object. This will be done next time
@@ -244,6 +254,7 @@ where
 
         // Cache miss. Get the object from permanent storage. If successful, we
         // need to cache the resulting byte stream.
+        STATS.disk_cache_miss();
         let lru = self.lru.clone();
         let max_size = self.max_size;
         let cache = self.cache.clone();

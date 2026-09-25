@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use core::{
-    fmt, mem,
+    mem,
     ops::Deref,
     pin::Pin,
     task::{Context, Poll},
@@ -28,6 +28,9 @@ use futures::TryStreamExt;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
+#[cfg(feature = "otel")]
+use core::fmt;
+#[cfg(feature = "otel")]
 use http::HeaderMap;
 use http_body_util::{BodyExt, BodyStream, Full};
 use hyper::body::Incoming;
@@ -205,9 +208,11 @@ pub fn empty() -> BoxBody {
         .boxed_unsync()
 }
 
+#[cfg(feature = "otel")]
 pub struct RedactedHeaders(pub HeaderMap);
 
 // Redact the Authorization header.
+#[cfg(feature = "otel")]
 impl fmt::Display for RedactedHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (key, value) in &self.0 {

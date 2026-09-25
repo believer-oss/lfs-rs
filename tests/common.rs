@@ -39,8 +39,6 @@ use aws_sdk_dynamodb::types::{
 };
 
 #[cfg(feature = "otel")]
-use opentelemetry_sdk::runtime;
-#[cfg(feature = "otel")]
 use tracing_subscriber::{Registry, prelude::*};
 
 /// Bind test server to localhost port 0. We don't want this server to be
@@ -719,25 +717,16 @@ pub fn init_logger() -> tracing::subscriber::DefaultGuard {
 pub fn init_logger() -> tracing::subscriber::DefaultGuard {
     use opentelemetry::trace::TracerProvider as _;
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
+    // Spans go through the OpenTelemetry layer, as they do in the server, but
+    // there is no exporter: the tests have no collector to send them to.
+    let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .build()
-        .unwrap();
-
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_id_generator(
-            opentelemetry_sdk::trace::RandomIdGenerator::default(),
-        )
-        .with_batch_exporter(exporter, runtime::Tokio)
-        .build();
-
-    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+        .tracer(env!("CARGO_PKG_NAME"));
 
     let telemetry = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
     let subscriber = Registry::default().with(telemetry);
-    // ignore any errors if we fail to set the global default
     tracing::subscriber::set_default(subscriber)
 }
 
@@ -915,9 +904,6 @@ where
         // If the server exited first, then propagate the error.
         result.map_err(Into::into)?;
     }
-
-    #[cfg(feature = "otel")]
-    opentelemetry::global::shutdown_tracer_provider();
 
     Ok(())
 }

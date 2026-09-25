@@ -1,127 +1,315 @@
-use opentelemetry::KeyValue;
-use opentelemetry::global;
-use opentelemetry::trace::TracerProvider as _;
-use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
+//! Sets up logging and, with the `otel` feature, OpenTelemetry traces and
+//! metrics exported over OTLP/gRPC (configured by the standard `OTEL_*`
+//! environment variables).
+
+use std::io::IsTerminal;
+
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Registry;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 
-use tracing_log::LogTracer;
-
+#[cfg(feature = "otel")]
+use opentelemetry::{KeyValue, trace::TracerProvider as _};
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::{
     Resource,
-    metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
-    runtime,
-    trace::{RandomIdGenerator, Sampler, TracerProvider},
+    metrics::{PeriodicReader, SdkMeterProvider},
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+#[cfg(feature = "otel")]
+use opentelemetry_semantic_conventions::attribute::SERVICE_VERSION;
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetryLayer;
 
-use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
-    attribute::{SERVICE_NAME, SERVICE_VERSION},
-};
+/// The target of this crate's own spans and events.
+const CRATE_TARGET: &str = env!("CARGO_CRATE_NAME");
 
-pub struct OtelGuard {
-    tracer_provider: TracerProvider,
+/// Builds the log filter. Everything logs at `info` unless `rust_log` (the
+/// value of `RUST_LOG`) says otherwise. If `level` (from `--log-level`) is
+/// given, this crate logs at it, unless `rust_log` names this crate itself.
+///
+/// Directives in `rust_log` that don't parse are skipped with a warning on
+/// stderr, since a typo shouldn't stop the server from starting.
+pub fn env_filter(
+    level: Option<LevelFilter>,
+    rust_log: Option<&str>,
+) -> EnvFilter {
+    let mut filter = match level {
+        Some(level) => EnvFilter::new(format!("info,{CRATE_TARGET}={level}")),
+        None => EnvFilter::new("info"),
+    };
+
+    for directive in rust_log.unwrap_or_default().split(',') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        match directive.parse() {
+            Ok(directive) => filter = filter.add_directive(directive),
+            Err(err) => {
+                eprintln!(
+                    "Ignoring invalid RUST_LOG directive '{directive}': {err}"
+                )
+            }
+        }
+    }
+
+    filter
+}
+
+/// Flushes and shuts down the exporters when dropped. Keep it alive until
+/// after the last event that should be exported.
+#[must_use]
+pub struct Guard {
+    #[cfg(feature = "otel")]
+    tracer_provider: SdkTracerProvider,
+    #[cfg(feature = "otel")]
     meter_provider: SdkMeterProvider,
 }
 
-// Create a Resource that captures information about the entity for which
-// telemetry is recorded.
-fn resource() -> Resource {
-    Resource::from_schema_url(
-        [
-            KeyValue::new(SERVICE_NAME, env!("CARGO_PKG_NAME")),
-            KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-        ],
-        SCHEMA_URL,
-    )
-}
-
-impl Drop for OtelGuard {
+#[cfg(feature = "otel")]
+impl Drop for Guard {
     fn drop(&mut self) {
         if let Err(err) = self.tracer_provider.shutdown() {
-            eprintln!("{err:?}");
+            eprintln!("Failed to shut down the tracer provider: {err}");
         }
         if let Err(err) = self.meter_provider.shutdown() {
-            eprintln!("{err:?}");
+            eprintln!("Failed to shut down the meter provider: {err}");
         }
     }
 }
 
-// Construct MeterProvider for MetricsLayer
-fn init_meter_provider() -> SdkMeterProvider {
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
-        .build()
-        .unwrap();
+/// Installs the global subscriber.
+pub fn setup_tracing(
+    level: Option<LevelFilter>,
+) -> Result<Guard, Box<dyn std::error::Error>> {
+    // Forward records from crates that use `log` instead of `tracing`.
+    tracing_log::LogTracer::init()?;
 
-    let reader = PeriodicReader::builder(exporter, runtime::Tokio)
-        .with_interval(std::time::Duration::from_secs(30))
-        .build();
+    let filter = env_filter(level, std::env::var("RUST_LOG").ok().as_deref());
 
-    // For debugging in development
-    let stdout_reader = PeriodicReader::builder(
-        opentelemetry_stdout::MetricExporter::default(),
-        runtime::Tokio,
-    )
-    .build();
+    // Color codes are only useful on a terminal. In a pod they end up in the
+    // log lines, and Loki can't detect the level.
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal());
 
-    let meter_provider = MeterProviderBuilder::default()
-        .with_resource(resource())
-        .with_reader(reader)
-        .with_reader(stdout_reader)
-        .build();
+    let subscriber = tracing_subscriber::registry().with(fmt);
 
-    global::set_meter_provider(meter_provider.clone());
+    #[cfg(feature = "otel")]
+    {
+        let tracer_provider = tracer_provider()?;
+        let meter_provider = meter_provider()?;
+        let tracer = tracer_provider.tracer(CRATE_TARGET);
 
-    meter_provider
+        let subscriber = subscriber
+            .with(OpenTelemetryLayer::new(tracer))
+            .with(filter);
+        tracing::subscriber::set_global_default(subscriber)?;
+
+        Ok(Guard {
+            tracer_provider,
+            meter_provider,
+        })
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        tracing::subscriber::set_global_default(subscriber.with(filter))?;
+        Ok(Guard {})
+    }
 }
 
-// Construct TracerProvider for OpenTelemetryLayer
-fn init_tracer_provider() -> TracerProvider {
+/// Describes this service. `OTEL_SERVICE_NAME` and
+/// `OTEL_RESOURCE_ATTRIBUTES` are also honored.
+#[cfg(feature = "otel")]
+fn resource() -> Resource {
+    Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .with_attribute(KeyValue::new(
+            SERVICE_VERSION,
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+}
+
+#[cfg(feature = "otel")]
+fn tracer_provider() -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .build()
-        .unwrap();
+        .build()?;
 
-    TracerProvider::builder()
-        // Customize sampling strategy
-        .with_sampler(Sampler::ParentBased(Box::new(
-            Sampler::TraceIdRatioBased(1.0),
-        )))
+    Ok(SdkTracerProvider::builder()
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource())
-        .with_batch_exporter(exporter, runtime::Tokio)
-        .build()
+        .with_batch_exporter(exporter)
+        .build())
 }
 
-pub fn setup_tracing(_level: LevelFilter) -> OtelGuard {
-    // Setup tracing-log to emit log records as tracing spans
-    LogTracer::init().expect("Failed to set default logger");
+#[cfg(feature = "otel")]
+fn meter_provider() -> Result<SdkMeterProvider, Box<dyn std::error::Error>> {
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .build()?;
 
-    let tracer_provider = init_tracer_provider();
-    let meter_provider = init_meter_provider();
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(std::time::Duration::from_secs(60))
+        .build();
 
-    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource())
+        .with_reader(reader)
+        .build();
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
-        .unwrap();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    register_stats(&meter_provider);
 
-    let subscriber = Registry::default()
-        .with(tracing_subscriber::fmt::layer())
-        // .with(otel_logs_layer)
-        .with(OpenTelemetryLayer::new(tracer))
-        .with(MetricsLayer::new(meter_provider.clone()))
-        .with(env_filter);
+    Ok(meter_provider)
+}
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set default tracing subscriber");
+/// Exports the counters in [`STATS`](lfs_rs::stats::STATS). Request latency is
+/// a histogram recorded by the request logger instead.
+#[cfg(feature = "otel")]
+fn register_stats(meter_provider: &SdkMeterProvider) {
+    use lfs_rs::stats::{STATS, Snapshot};
+    use opentelemetry::metrics::MeterProvider as _;
 
-    OtelGuard {
-        tracer_provider,
-        meter_provider,
+    type Read = fn(&Snapshot) -> Vec<(u64, Vec<KeyValue>)>;
+
+    let meter = meter_provider.meter(CRATE_TARGET);
+
+    // The instruments stay registered after these builders' handles drop.
+    let counter = |name: &'static str, unit: &'static str, read: Read| {
+        meter
+            .u64_observable_counter(name)
+            .with_unit(unit)
+            .with_callback(move |observer| {
+                for (value, attributes) in read(&STATS.snapshot()) {
+                    observer.observe(value, &attributes);
+                }
+            })
+            .build();
+    };
+    let gauge = |name: &'static str, unit: &'static str, read: Read| {
+        meter
+            .u64_observable_gauge(name)
+            .with_unit(unit)
+            .with_callback(move |observer| {
+                for (value, attributes) in read(&STATS.snapshot()) {
+                    observer.observe(value, &attributes);
+                }
+            })
+            .build();
+    };
+    counter("lfs.transfer.bytes", "By", |s| {
+        vec![
+            (s.bytes_uploaded, vec![KeyValue::new("direction", "upload")]),
+            (
+                s.bytes_downloaded,
+                vec![KeyValue::new("direction", "download")],
+            ),
+        ]
+    });
+    counter("lfs.presigned_urls", "{url}", |s| {
+        vec![
+            (
+                s.presigned_uploads,
+                vec![KeyValue::new("operation", "upload")],
+            ),
+            (
+                s.presigned_downloads,
+                vec![KeyValue::new("operation", "download")],
+            ),
+        ]
+    });
+    counter("lfs.cache.lookups", "{lookup}", |s| {
+        let lookup = |cache, result| {
+            vec![
+                KeyValue::new("cache", cache),
+                KeyValue::new("result", result),
+            ]
+        };
+        vec![
+            (s.disk_cache_hits, lookup("disk", "hit")),
+            (s.disk_cache_misses, lookup("disk", "miss")),
+            (s.s3_size_cache_hits, lookup("s3_size", "hit")),
+            (s.s3_size_cache_misses, lookup("s3_size", "miss")),
+            (s.github_auth_cache_hits, lookup("github_auth", "hit")),
+        ]
+    });
+    counter("lfs.github.api_calls", "{call}", |s| {
+        vec![(s.github_api_calls, vec![])]
+    });
+    gauge("lfs.disk_cache.usage", "By", |s| {
+        vec![(s.disk_cache_bytes, vec![])]
+    });
+    // 0 means unlimited, which is better left unreported than reported as 0.
+    gauge("lfs.disk_cache.limit", "By", |s| match s.disk_cache_limit {
+        0 => vec![],
+        limit => vec![(limit, vec![])],
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    /// Which of (this crate at debug, another crate at debug) the filter
+    /// lets through.
+    fn debug_enabled(filter: EnvFilter) -> (bool, bool) {
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            (
+                tracing::enabled!(target: "lfs_rs", Level::DEBUG),
+                tracing::enabled!(target: "hyper", Level::DEBUG),
+            )
+        })
+    }
+
+    #[test]
+    fn log_level_applies_to_this_crate_only() {
+        let filter = env_filter(Some(LevelFilter::DEBUG), None);
+        assert_eq!(debug_enabled(filter), (true, false));
+
+        let filter = env_filter(Some(LevelFilter::INFO), None);
+        assert_eq!(debug_enabled(filter), (false, false));
+    }
+
+    #[test]
+    fn rust_log_sets_the_rest() {
+        let filter = env_filter(Some(LevelFilter::INFO), Some("hyper=debug"));
+        assert_eq!(debug_enabled(filter), (false, true));
+
+        let filter = env_filter(Some(LevelFilter::INFO), Some("debug"));
+        assert_eq!(debug_enabled(filter), (false, true));
+    }
+
+    /// Without `--log-level`, this crate follows RUST_LOG like everything else.
+    #[test]
+    fn rust_log_alone_applies_to_this_crate() {
+        let filter = env_filter(None, Some("debug"));
+        assert_eq!(debug_enabled(filter), (true, true));
+
+        let filter = env_filter(None, None);
+        assert_eq!(debug_enabled(filter), (false, false));
+    }
+
+    #[test]
+    fn rust_log_naming_this_crate_wins() {
+        let filter = env_filter(Some(LevelFilter::INFO), Some("lfs_rs=debug"));
+        assert_eq!(debug_enabled(filter), (true, false));
+
+        let filter = env_filter(Some(LevelFilter::DEBUG), Some("lfs_rs=info"));
+        assert_eq!(debug_enabled(filter), (false, false));
+    }
+
+    #[test]
+    fn invalid_directives_are_skipped() {
+        let filter = env_filter(
+            Some(LevelFilter::INFO),
+            Some("hyper=debug,=bogus=,lfs_rs"),
+        );
+        assert_eq!(debug_enabled(filter), (true, true));
     }
 }

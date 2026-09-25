@@ -46,6 +46,7 @@ use tracing::instrument;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 use crate::lru;
+use crate::stats::STATS;
 use derive_more::{Display, From};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -463,10 +464,12 @@ impl Storage for Backend {
         if let Some(cache) = &self.size_cache {
             if let Some(size) = cache.lock().get_refresh(key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                STATS.s3_size_cache_hit();
                 tracing::debug!("S3 size cache hit for {}", key.oid());
                 return Ok(Some(size));
             }
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            STATS.s3_size_cache_miss();
         }
 
         // Cache miss - perform HEAD request

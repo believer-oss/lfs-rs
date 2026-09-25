@@ -30,6 +30,7 @@ use std::path::Path;
 
 use futures::future::Either;
 use lfs_rs::S3ServerBuilder;
+use lfs_rs::stats::{RequestClass, STATS};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -78,8 +79,20 @@ async fn s3_smoke_test(
     repo.lfs_push()?;
 
     // Make sure we can re-download the same objects.
+    let before_pull = STATS.snapshot();
     repo.clean_lfs()?;
     repo.lfs_pull()?;
+
+    // The counters are shared by every test in this binary, so only check
+    // for at least what this pull did.
+    let pulled = STATS.snapshot().since(&before_pull);
+    assert!(pulled.requests(RequestClass::Batch) >= 1, "{pulled:?}");
+    assert!(pulled.requests(RequestClass::Download) >= 3, "{pulled:?}");
+    assert!(pulled.bytes_downloaded >= 28 * 1024 * 1024, "{pulled:?}");
+    assert!(
+        pulled.s3_size_cache_hits + pulled.s3_size_cache_misses >= 3,
+        "{pulled:?}"
+    );
 
     // Push again. This should be super fast.
     repo.lfs_push()?;
@@ -136,7 +149,19 @@ async fn s3_production_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     server.authentication_server(mock.uri());
     let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
 
-    common::lock_smoke_test(server, addr, Some(startup_span)).await
+    let before = STATS.snapshot();
+    common::lock_smoke_test(server, addr, Some(startup_span)).await?;
+
+    // Uploads go through the disk cache, and every API request is
+    // authenticated through the (mocked) GitHub API or its cache.
+    let after = STATS.snapshot();
+    let delta = after.since(&before);
+    assert!(after.disk_cache_bytes >= 28 * 1024 * 1024, "{after:?}");
+    assert_eq!(after.disk_cache_limit, 1024 * 1024 * 1024);
+    assert!(delta.github_api_calls >= 1, "{delta:?}");
+    assert!(delta.github_auth_cache_hits >= 1, "{delta:?}");
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

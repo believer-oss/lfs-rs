@@ -19,12 +19,11 @@
 // SOFTWARE.
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use hex::FromHex;
 
-#[cfg(not(feature = "otel"))]
-use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use lfs_rs::{Cache, LocalServerBuilder, S3ServerBuilder};
@@ -35,10 +34,7 @@ use lfs_rs::DynamoLs;
 #[cfg(feature = "redis")]
 use lfs_rs::RedisLs;
 
-#[cfg(feature = "otel")]
 mod init_tracing;
-#[cfg(feature = "otel")]
-use init_tracing::setup_tracing;
 #[cfg(feature = "otel")]
 use tracing::{field, instrument, span};
 
@@ -100,13 +96,25 @@ struct GlobalArgs {
     )]
     max_cache_size: human_size::Size,
 
-    /// Logging level to use. Example: "debug"
-    #[clap(long = "log-level", default_value = "info", env = "RUDOLFS_LOG")]
-    log_level: LevelFilter,
+    /// Logging level for lfs-rs itself, e.g. "debug". Without it, lfs-rs logs
+    /// at the level RUST_LOG sets, or `info`. A RUST_LOG directive naming
+    /// `lfs_rs` takes precedence over this.
+    #[clap(long = "log-level", env = "RUDOLFS_LOG")]
+    log_level: Option<LevelFilter>,
 
     /// Pass authorization header to GitHub to check permissions
     #[clap(long)]
     github_auth: bool,
+
+    /// How often to log a summary of the server's activity at info level
+    /// (requests, bytes transferred, cache hit rates). 0 turns it off.
+    #[clap(
+        long = "stats-interval",
+        default_value = "1h",
+        value_parser = humantime::parse_duration,
+        env = "RUDOLFS_STATS_INTERVAL"
+    )]
+    stats_interval: Duration,
 }
 
 fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
@@ -238,31 +246,15 @@ struct LocalArgs {
 
 impl Args {
     async fn main(self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(not(feature = "otel"))]
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive(
-                    // Filter directive for this crate specifically. This will
-                    // not override any directives from RUST_LOG unless it
-                    // overlaps.
-                    format!(
-                        "{}={}",
-                        env!("CARGO_PKG_NAME"),
-                        self.global.log_level
-                    )
-                    .parse()?,
-                ),
-            )
-            .init();
-
-        #[cfg(feature = "otel")]
-        let _guard = setup_tracing(self.global.log_level);
-
         #[cfg(feature = "otel")]
         let server_span =
             span!(tracing::Level::INFO, "server", local_addr = field::Empty);
 
         tracing::info!("Starting server...");
+
+        if !self.global.stats_interval.is_zero() {
+            tokio::spawn(lfs_rs::stats::log_every(self.global.stats_interval));
+        }
 
         // Find a socket address to bind to. This will resolve domain names.
         let addr = match self.global.host {
@@ -294,7 +286,7 @@ impl Args {
 impl S3Args {
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", name = "s3args.run")
+        instrument(level = "info", name = "s3args.run", skip_all)
     )]
     async fn run(
         self,
@@ -351,7 +343,7 @@ impl S3Args {
 impl LocalArgs {
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(self), name = "http.request")
+        instrument(level = "info", name = "localargs.run", skip_all)
     )]
     async fn run(
         self,
@@ -398,7 +390,19 @@ impl LocalArgs {
 
 #[tokio::main]
 async fn main() {
-    let exit_code = if let Err(err) = Args::parse().main().await {
+    let args = Args::parse();
+
+    // Set up here rather than in `Args::main` so that the guard outlives the
+    // error logged below, and flushes it to the exporter.
+    let guard = match init_tracing::setup_tracing(args.global.log_level) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("Failed to set up logging: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let exit_code = if let Err(err) = args.main().await {
         // Include the causes: the outermost error is usually just context,
         // such as which bucket we failed to reach, and not why.
         let mut message = err.to_string();
@@ -413,5 +417,7 @@ async fn main() {
         0
     };
 
+    // `exit` skips destructors, so flush explicitly.
+    drop(guard);
     std::process::exit(exit_code);
 }

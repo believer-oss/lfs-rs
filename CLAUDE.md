@@ -123,11 +123,25 @@ two depend on Cargo features. `--lock-backend` selects one.
 
 ### Observability
 
-With the `otel` feature, `src/init_tracing.rs` sets up OpenTelemetry OTLP
-export, and handlers use `#[instrument]` behind `cfg(feature = "otel")`.
-Without it, a plain `tracing_subscriber` `EnvFilter` is used. Any
-otel-specific code you add needs the same `cfg` gate so that
-`--no-default-features` still builds.
+`src/init_tracing.rs` sets up logging for both builds. `main` creates the
+subscriber and holds its guard until after the final error is logged. `exit`
+skips destructors, so the guard is dropped explicitly first. `RUST_LOG`
+(default `info`) sets the filter. `--log-level` / `RUDOLFS_LOG`, if given, sets
+this crate's level, unless `RUST_LOG` names `lfs_rs` itself. ANSI colors are only
+used on a terminal.
+
+With the `otel` feature, traces and metrics are exported over OTLP/gRPC
+(`OTEL_EXPORTER_OTLP_ENDPOINT` etc.), and handlers use `#[instrument]` behind
+`cfg(feature = "otel")`. Keep `info` for what an operator needs. Health checks,
+`ret` values and per-call detail belong at `debug`. Any otel-specific code you
+add needs the same `cfg` gate so that `--no-default-features` still builds.
+
+Activity is counted in `stats::STATS`, a process-wide set of atomic counters
+(`src/stats.rs`). The same counters feed the periodic `stats` line at `info`
+(`--stats-interval`, default 1h, deltas since the previous line) and the OTLP
+metrics that `init_tracing` registers, exported every 60s. Request latency is
+an OTel histogram in `logger.rs`. Tests that check counters must assert "at
+least" on deltas, since other tests in the binary share them.
 
 ## Conventions
 

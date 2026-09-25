@@ -52,6 +52,7 @@ use crate::locks::{
     ReleaseLockBatchRequest, ReleaseLockRequest, VerifyLocksRequest,
     VerifyLocksResponse,
 };
+use crate::stats::STATS;
 use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
 use crate::{empty, from_json, full, into_json};
 
@@ -373,6 +374,9 @@ where
             let body_stream = StreamBody::new(
                 object
                     .stream()
+                    // Counted as sent, so an aborted download counts only
+                    // what the client got.
+                    .inspect_ok(|chunk| STATS.downloaded(chunk.len() as u64))
                     .map_ok(Frame::data)
                     .map_err(|e: std::io::Error| e.into()),
             );
@@ -419,6 +423,7 @@ where
         let body = req.into_body();
         let stream = BodyDataStream::new(body)
             .try_filter_map(|chunk| async { Ok(Some(chunk)) })
+            .inspect_ok(|chunk: &Bytes| STATS.uploaded(chunk.len() as u64))
             .map_err(std::io::Error::other);
 
         let object = LFSObject::new(len, Box::pin(stream));
@@ -856,7 +861,10 @@ where
                         )
                         .await
                     {
-                        Some(url) => (url, None),
+                        Some(url) => {
+                            STATS.presigned_upload();
+                            (url, None)
+                        }
                         None => (
                             format!(
                                 "{}api/{}/object/{}",
@@ -896,14 +904,14 @@ where
         lfs::Operation::Download => {
             // If we're returning a pre-signed URL, don't also reflect
             // the auth header back to the client.
-            let (download_url, header) = match storage
+            let (download_url, header, presigned) = match storage
                 .download_url(
                     &StorageKey::new(namespace.clone(), object.oid),
                     PRESIGNED_URL_EXPIRATION,
                 )
                 .await
             {
-                Some(url) => (url, None),
+                Some(url) => (url, None, true),
                 None => (
                     storage
                         .public_url(&StorageKey::new(
@@ -917,8 +925,13 @@ where
                             )
                         }),
                     extract_auth_header(headers),
+                    false,
                 ),
             };
+
+            if presigned && size.is_some() {
+                STATS.presigned_download();
+            }
 
             // If the object does not exist, then we should return a 404 error
             // for this object.
