@@ -24,8 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # The S3 and DynamoDB tests run against rustfs and DynamoDB Local. They skip
-    # when unconfigured, so LFS_TEST_REQUIRED makes a skip fail here instead of
+    # The S3, DynamoDB and Redis tests run against rustfs, DynamoDB Local and
+    # Redis. They skip when unconfigured, so LFS_TEST_REQUIRED makes a skip fail here instead of
     # passing silently. See tests/common.rs for the variables.
     env:
       LFS_TEST_REQUIRED: "1"
@@ -33,6 +33,7 @@ jobs:
       LFS_TEST_S3_BUCKET: lfs-rs-scratch-ci
       LFS_TEST_DYNAMODB_ENDPOINT: http://localhost:8000
       LFS_TEST_DYNAMODB_TABLE: ci
+      LFS_TEST_REDIS_URI: redis://localhost:6379
       LFS_TEST_AWS_ACCESS_KEY_ID: lfstest
       LFS_TEST_AWS_SECRET_ACCESS_KEY: lfstestsecret
 
@@ -45,7 +46,7 @@ jobs:
       # `latest` is a rolling build, hence the digest; the `1.0.0-alpha.N`
       # release images lack the entrypoint that provisions /data, so
       # `server /data` fails on them.
-      - name: Start rustfs and DynamoDB Local
+      - name: Start rustfs, DynamoDB Local and Redis
         run: |
           docker run -d --name rustfs -p 9000:9000 \
             -e RUSTFS_ACCESS_KEY="$LFS_TEST_AWS_ACCESS_KEY_ID" \
@@ -55,6 +56,8 @@ jobs:
           docker run -d --name dynamodb -p 8000:8000 \
             amazon/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab \
             -jar DynamoDBLocal.jar -sharedDb -inMemory
+          docker run -d --name redis -p 6379:6379 \
+            redis@sha256:c6eabf748fc7a61dbb5a705c78bcf3d6377b1127a97d0ce965c11c44ba46896f
 
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -63,17 +66,19 @@ jobs:
 
       # The tests create the bucket and tables themselves. DynamoDB Local
       # answers `GET /` with a 400 once it is listening.
-      - name: Wait for rustfs and DynamoDB Local
+      - name: Wait for the services
         run: |
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/health > /dev/null \
               && curl -s -o /dev/null http://localhost:8000/ \
+              && docker exec redis redis-cli ping > /dev/null \
               && exit 0
             sleep 2
           done
-          echo "::error::rustfs or DynamoDB Local did not become ready"
+          echo "::error::the test services did not become ready"
           docker logs rustfs
           docker logs dynamodb
+          docker logs redis
           exit 1
 
       # Every feature except `faulty`, which injects stream errors that the
@@ -86,6 +91,7 @@ jobs:
         run: |
           docker logs rustfs
           docker logs dynamodb
+          docker logs redis
 
   formatting:
     name: Check format

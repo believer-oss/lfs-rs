@@ -1,4 +1,4 @@
-# Services for the S3 and DynamoDB integration tests. CI runs the same images
+# Services for the S3, DynamoDB and Redis integration tests. CI runs the same images
 # (see .github/workflows/ci.yml); keep the digests in sync when bumping.
 #
 #   docker compose -f tests/docker-compose.yaml up -d   # or podman compose
@@ -6,6 +6,7 @@
 #     LFS_TEST_S3_BUCKET=lfs-rs-scratch-local \
 #     LFS_TEST_DYNAMODB_ENDPOINT=http://localhost:8000 \
 #     LFS_TEST_DYNAMODB_TABLE=local \
+#     LFS_TEST_REDIS_URI=redis://localhost:6379 \
 #     LFS_TEST_AWS_ACCESS_KEY_ID=lfstest \
 #     LFS_TEST_AWS_SECRET_ACCESS_KEY=lfstestsecret
 #   cargo test --features redis   # not --all-features: `faulty` breaks S3 tests
@@ -30,3 +31,8 @@ services:
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     ports:
       - "8000:8000"
+
+  redis:
+    image: docker.io/library/redis@sha256:c6eabf748fc7a61dbb5a705c78bcf3d6377b1127a97d0ce965c11c44ba46896f
+    ports:
+      - "6379:6379"

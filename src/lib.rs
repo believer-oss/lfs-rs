@@ -51,8 +51,9 @@ use crate::app::App;
 use crate::error::Error;
 pub use crate::lfs::Oid;
 pub use crate::locks::{
-    CreateLockBatchRequest, LocalLs, LockBatch, LockBatchOuter, LockFailure,
-    LockStorage, NoneLs, ReleaseLockBatchRequest,
+    CreateLockBatchRequest, ListLocksResponse, LocalLs, LockBatch,
+    LockBatchOuter, LockFailure, LockStorage, LockStoreError, NoneLs,
+    ReleaseLockBatchRequest,
 };
 use crate::logger::Logger;
 use crate::storage::{Cached, Disk, Encrypted, S3, Storage, Verify};

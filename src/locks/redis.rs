@@ -1,55 +1,210 @@
-use futures::StreamExt;
+use futures::TryStreamExt;
+use hex::FromHex;
+use redis::aio::MultiplexedConnection;
+use redis::{AsyncCommands, FromRedisValue, ParsingError, from_redis_value};
+use std::sync::LazyLock;
 
 use crate::lfs::Oid;
 
 use anyhow::{Result, anyhow, bail};
-use hex::FromHex;
-pub use redis::{
-    AsyncCommands, AsyncIter, FromRedisValue, RedisError, from_redis_value,
-};
 
 use super::{
-    ListLocksResponse, Lock, LockBatch, LockStorage, LockStoreError as Error,
-    VerifyLocksResponse,
+    ListLocksResponse, Lock, LockBatch, LockFailure, LockStorage,
+    LockStoreError as Error, VerifyLocksResponse,
 };
 use async_trait::async_trait;
 use sha2::Digest;
 
+/// Stores locks in Redis as two keys, like `LocalLs`'s index:
+///
+/// - `{repo}:{path}` holds the lock's id, the hex SHA256 of `{repo}:{path}`.
+/// - `{id}` holds the lock, as JSON.
+///
+/// Both are written with one MSETNX, so a lock is created whole or not at all,
+/// and deleted with one DEL.
 pub struct RedisLockStore {
     client: redis::Client,
+    // FIXME: --lock-redis-ttl is accepted but not applied. Expiring both keys
+    // while keeping MSETNX's all-or-nothing creation needs a Lua script.
     // ttl: usize,
+}
+
+/// The id of the lock on `path` in `repo`. Ids must be the same for the same
+/// lock across backends, since clients hold on to them.
+fn lock_id(repo: &str, path: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(format!("{repo}:{path}"));
+    Oid::from(hasher.finalize()).to_string()
+}
+
+/// Deletes a path's index key (`KEYS[1]`) if it points to the lock id
+/// (`ARGV[1]`, whose key is `KEYS[2]`) and that lock doesn't exist.
+///
+/// Atomically: checking and deleting in separate commands let two clients
+/// repairing the same index at once delete the one a third had just created
+/// along with its lock, hiding that lock from listings.
+static REPAIR_DANGLING_INDEX: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r"
+        if redis.call('EXISTS', KEYS[2]) == 0
+            and redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        ",
+    )
+});
+
+fn path_key(repo: &str, path: &str) -> String {
+    format!("{repo}:{path}")
+}
+
+/// Escapes `s` for use in a SCAN MATCH pattern.
+fn escape_glob(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 impl RedisLockStore {
     pub async fn new(uri: &str, _lock_ttl: usize) -> Result<Self, Error> {
         let client = redis::Client::open(uri)?;
-        Ok(RedisLockStore {
-            client,
-            // ttl: lock_ttl,
-        })
+        Ok(RedisLockStore { client })
     }
 
-    async fn get_lock_from_oid(&self, oid: &Oid) -> Result<Vec<Lock>, Error> {
-        let mut con = self.client.get_multiplexed_async_connection().await?;
-        match con.get::<String, Lock>(oid.to_string()).await {
-            Ok(v) => Ok(vec![v]),
-            Err(_) => Err(super::LockStoreError::LockNotFound(oid.to_string())),
+    async fn connection(&self) -> Result<MultiplexedConnection, Error> {
+        Ok(self.client.get_multiplexed_async_connection().await?)
+    }
+
+    async fn get_lock(
+        con: &mut MultiplexedConnection,
+        id: &str,
+    ) -> Result<Option<Lock>> {
+        Ok(con.get::<_, Option<Lock>>(id).await?)
+    }
+
+    /// The lock with `id`, if it is one of `repo`'s. Ids are hashes of repo and
+    /// path, and predictable, so a lock found under another repo's request is
+    /// treated as not found.
+    async fn get_repo_lock(
+        con: &mut MultiplexedConnection,
+        repo: &str,
+        id: &str,
+    ) -> Result<Option<Lock>> {
+        Ok(Self::get_lock(con, id)
+            .await?
+            .filter(|lock| lock_id(repo, &lock.path) == id))
+    }
+
+    /// All the locks in `repo`.
+    async fn repo_locks(
+        con: &mut MultiplexedConnection,
+        repo: &str,
+    ) -> Result<Vec<Lock>> {
+        let pattern = format!("{}:*", escape_glob(repo));
+        let keys: Vec<String> = {
+            let iter = con.scan_match::<_, String>(pattern).await?;
+            iter.try_collect().await?
+        };
+        if keys.is_empty() {
+            return Ok(vec![]);
         }
+
+        // Locks released since the scan come back as nil and are skipped.
+        let ids: Vec<Option<String>> = con.mget(keys).await?;
+        let ids: Vec<String> = ids.into_iter().flatten().collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let locks: Vec<Option<Lock>> = con.mget(ids).await?;
+        Ok(locks.into_iter().flatten().collect())
+    }
+
+    /// Creates the lock, or returns the lock that already exists on `path`.
+    async fn try_create(
+        con: &mut MultiplexedConnection,
+        repo: &str,
+        path: &str,
+        owner: &str,
+    ) -> Result<Result<Lock, Lock>> {
+        let id = lock_id(repo, path);
+        let lock = Lock::new(id.clone(), path.to_string(), owner.to_string());
+        let json = serde_json::to_string(&lock)?;
+
+        let index = path_key(repo, path);
+
+        // At most twice: the second time after removing a dangling index key.
+        for _ in 0..2 {
+            let created: bool = con
+                .mset_nx(&[
+                    (index.clone(), id.clone()),
+                    (id.clone(), json.clone()),
+                ])
+                .await?;
+            if created {
+                return Ok(Ok(lock));
+            }
+
+            if let Some(existing) = Self::get_lock(con, &id).await? {
+                return Ok(Err(existing));
+            }
+
+            // The path's index key exists but its lock doesn't, e.g. because
+            // the lock was deleted without its index. It would block the path
+            // for good, so remove it, and then try again.
+            let _: u64 = REPAIR_DANGLING_INDEX
+                .key(&index)
+                .key(&id)
+                .arg(&id)
+                .invoke_async(con)
+                .await?;
+        }
+
+        Err(anyhow!(Error::InternalServerError(format!(
+            "could not create lock on '{path}'"
+        ))))
+    }
+
+    async fn release(
+        con: &mut MultiplexedConnection,
+        repo: &str,
+        owner: &str,
+        id: &str,
+        force: bool,
+    ) -> Result<Lock> {
+        let Some(lock) = Self::get_repo_lock(con, repo, id).await? else {
+            bail!(Error::DeleteNotFound(id.to_string()));
+        };
+
+        match &lock.owner {
+            Some(o) if o.name == owner || force => {}
+            Some(o) => {
+                bail!("lock held by {}, not {owner}, and not forced", o.name)
+            }
+            None => bail!("lock with no owner!"),
+        }
+
+        // Another client could release and retake the lock between the read
+        // above and this delete. Locks are advisory and git-lfs checks them
+        // again before pushing, so this is not guarded with WATCH.
+        let _: u64 = con
+            .del(&[id.to_string(), path_key(repo, &lock.path)])
+            .await?;
+        Ok(lock)
     }
 }
 
 impl FromRedisValue for Lock {
-    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
+    fn from_redis_value(v: redis::Value) -> Result<Self, ParsingError> {
         let v: String = from_redis_value(v)?;
-        match serde_json::from_slice::<Lock>(v.as_bytes()) {
-            Ok(l) => Ok(l),
-            Err(e) => Err((
-                redis::ErrorKind::TypeError,
-                "couldn't deserialize json from redis",
-                e.to_string(),
-            )
-                .into()),
-        }
+        serde_json::from_str::<Lock>(&v).map_err(|e| {
+            format!("couldn't deserialize json from redis: {e}").into()
+        })
     }
 }
 
@@ -61,47 +216,44 @@ impl LockStorage for RedisLockStore {
         path: String,
         owner: String,
     ) -> Result<Lock> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(format!("{}:{}", repo, path));
-        let path_oid = Oid::from(hasher.finalize()).to_string();
-
-        let key = format!("{}:{}", repo, path);
-        // We could store this as an HSET of the elements, or as a string JSON
-        // of the lock and a separate lookup from repo/path to the
-        // hashed key. This implements the latter.
-        let lock = Lock::new(key.to_string(), path, owner);
-        let mut con = self.client.get_multiplexed_async_connection().await?;
-
-        let json_lock = serde_json::to_string(&lock)?;
-
-        // Try to set the value, if it errors try to get the existing lock
-        if con
-            .mset_nx::<String, String, bool>(&[
-                (key, path_oid.clone()),
-                (path_oid.clone(), json_lock),
-            ])
-            .await?
-        {
-            Ok(lock)
-        } else if let Ok(v) = con.get::<String, String>(path_oid).await {
-            Err(anyhow!(super::LockStoreError::CreateConflict(
-                serde_json::from_str(v.as_str())?
-            )))
-        } else {
-            Err(anyhow!(super::LockStoreError::InternalServerError(
-                "could not create lock".to_string()
-            )))
+        let mut con = self.connection().await?;
+        match Self::try_create(&mut con, &repo, &path, &owner).await? {
+            Ok(lock) => Ok(lock),
+            Err(existing) => Err(anyhow!(Error::CreateConflict(existing))),
         }
     }
 
-    #[inline]
     async fn create_locks(
         &self,
-        _repo: String,
-        _path: Vec<String>,
-        _owner: String,
+        repo: String,
+        paths: Vec<String>,
+        owner: String,
     ) -> Result<LockBatch> {
-        Err(anyhow!(super::LockStoreError::NotImplemented))
+        let mut con = self.connection().await?;
+        let mut paths_ok = Vec::with_capacity(paths.len());
+        let mut failures = Vec::new();
+
+        for path in paths {
+            let reason =
+                match Self::try_create(&mut con, &repo, &path, &owner).await {
+                    Ok(Ok(_)) => {
+                        paths_ok.push(path);
+                        continue;
+                    }
+                    // The same reasons as `LocalLs` gives.
+                    Ok(Err(existing)) => match existing.owner {
+                        Some(o) if o.name == owner => {
+                            "lock already held".to_string()
+                        }
+                        Some(o) => format!("lock held by user {}", o.name),
+                        None => "lock held".to_string(),
+                    },
+                    Err(err) => err.to_string(),
+                };
+            failures.push(LockFailure { path, reason });
+        }
+
+        Ok(LockBatch::new(paths_ok, failures, owner))
     }
 
     async fn list_locks(
@@ -112,40 +264,29 @@ impl LockStorage for RedisLockStore {
         _cursor: Option<String>,
         _limit: Option<u64>,
     ) -> Result<ListLocksResponse> {
-        let locks: Vec<Lock>;
-        if let Some(id) = id {
-            // if we're passed an id, look it up and return the single lock.
-            // Path shouldn't matter?
-            let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
-            locks = self.get_lock_from_oid(&oid).await?;
+        let mut con = self.connection().await?;
+
+        let locks = if let Some(id) = id {
+            // Reject anything that isn't an id before using it as a key.
+            let id = Oid::from(<[u8; 32]>::from_hex(id)?).to_string();
+            match Self::get_repo_lock(&mut con, &repo, &id).await? {
+                Some(lock) => vec![lock],
+                None => bail!(Error::LockNotFound(id)),
+            }
         } else if let Some(path) = path {
-            // If we have a path, we need to find it and return the matching
-            // lock
-            let mut con =
-                self.client.get_multiplexed_async_connection().await?;
-            let key = format!("{}:{}", repo, path);
-            match con.get::<String, String>(key).await {
-                Ok(id) => {
-                    let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
-                    locks = self.get_lock_from_oid(&oid).await?;
-                }
-                Err(_) => {
-                    return Err(anyhow!(
-                        super::LockStoreError::InternalServerError(
-                            "path not found".to_string()
-                        )
-                    ));
-                }
+            let id: Option<String> = con.get(path_key(&repo, &path)).await?;
+            let lock = match id {
+                Some(id) => Self::get_lock(&mut con, &id).await?,
+                None => None,
+            };
+            match lock {
+                Some(lock) => vec![lock],
+                None => bail!(Error::LockNotFound(path)),
             }
         } else {
-            // If we don't get an id or path, we return them all...
-            let mut con =
-                self.client.get_multiplexed_async_connection().await?;
-            let iter: AsyncIter<String> =
-                con.scan_match(format!("{}:*", repo)).await?;
-            let keys: Vec<String> = iter.collect().await;
-            locks = con.mget::<Vec<String>, Vec<Lock>>(keys).await?;
-        }
+            Self::repo_locks(&mut con, &repo).await?
+        };
+
         Ok(ListLocksResponse {
             locks,
             next_cursor: None,
@@ -159,23 +300,13 @@ impl LockStorage for RedisLockStore {
         _cursor: Option<String>,
         _limit: Option<u64>,
     ) -> Result<VerifyLocksResponse> {
-        // let lockfile = self
-        //     .lockfile
-        //     .lock()
-        //     .expect("couldnt acquire lock, poisoned");
-        //
-        let mut con = self.client.get_multiplexed_async_connection().await?;
-        let iter: AsyncIter<String> =
-            con.scan_match(format!("{}:*", repo)).await?;
-        let keys: Vec<String> = iter.collect().await;
-        let locks = con.mget::<Vec<String>, Vec<Lock>>(keys).await?;
-        let (ours, theirs) = locks.iter().cloned().partition(|v| {
-            if let Some(o) = v.owner.clone() {
-                o.name == owner
-            } else {
-                false
-            }
-        });
+        let mut con = self.connection().await?;
+        let (ours, theirs) = Self::repo_locks(&mut con, &repo)
+            .await?
+            .into_iter()
+            .partition(|lock| {
+                lock.owner.as_ref().is_some_and(|o| o.name == owner)
+            });
 
         Ok(VerifyLocksResponse {
             ours,
@@ -191,46 +322,56 @@ impl LockStorage for RedisLockStore {
         id: String,
         force: Option<bool>,
     ) -> Result<Lock> {
-        // let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
-        // let key = LocalFsKey::new_from_oid(&repo, &oid);
-        //
-        // let mut lockfile = self
-        //     .lockfile
-        //     .lock()
-        //     .expect("couldnt acquire lock, poisoned");
-        // lockfile.del_entry(&key, owner, force)
-        let force = force.unwrap_or(false);
-        let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
-        let mut con = self.client.get_multiplexed_async_connection().await?;
-        let lock = con.get::<String, Lock>(oid.to_string()).await?;
-        if let Some(o) = lock.owner.clone() {
-            if owner == o.name || force {
-                let key = format!("{}:{}", repo, lock.path.clone());
-                let keys = vec![oid.to_string(), key];
-                // FIXME This should be handling the case where one key deletes
-                // but the other does not...
-                match con.del::<Vec<String>, u8>(keys).await? {
-                    2 => Ok(lock),
-                    _ => {
-                        bail!("failed to release lock")
-                    }
-                }
-            } else {
-                bail!("lock owner incorrect and not forced")
-            }
-        } else {
-            bail!("lock with no owner!")
-        }
+        let id = Oid::from(<[u8; 32]>::from_hex(id)?).to_string();
+        let mut con = self.connection().await?;
+        Self::release(&mut con, &repo, &owner, &id, force.unwrap_or(false))
+            .await
     }
 
-    #[inline]
     async fn release_locks(
         &self,
-        _repo: String,
-        _owner: String,
-        _paths: Vec<String>,
-        _force: Option<bool>,
+        repo: String,
+        owner: String,
+        paths: Vec<String>,
+        force: Option<bool>,
     ) -> Result<LockBatch> {
-        Err(anyhow!(super::LockStoreError::NotImplemented))
+        let mut con = self.connection().await?;
+        let force = force.unwrap_or(false);
+        let mut paths_ok = Vec::with_capacity(paths.len());
+        let mut failures = Vec::new();
+
+        for path in paths {
+            let id = lock_id(&repo, &path);
+            match Self::release(&mut con, &repo, &owner, &id, force).await {
+                Ok(_) => paths_ok.push(path),
+                Err(err) => failures.push(LockFailure {
+                    path,
+                    reason: err.to_string(),
+                }),
+            }
+        }
+
+        Ok(LockBatch::new(paths_ok, failures, owner))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_match_local_ls() {
+        // The hex SHA256 of "org/repo:a.bin", as LocalLs computes it.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update("org/repo:a.bin");
+        let expected = hex::encode(hasher.finalize());
+
+        assert_eq!(lock_id("org/repo", "a.bin"), expected);
+    }
+
+    #[test]
+    fn escapes_scan_patterns() {
+        assert_eq!(escape_glob("org/repo"), "org/repo");
+        assert_eq!(escape_glob(r"a*b?c[d]e\f"), r"a\*b\?c\[d\]e\\f");
     }
 }

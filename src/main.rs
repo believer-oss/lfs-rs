@@ -190,7 +190,7 @@ pub struct LockArgs {
     redis_uri: Option<String>,
 
     /// If the --lock-backend is set to redis, the default ttl to use for
-    /// locks. FIXME: Not implemented
+    /// locks. Not implemented yet: locks never expire.
     #[cfg(feature = "redis")]
     #[clap(long = "lock-redis-ttl", env = "RUDOLFS_LOCK_REDIS_TTL")]
     redis_ttl: Option<usize>,

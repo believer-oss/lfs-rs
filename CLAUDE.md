@@ -46,7 +46,8 @@ uses `--all-features` so that `faulty` gets compiled.
   be installed. Every git call goes through the `git!` macro, which points
   `GIT_CONFIG_GLOBAL` at a generated config, so your own `~/.gitconfig`
   (e.g. `lfs.storage`) can't affect the tests.
-- The S3 and DynamoDB tests read their targets from `LFS_TEST_*` env vars
+- The S3, DynamoDB and Redis tests read their targets from `LFS_TEST_*` env
+  vars
   (documented in `tests/common.rs`) and skip when those are unset.
   `LFS_TEST_REQUIRED=1` turns a skip into a failure, and CI sets it.
   Credentials go into an explicit `SdkConfig` (`S3ServerBuilder::sdk_config`,
@@ -56,7 +57,7 @@ uses `--all-features` so that `faulty` gets compiled.
   prefix in IAM. The harness rejects buckets without the prefix. It adds the
   prefix to table names itself, because the tests delete and recreate those
   tables.
-- CI runs them against rustfs and DynamoDB Local. To do the same locally,
+- CI runs them against rustfs, DynamoDB Local and Redis. To do the same locally,
   start `tests/docker-compose.yaml` and export the variables listed at the
   top of that file. The tests create the bucket and tables themselves. The
   image digests are pinned in both that file and `.github/workflows/ci.yml`,

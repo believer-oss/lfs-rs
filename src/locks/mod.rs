@@ -33,7 +33,7 @@ pub enum LockStoreError {
     LockNotFound(String),
     #[cfg(feature = "redis")]
     #[error("redis error: {0}")]
-    RedisError(#[from] redis::RedisError),
+    RedisError(#[from] ::redis::RedisError),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

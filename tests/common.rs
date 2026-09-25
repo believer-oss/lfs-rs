@@ -113,6 +113,8 @@ fn git_config_global() -> &'static Path {
 /// - `LFS_TEST_DYNAMODB_TABLE`, and `LFS_TEST_DYNAMODB_ENDPOINT` for DynamoDB
 ///   Local. This is the base of the table names; see [`dynamodb_target`].
 ///   Tables are deleted and recreated by the tests.
+/// - `LFS_TEST_REDIS_URI` for the Redis lock backend, e.g.
+///   `redis://localhost:6379`.
 /// - `LFS_TEST_AWS_ACCESS_KEY_ID`, `LFS_TEST_AWS_SECRET_ACCESS_KEY`, and
 ///   optionally `LFS_TEST_AWS_SESSION_TOKEN` and `LFS_TEST_AWS_REGION` (default
 ///   `us-east-1`), used for both.
@@ -213,6 +215,43 @@ pub async fn s3_target(test: &str) -> Option<S3Target> {
     }
 
     Some(S3Target { bucket, config })
+}
+
+/// Returns the Redis URI to test against (`LFS_TEST_REDIS_URI`), or `None` if
+/// the test should skip. Lock keys an earlier run left in `repo` are deleted
+/// first, so tests running at once must use different repos. Nothing else in
+/// the database is touched.
+#[cfg(feature = "redis")]
+pub async fn redis_target(test: &str, repo: &str) -> Option<String> {
+    use futures::TryStreamExt;
+    use redis::AsyncCommands;
+
+    let Some(uri) = test_var("LFS_TEST_REDIS_URI") else {
+        return skip(test, "LFS_TEST_REDIS_URI");
+    };
+
+    let client = redis::Client::open(uri.as_str()).expect("invalid Redis URI");
+    let mut con = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("failed to connect to Redis");
+
+    // Each lock is `{repo}:{path}` -> `{id}` and `{id}` -> the lock.
+    let keys: Vec<String> = {
+        let iter = con
+            .scan_match::<_, String>(format!("{repo}:*"))
+            .await
+            .unwrap();
+        iter.try_collect().await.unwrap()
+    };
+    if !keys.is_empty() {
+        let ids: Vec<Option<String>> = con.mget(&keys).await.unwrap();
+        let stale: Vec<String> =
+            keys.into_iter().chain(ids.into_iter().flatten()).collect();
+        let _: u64 = con.del(stale).await.unwrap();
+    }
+
+    Some(uri)
 }
 
 pub struct DynamoTarget {
