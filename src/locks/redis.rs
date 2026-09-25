@@ -2,10 +2,10 @@ use futures::StreamExt;
 
 use crate::lfs::Oid;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use hex::FromHex;
 pub use redis::{
-    from_redis_value, AsyncCommands, AsyncIter, FromRedisValue, RedisError,
+    AsyncCommands, AsyncIter, FromRedisValue, RedisError, from_redis_value,
 };
 
 use super::{
@@ -134,7 +134,7 @@ impl LockStorage for RedisLockStore {
                         super::LockStoreError::InternalServerError(
                             "path not found".to_string()
                         )
-                    ))
+                    ));
                 }
             }
         } else {

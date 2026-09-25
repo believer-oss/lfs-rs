@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use futures::future::{BoxFuture, FutureExt};
 use humantime::format_duration;
-use hyper::{body::Incoming, Request, Response};
+use hyper::{Request, Response, body::Incoming};
 use tower::Service;
 
 use crate::app::BoxBody;

@@ -30,12 +30,12 @@ use std::path::Path;
 
 use futures::future::Either;
 use lfs_rs::S3ServerBuilder;
-use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo, SERVER_ADDR};
+use common::{GitRepo, SERVER_ADDR, init_logger};
 
 /// Pushes and pulls LFS objects through S3 without a local cache. Each caller
 /// needs its own prefix: the objects are deterministic, so encrypted and
@@ -101,7 +101,7 @@ async fn s3_smoke_test_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_smoke_test_encrypted() -> Result<(), Box<dyn std::error::Error>> {
-    let key = StdRng::seed_from_u64(42).gen();
+    let key = StdRng::seed_from_u64(42).random();
     s3_smoke_test("S3 encrypted", "test_lfs_encrypted", Some(key)).await
 }
 
@@ -141,8 +141,8 @@ async fn s3_production_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
-    use lfs_rs::storage::{Storage, StorageKey};
     use lfs_rs::Oid;
+    use lfs_rs::storage::{Storage, StorageKey};
 
     let _guard = init_logger();
 

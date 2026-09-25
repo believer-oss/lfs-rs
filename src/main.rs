@@ -399,7 +399,15 @@ impl LocalArgs {
 #[tokio::main]
 async fn main() {
     let exit_code = if let Err(err) = Args::parse().main().await {
-        tracing::error!("{err}");
+        // Include the causes: the outermost error is usually just context,
+        // such as which bucket we failed to reach, and not why.
+        let mut message = err.to_string();
+        let mut source = err.source();
+        while let Some(cause) = source {
+            message.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        tracing::error!("{message}");
         1
     } else {
         0

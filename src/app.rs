@@ -26,16 +26,15 @@ use std::{
 };
 
 use futures::{
-    future::{self, BoxFuture},
     TryStreamExt,
+    future::{self, BoxFuture},
 };
 
-use http::{self, header, HeaderMap, StatusCode, Uri};
+use http::{self, HeaderMap, StatusCode, Uri, header};
 use http_body_util::{BodyDataStream, BodyExt, StreamBody};
 use hyper::{
-    self,
+    self, Method, Request, Response,
     body::{Frame, Incoming},
-    Method, Request, Response,
 };
 use tower::Service;
 use url::form_urlencoded;
@@ -230,7 +229,7 @@ where
             _ => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(full("Missing org/project in URL"))?)
+                    .body(full("Missing org/project in URL"))?);
             }
         };
 
@@ -243,7 +242,7 @@ where
                     None => {
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(full("Missing OID parameter."))?)
+                            .body(full("Missing OID parameter."))?);
                     }
                 };
 
@@ -442,12 +441,12 @@ where
         let val: lfs::VerifyRequest = from_json(req.into_body()).await?;
         let key = StorageKey::new(namespace, val.oid);
 
-        if let Some(size) = storage.size(&key).await? {
-            if size == val.size {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(empty())?);
-            }
+        if let Some(size) = storage.size(&key).await?
+            && size == val.size
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(empty())?);
         }
 
         // Object doesn't exist or the size is incorrect.
@@ -497,10 +496,10 @@ where
 
                 let objects = future::try_join_all(objects).await?;
                 let mut transfer = Some(lfs::Transfer::Basic);
-                if let Some(transfers) = val.transfers {
-                    if transfers.contains(&lfs::Transfer::LfsRs) {
-                        transfer = Some(lfs::Transfer::LfsRs)
-                    }
+                if let Some(transfers) = val.transfers
+                    && transfers.contains(&lfs::Transfer::LfsRs)
+                {
+                    transfer = Some(lfs::Transfer::LfsRs)
                 }
                 let response = lfs::BatchResponse { transfer, objects };
 
@@ -973,11 +972,7 @@ fn extract_auth_header(
         }
     });
     let map = BTreeMap::from_iter(headers);
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
+    if map.is_empty() { None } else { Some(map) }
 }
 
 impl<S, L> Service<Req> for App<S, L>

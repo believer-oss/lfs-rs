@@ -11,12 +11,12 @@ use http_body_util::Full;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use lfs_rs::{
-    into_json, CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter,
-    LockStorage, ReleaseLockBatchRequest,
+    CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter, LockStorage,
+    ReleaseLockBatchRequest, into_json,
 };
-use rand::rngs::StdRng;
-use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::{Rng, RngExt};
 use std::fs::{self, File};
 use std::io;
 use std::io::ErrorKind;
@@ -41,7 +41,7 @@ use aws_sdk_dynamodb::types::{
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::runtime;
 #[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
+use tracing_subscriber::{Registry, prelude::*};
 
 /// Bind test server to localhost port 0. We don't want this server to be
 /// externally visible.
@@ -163,7 +163,7 @@ fn aws_config(endpoint: Option<String>) -> SdkConfig {
         test_var("LFS_TEST_AWS_REGION").unwrap_or_else(|| "us-east-1".into());
 
     let mut config = SdkConfig::builder()
-        .behavior_version(BehaviorVersion::v2024_03_28())
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .region(Region::new(region))
         .credentials_provider(SharedCredentialsProvider::new(credentials));
     if let Some(endpoint) = endpoint {
@@ -751,7 +751,7 @@ pub async fn smoke_test(
     startup_span: Option<EnteredSpan>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data = tempfile::TempDir::new()?;
-    let key = Some(StdRng::seed_from_u64(42).gen());
+    let key = Some(StdRng::seed_from_u64(42).random());
 
     let mock = GitRepo::setup_mock_gh_auth().await;
 

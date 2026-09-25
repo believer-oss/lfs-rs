@@ -69,12 +69,14 @@ uses `--all-features` so that `faulty` gets compiled.
 `storage::Storage` (`src/storage/mod.rs`) is an async trait with methods
 `get`/`put`/`size`/`delete`/`list` plus optional signed/public URL methods.
 Each backend in `src/storage/` either implements it directly (`Disk`, `S3`)
-or wraps another `Storage` (`Cached`, `Encrypted`, `Verify`, `Retrying`,
-`Faulty`). The builders in `src/lib.rs` (`S3ServerBuilder`,
-`LocalServerBuilder`) put the stack together. For S3 the order is:
+or wraps another `Storage` (`Cached`, `Encrypted`, `Verify`, `Faulty`). The
+builders in `src/lib.rs` (`S3ServerBuilder`, `LocalServerBuilder`) put the stack
+together. There is no retry layer: S3 retries are the AWS SDK's (3 attempts for
+transient errors), checked by the `retries` tests in `s3.rs`. For S3 the order
+is:
 
 ```
-Verify( Verify(Encrypted(Cached(Disk, Retrying(S3)))) | Verify(Cached(...)) )
+Verify( Verify(Encrypted(Cached(Disk, S3))) | Verify(Cached(Disk, S3)) )
 ```
 
 Rules about the order:

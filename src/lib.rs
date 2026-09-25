@@ -32,6 +32,7 @@ mod sha256;
 pub mod storage;
 mod util;
 
+use anyhow::Context as _;
 use futures::future::{BoxFuture, Either, Future, TryFutureExt};
 use parking_lot::RwLock;
 use std::{
@@ -53,7 +54,7 @@ pub use crate::locks::{
     LockStorage, NoneLs, ReleaseLockBatchRequest,
 };
 use crate::logger::Logger;
-use crate::storage::{Cached, Disk, Encrypted, Retrying, Storage, Verify, S3};
+use crate::storage::{Cached, Disk, Encrypted, S3, Storage, Verify};
 pub use crate::util::{empty, from_json, full, into_json};
 
 #[cfg(feature = "dynamodb")]
@@ -217,8 +218,8 @@ impl S3ServerBuilder {
         );
         s3.check().await?;
 
-        // Retry certain operations to S3 to make it more reliable.
-        let s3 = Retrying::new(s3);
+        // Retries are left to the AWS SDK, which retries transient failures
+        // (5xx, throttling, timeouts, connection errors) up to 3 times.
 
         // Add a little instability for testing purposes.
         #[cfg(feature = "faulty")]
@@ -411,6 +412,18 @@ where
     let locks = Arc::new(locks);
     let cache = Arc::new(RwLock::new(LinkedHashMap::new()));
 
+    // One client for every connection, so they share its connection pool.
+    // Created only when needed, so that without GitHub auth the system root
+    // certificates aren't required.
+    let github = if authenticated {
+        Some(auth::github_client().context(
+            "failed to create the GitHub API client (loading root \
+             certificates)",
+        )?)
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     let server = hyper_util::server::conn::auto::Builder::new(
@@ -443,7 +456,7 @@ where
                         let auth = Auth::new(
                             app,
                             cache,
-                            authenticated,
+                            github.clone(),
                             authentication_server.clone(),
                         );
 

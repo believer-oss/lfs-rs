@@ -1,24 +1,24 @@
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
 
 use tracing_log::LogTracer;
 
 use opentelemetry_sdk::{
+    Resource,
     metrics::{MeterProviderBuilder, PeriodicReader, SdkMeterProvider},
     runtime,
     trace::{RandomIdGenerator, Sampler, TracerProvider},
-    Resource,
 };
 
 use opentelemetry_semantic_conventions::{
-    attribute::{SERVICE_NAME, SERVICE_VERSION},
     SCHEMA_URL,
+    attribute::{SERVICE_NAME, SERVICE_VERSION},
 };
 
 pub struct OtelGuard {

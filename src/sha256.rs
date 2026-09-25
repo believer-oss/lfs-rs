@@ -24,15 +24,14 @@ use std::fmt;
 use std::ops;
 use std::str::FromStr;
 
-use futures::{ready, Stream};
+use futures::{Stream, ready};
 use hex::{FromHex, FromHexError, ToHex};
 use serde::{
+    Deserialize, Serialize,
     de::{self, Deserializer, Visitor},
     ser::Serializer,
-    Deserialize, Serialize,
 };
 
-use sha2::digest::generic_array::{typenum, GenericArray};
 use sha2::{self, Digest};
 
 /// An error associated with parsing a SHA256.
@@ -55,7 +54,7 @@ impl std::error::Error for Sha256Error {}
 
 /// A Git LFS object ID (i.e., a SHA256).
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Default)]
-pub struct Sha256(GenericArray<u8, typenum::U32>);
+pub struct Sha256([u8; 32]);
 
 impl Sha256 {
     pub fn bytes(&self) -> &[u8] {
@@ -90,13 +89,15 @@ impl AsRef<[u8]> for Sha256 {
 
 impl From<[u8; 32]> for Sha256 {
     fn from(arr: [u8; 32]) -> Self {
-        Sha256(arr.into())
+        Sha256(arr)
     }
 }
 
-impl From<GenericArray<u8, typenum::U32>> for Sha256 {
-    fn from(arr: GenericArray<u8, typenum::U32>) -> Self {
-        Sha256(arr)
+/// Converts the output of a SHA256 hasher, without naming the array type the
+/// `digest` crate happens to use.
+impl From<sha2::digest::Output<sha2::Sha256>> for Sha256 {
+    fn from(arr: sha2::digest::Output<sha2::Sha256>) -> Self {
+        Sha256(arr.into())
     }
 }
 

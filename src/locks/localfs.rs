@@ -17,7 +17,7 @@ use super::{
     ListLocksResponse, Lock, LockBatch, LockFailure, LockStorage,
     VerifyLocksResponse,
 };
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use async_trait::async_trait;
 use sha2::Digest;
 
@@ -374,13 +374,16 @@ impl LockStorage for LocalFsLockStore {
             let key = lockfile.oid_lookup.get(&path_key);
             match key {
                 Some(k) => {
-                    locks = vec![lockfile
-                        .locks
-                        .get(k)
-                        .expect(
-                            "could not find lock for path, invalid oid_lookup!",
-                        )
-                        .clone()]
+                    locks = vec![
+                        lockfile
+                            .locks
+                            .get(k)
+                            .expect(
+                                "could not find lock for path, invalid \
+                                 oid_lookup!",
+                            )
+                            .clone(),
+                    ]
                 }
                 None => bail!("could not find lock for path"),
             }

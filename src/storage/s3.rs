@@ -20,6 +20,7 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use aws_config::{Region, SdkConfig};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{
@@ -32,11 +33,10 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
     BucketAccelerateStatus, CompletedMultipartUpload, CompletedPart,
 };
-use aws_sdk_s3::Client;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::BytesMut;
-use futures::{stream, TryStreamExt};
+use futures::{TryStreamExt, stream};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
@@ -48,8 +48,8 @@ use super::{LFSObject, Storage, StorageKey, StorageStream};
 use crate::lru;
 use derive_more::{Display, From};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, From, Display)]
@@ -164,7 +164,7 @@ impl Backend {
     /// (e.g. an S3-compatible server) and a region must also be set.
     pub async fn load_config() -> Result<SdkConfig, anyhow::Error> {
         let mut shared_config =
-            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+            aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12());
 
         if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
             // If a custom endpoint is set, do not use the AWS default
@@ -613,7 +613,7 @@ mod tests {
     /// environment so the test can't pick up a developer's real credentials.
     fn config() -> SdkConfig {
         SdkConfig::builder()
-            .behavior_version(aws_config::BehaviorVersion::v2024_03_28())
+            .behavior_version(aws_config::BehaviorVersion::v2026_01_12())
             .region(Region::new("us-west-2"))
             .credentials_provider(SharedCredentialsProvider::new(
                 Credentials::new(ACCESS_KEY_ID, "secret", None, None, "test"),
@@ -741,5 +741,95 @@ mod tests {
         let url = presigned_get(&config()).await;
         assert_eq!(url.host_str(), Some("bucket.s3.us-west-2.amazonaws.com"));
         assert!(url.path().starts_with("/lfs/"), "{url}");
+    }
+
+    /// Retries are left to the SDK. These check what it retries, against a fake
+    /// S3, with the configuration `load_config` builds.
+    mod retries {
+        use super::*;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn backend(server: &MockServer) -> Backend {
+            // As `Backend::load_config` does, but with fixed credentials.
+            let config = aws_config::defaults(
+                aws_config::BehaviorVersion::v2026_01_12(),
+            )
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                ACCESS_KEY_ID,
+                "secret",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(server.uri())
+            .load()
+            .await;
+            Backend::from_config(
+                &config,
+                "bucket".into(),
+                "lfs".into(),
+                None,
+                false,
+                0,
+            )
+        }
+
+        fn head(status: u16) -> Mock {
+            Mock::given(method("HEAD")).respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("content-length", "3"),
+            )
+        }
+
+        async fn requests(server: &MockServer) -> usize {
+            server.received_requests().await.unwrap().len()
+        }
+
+        #[tokio::test]
+        async fn transient_errors_are_retried() {
+            let server = MockServer::start().await;
+            head(503)
+                .up_to_n_times(2)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            head(200).mount(&server).await;
+
+            let size = backend(&server).await.size(&key()).await.unwrap();
+
+            assert_eq!(size, Some(3));
+            assert_eq!(requests(&server).await, 3);
+        }
+
+        #[tokio::test]
+        async fn retries_stop_after_three_attempts() {
+            let server = MockServer::start().await;
+            head(500).mount(&server).await;
+
+            assert!(backend(&server).await.size(&key()).await.is_err());
+            assert_eq!(requests(&server).await, 3);
+        }
+
+        #[tokio::test]
+        async fn permanent_errors_are_not_retried() {
+            let server = MockServer::start().await;
+            head(403).mount(&server).await;
+
+            assert!(backend(&server).await.size(&key()).await.is_err());
+            assert_eq!(requests(&server).await, 1);
+        }
+
+        #[tokio::test]
+        async fn missing_objects_are_not_errors() {
+            let server = MockServer::start().await;
+            head(404).mount(&server).await;
+
+            let size = backend(&server).await.size(&key()).await.unwrap();
+
+            assert_eq!(size, None);
+            assert_eq!(requests(&server).await, 1);
+        }
     }
 }

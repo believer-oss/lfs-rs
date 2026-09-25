@@ -6,27 +6,27 @@ use crate::storage::Namespace;
 use crate::util::{empty, full};
 use crate::{app::BoxBody, error::Error};
 
-use http::{self, header, HeaderMap, HeaderValue, StatusCode};
+use http::{self, HeaderMap, HeaderValue, StatusCode, header};
 use http_body_util::BodyExt;
 use hyper::{
-    self,
+    self, Request, Response,
     body::{Buf, Incoming},
-    Request, Response,
 };
-use hyper_tls::HttpsConnector;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
 use tower::Service;
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "otel")]
-use tracing::{instrument, Instrument as _};
+use tracing::{Instrument as _, instrument};
 
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 type GithubAuthCache = Arc<RwLock<LinkedHashMap<String, AuthCacheEntry>>>;
 
@@ -80,19 +80,41 @@ pub struct Permissions {
     pub maintain: bool,
 }
 
+/// The client for the GitHub API. Clones share one connection pool, so create
+/// it once with [`github_client`] and clone it.
+pub type GithubClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
+
+/// Creates the GitHub API client, trusting the system's root certificates.
+pub fn github_client() -> std::io::Result<GithubClient> {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        // Named explicitly: if another crate enabled a second rustls
+        // provider, rustls would have no default and this would panic.
+        .with_provider_and_native_roots(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        )?
+        // Tests stand in for GitHub with a plain HTTP server.
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(https))
+}
+
 #[derive(Debug, Clone)]
 pub struct Auth<S> {
     cache: GithubAuthCache,
     service: S,
-    authenticated: bool,
+    /// Set if requests must be authenticated with GitHub.
+    client: Option<GithubClient>,
     server: String,
 }
 
 impl<S> Auth<S> {
+    /// Wraps `service` so that requests are authenticated with GitHub, if
+    /// `client` is given. Otherwise requests pass straight through.
     pub fn new(
         service: S,
         cache: GithubAuthCache,
-        authenticated: bool,
+        client: Option<GithubClient>,
         server: Option<String>,
     ) -> Self {
         let server = server.unwrap_or("https://api.github.com".to_string());
@@ -100,7 +122,7 @@ impl<S> Auth<S> {
         Auth {
             cache,
             service,
-            authenticated,
+            client,
             server,
         }
     }
@@ -113,6 +135,7 @@ impl<S> Auth<S> {
         headers: &HeaderMap,
         namespace: &Namespace,
         github_auth_cache: GithubAuthCache,
+        client: &GithubClient,
         server: &str,
     ) -> Result<Option<UserRepoInfo>, Error> {
         if let Some(auth) = headers.get(header::AUTHORIZATION) {
@@ -132,9 +155,6 @@ impl<S> Auth<S> {
                     return Ok(Some(entry.data.clone()));
                 }
             }
-
-            let client = Client::builder(TokioExecutor::new())
-                .build(HttpsConnector::new());
 
             let url = format!(
                 "{}/repos/{}/{}",
@@ -158,7 +178,7 @@ impl<S> Auth<S> {
                 let repository: Repository =
                     serde_json::from_reader(body.reader())?;
 
-                let username = Self::get_github_username(auth, server)
+                let username = Self::get_github_username(auth, client, server)
                     .await
                     .unwrap_or(None);
 
@@ -187,11 +207,9 @@ impl<S> Auth<S> {
     )]
     async fn get_github_username(
         auth: &HeaderValue,
+        client: &GithubClient,
         server: &str,
     ) -> Result<Option<String>, Error> {
-        let client =
-            Client::builder(TokioExecutor::new()).build(HttpsConnector::new());
-
         let req = Request::get(format!("{}/user", server))
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::AUTHORIZATION, auth)
@@ -256,9 +274,14 @@ where
     fn call(&mut self, mut req: Req) -> Self::Future {
         tracing::debug!("checking auth for {}", &req.uri());
 
-        if (!self.authenticated) || (!req.uri().path().starts_with("/api/")) {
-            tracing::trace!("skipping auth");
-            return Box::pin(self.service.call(req));
+        let client = match &self.client {
+            Some(client) if req.uri().path().starts_with("/api/") => {
+                client.clone()
+            }
+            _ => {
+                tracing::trace!("skipping auth");
+                return Box::pin(self.service.call(req));
+            }
         };
         #[cfg(feature = "otel")]
         tracing::Span::current().record("authenticated", true);
@@ -288,7 +311,7 @@ where
                 _ => {
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
-                        .body(full("Missing org/project in URL"))?)
+                        .body(full("Missing org/project in URL"))?);
                 }
             };
 
@@ -298,6 +321,7 @@ where
                 req.headers(),
                 &namespace,
                 cache,
+                &client,
                 &server,
             )
             .await?

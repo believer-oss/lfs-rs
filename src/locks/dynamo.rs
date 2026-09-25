@@ -5,14 +5,14 @@ use super::{
     VerifyLocksResponse,
 };
 use anyhow::bail;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use aws_sdk_dynamodb::{
-    types::AttributeValue, types::DeleteRequest, types::KeysAndAttributes,
-    types::PutRequest, types::WriteRequest, Client,
+    Client, types::AttributeValue, types::DeleteRequest,
+    types::KeysAndAttributes, types::PutRequest, types::WriteRequest,
 };
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use futures::future;
 
 use uuid::Uuid;
@@ -91,7 +91,7 @@ pub struct DynamoLockStore {
 impl DynamoLockStore {
     pub async fn new(table_name: String, endpoint_url: Option<&str>) -> Self {
         let mut shared_config =
-            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+            aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12());
         if let Some(endpoint_url) = endpoint_url {
             shared_config = shared_config.endpoint_url(endpoint_url)
         };
@@ -169,35 +169,34 @@ impl DynamoLockStore {
                         bail!("SDK error fetching locks: {:?}", unified_error);
                     }
                     Ok(output) => {
-                        if let Some(responses) = &output.responses {
-                            if let Some(existing_locks) =
+                        if let Some(responses) = &output.responses
+                            && let Some(existing_locks) =
                                 responses.get(&self.table_name)
-                            {
-                                for data in existing_locks.iter() {
-                                    let extract = |v| {
-                                        data.get(v)
-                                            .unwrap()
-                                            .as_s()
-                                            .unwrap()
-                                            .to_string()
-                                    };
+                        {
+                            for data in existing_locks.iter() {
+                                let extract = |v| {
+                                    data.get(v)
+                                        .unwrap()
+                                        .as_s()
+                                        .unwrap()
+                                        .to_string()
+                                };
 
-                                    all_locks.push(Lock {
-                                        id: extract("id"),
-                                        path: extract("path"),
-                                        locked_at: extract("locked_at"),
-                                        owner: Some(OwnerInfo {
-                                            name: extract("owner"),
-                                        }),
-                                    });
-                                }
+                                all_locks.push(Lock {
+                                    id: extract("id"),
+                                    path: extract("path"),
+                                    locked_at: extract("locked_at"),
+                                    owner: Some(OwnerInfo {
+                                        name: extract("owner"),
+                                    }),
+                                });
                             }
                         }
 
-                        if let Some(keys) = output.unprocessed_keys {
-                            if !keys.is_empty() {
-                                keys_and_attributes.push(keys);
-                            }
+                        if let Some(keys) = output.unprocessed_keys
+                            && !keys.is_empty()
+                        {
+                            keys_and_attributes.push(keys);
                         }
                     }
                 }
@@ -260,14 +259,12 @@ impl DynamoLockStore {
                     let unified_error: aws_sdk_dynamodb::Error = e.into();
                     bail!("SDK error creating locks: {:?}", unified_error);
                 }
-                if let Ok(output) = res {
-                    if let Some(unprocessed) = &output.unprocessed_items {
-                        if let Some(unprocessed_writes) =
-                            unprocessed.get(&self.table_name)
-                        {
-                            writes.append(&mut unprocessed_writes.clone());
-                        }
-                    }
+                if let Ok(output) = res
+                    && let Some(unprocessed) = &output.unprocessed_items
+                    && let Some(unprocessed_writes) =
+                        unprocessed.get(&self.table_name)
+                {
+                    writes.append(&mut unprocessed_writes.clone());
                 }
             }
 
