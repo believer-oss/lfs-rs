@@ -90,16 +90,25 @@ pub struct DynamoLockStore {
 
 impl DynamoLockStore {
     pub async fn new(table_name: String, endpoint_url: Option<&str>) -> Self {
-        let client: Client;
         let mut shared_config =
             aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
         if let Some(endpoint_url) = endpoint_url {
             shared_config = shared_config.endpoint_url(endpoint_url)
         };
         let sdk_config = shared_config.load().await;
-        client = Client::new(&sdk_config);
 
-        DynamoLockStore { client, table_name }
+        Self::from_config(&sdk_config, table_name)
+    }
+
+    /// Creates the lock store from an already loaded AWS configuration.
+    pub fn from_config(
+        sdk_config: &aws_config::SdkConfig,
+        table_name: String,
+    ) -> Self {
+        DynamoLockStore {
+            client: Client::new(sdk_config),
+            table_name,
+        }
     }
 
     #[instrument(level = "info", err, skip(self), fields(paths = paths.len()))]

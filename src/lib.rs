@@ -91,6 +91,7 @@ pub struct S3ServerBuilder {
     authenticated: bool,
     authentication_server: Option<String>,
     size_cache_entries: usize,
+    sdk_config: Option<aws_config::SdkConfig>,
 }
 
 impl S3ServerBuilder {
@@ -105,6 +106,7 @@ impl S3ServerBuilder {
             authenticated: false,
             authentication_server: None,
             size_cache_entries: 256000, // Default to 256k entries
+            sdk_config: None,
         }
     }
 
@@ -167,6 +169,14 @@ impl S3ServerBuilder {
         self
     }
 
+    /// Sets the AWS configuration to use instead of loading it from the
+    /// environment. A custom endpoint in this configuration selects
+    /// path-style addressing, as `$AWS_S3_ENDPOINT` does.
+    pub fn sdk_config(&mut self, config: aws_config::SdkConfig) -> &mut Self {
+        self.sdk_config = Some(config);
+        self
+    }
+
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
     pub async fn spawn(
@@ -193,15 +203,19 @@ impl S3ServerBuilder {
             }
         }
 
-        let s3 = S3::new(
+        let sdk_config = match self.sdk_config {
+            Some(config) => config,
+            None => S3::load_config().await?,
+        };
+        let s3 = S3::from_config(
+            &sdk_config,
             self.bucket,
             prefix,
             self.cdn,
             self.s3_accelerate,
             self.size_cache_entries,
-        )
-        .map_err(Error::from)
-        .await?;
+        );
+        s3.check().await?;
 
         // Retry certain operations to S3 to make it more reliable.
         let s3 = Retrying::new(s3);

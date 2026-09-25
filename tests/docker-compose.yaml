@@ -1,0 +1,32 @@
+# Services for the S3 and DynamoDB integration tests. CI runs the same images
+# (see .github/workflows/ci.yml); keep the digests in sync when bumping.
+#
+#   docker compose -f tests/docker-compose.yaml up -d   # or podman compose
+#   export LFS_TEST_S3_ENDPOINT=http://localhost:9000 \
+#     LFS_TEST_S3_BUCKET=lfs-rs-scratch-local \
+#     LFS_TEST_DYNAMODB_ENDPOINT=http://localhost:8000 \
+#     LFS_TEST_DYNAMODB_TABLE=local \
+#     LFS_TEST_AWS_ACCESS_KEY_ID=lfstest \
+#     LFS_TEST_AWS_SECRET_ACCESS_KEY=lfstestsecret
+#   cargo test --features redis   # not --all-features: `faulty` breaks S3 tests
+#
+# The tests create the bucket and tables themselves. Test buckets must be
+# named lfs-rs-scratch-*, and tables get that prefix added (see tests/common.rs).
+services:
+  # rustfs rather than minio, which has withdrawn its community image. `latest`
+  # is a rolling build, hence the digest; the `1.0.0-alpha.N` release images
+  # lack the entrypoint that provisions /data, so `server /data` fails on them.
+  rustfs:
+    image: docker.io/rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    command: ["server", "/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: lfstest
+      RUSTFS_SECRET_KEY: lfstestsecret
+    ports:
+      - "9000:9000"
+
+  dynamodb-local:
+    image: docker.io/amazon/dynamodb-local@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"

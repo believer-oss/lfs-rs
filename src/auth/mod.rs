@@ -123,7 +123,7 @@ impl<S> Auth<S> {
                 event!(
                     Level::DEBUG,
                     message = "cache hit",
-                    key = format!("{}", &key[0..4]),
+                    key = &key[0..4],
                     age = entry.timestamp.elapsed().as_secs()
                 );
 

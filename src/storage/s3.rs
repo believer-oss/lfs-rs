@@ -19,7 +19,7 @@
 // SOFTWARE.
 use anyhow::Context;
 use async_trait::async_trait;
-use aws_config::Region;
+use aws_config::{Region, SdkConfig};
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{
@@ -29,7 +29,9 @@ use aws_sdk_s3::operation::{
     put_object::PutObjectError, upload_part::UploadPartError,
 };
 use aws_sdk_s3::presigning::PresigningConfig;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{
+    BucketAccelerateStatus, CompletedMultipartUpload, CompletedPart,
+};
 use aws_sdk_s3::Client;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
@@ -135,116 +137,87 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Loads the AWS configuration from the environment, connects to the
+    /// bucket and checks that it is usable.
     pub async fn new(
+        bucket: String,
+        prefix: String,
+        cdn: Option<String>,
+        s3_accelerate: bool,
+        size_cache_entries: usize,
+    ) -> Result<Self, anyhow::Error> {
+        let sdk_config = Self::load_config().await?;
+        let backend = Self::from_config(
+            &sdk_config,
+            bucket,
+            prefix,
+            cdn,
+            s3_accelerate,
+            size_cache_entries,
+        );
+        backend.check().await?;
+        Ok(backend)
+    }
+
+    /// Loads the AWS configuration from the default credential and region
+    /// chains. If `$AWS_S3_ENDPOINT` is set, it is used as a custom endpoint
+    /// (e.g. an S3-compatible server) and a region must also be set.
+    pub async fn load_config() -> Result<SdkConfig, anyhow::Error> {
+        let mut shared_config =
+            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
+
+        if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
+            // If a custom endpoint is set, do not use the AWS default
+            // (us-east-1). Instead, check environment variables for a region
+            // name.
+            let name = std::env::var("AWS_DEFAULT_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .context(
+                    "$AWS_S3_ENDPOINT was set without $AWS_DEFAULT_REGION or \
+                     $AWS_REGION being set. Custom endpoints don't make sense \
+                     without also setting a region.",
+                )?;
+            shared_config = shared_config
+                .endpoint_url(endpoint)
+                .region(Region::new(name));
+        }
+
+        Ok(shared_config.load().await)
+    }
+
+    /// Creates the backend from an already loaded AWS configuration. This
+    /// makes no requests; call [`Backend::check`] to verify the bucket.
+    ///
+    /// If the configuration has a custom endpoint, path-style addressing is
+    /// used, since S3-compatible servers generally don't route virtual-hosted
+    /// bucket names.
+    pub fn from_config(
+        sdk_config: &SdkConfig,
         bucket: String,
         mut prefix: String,
         cdn: Option<String>,
         s3_accelerate: bool,
         size_cache_entries: usize,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Self {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
             prefix.pop();
         }
 
-        let (region, endpoint_url) =
-            if let Ok(endpoint) = std::env::var("AWS_S3_ENDPOINT") {
-                // If a custom endpoint is set, do not use the AWS default
-                // (us-east-1). Instead, check environment variables for a
-                // region name.
-                let name = std::env::var("AWS_DEFAULT_REGION")
-                    .or_else(|_| std::env::var("AWS_REGION"))
-                    .context(
-                        "$AWS_S3_ENDPOINT was set without $AWS_DEFAULT_REGION \
-                         or $AWS_REGION being set. Custom endpoints don't \
-                         make sense without also setting a region.",
-                    )?;
-                (Region::new(name), Some(endpoint))
-            } else {
-                (Region::new("us-east-1"), None)
-            };
-
-        let client: Client;
-        let mut shared_config =
-            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
-        if let Some(endpoint_url) = endpoint_url {
-            shared_config = shared_config.endpoint_url(endpoint_url);
-            shared_config = shared_config.region(region.clone());
-        }
-        let sdk_config = shared_config.load().await;
-        client = Client::new(&sdk_config);
+        let service_config = aws_sdk_s3::config::Builder::from(sdk_config)
+            .force_path_style(sdk_config.endpoint_url().is_some())
+            .build();
+        let client = Client::from_conf(service_config);
 
         // S3 client used for signing accelerate upload and download URLs.
         let accelerate_client = if s3_accelerate {
-            let service_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            let service_config = aws_sdk_s3::config::Builder::from(sdk_config)
                 .accelerate(true)
                 .build();
             Some(Client::from_conf(service_config))
         } else {
             None
         };
-
-        // Perform a HEAD operation to check that the bucket exists and that
-        // our credentials work. This helps catch very common errors early on
-        // in application startup. Exit on error, since we can't do anything
-        // useful.
-        let resp = client.head_bucket().bucket(bucket.clone()).send().await;
-        if resp.is_err() {
-            tracing::error!("Failed to connect to S3 bucket '{}'", bucket);
-            std::process::exit(1);
-        } else {
-            tracing::info!(
-                "Connecting to S3 bucket '{}' at region '{}'",
-                bucket,
-                sdk_config
-                    .region()
-                    .unwrap_or(&aws_config::Region::new("us-east-1"))
-            );
-        }
-
-        // If we expect to use transfer acceleration, check that it is enabled.
-        if s3_accelerate {
-            let resp = client
-                .get_bucket_accelerate_configuration()
-                .bucket(bucket.clone())
-                .send()
-                .await;
-            if let Ok(resp) = resp {
-                let status = resp.status.expect(
-                    "Unable to determine S3 transfer acceleration status",
-                );
-                match status.as_str() {
-                    "Enabled" => tracing::info!(
-                        "S3 transfer acceleration is enabled for bucket '{}'",
-                        bucket
-                    ),
-                    "Suspended" => {
-                        tracing::error!(
-                            "S3 transfer acceleration is suspended for bucket \
-                             '{}'",
-                            bucket
-                        );
-                        tracing::error!(
-                            "Please enable S3 transfer acceleration for this \
-                             bucket or disable configuration"
-                        );
-                        std::process::exit(1);
-                    }
-                    _ => tracing::warn!(
-                        "S3 transfer acceleration is in an unknown state '{}' \
-                         for bucket '{}'",
-                        status,
-                        bucket
-                    ),
-                }
-            } else {
-                tracing::error!(
-                    "Failed to check S3 transfer acceleration for bucket '{}'",
-                    bucket
-                );
-                std::process::exit(1);
-            }
-        }
 
         // Initialize the size cache
         let (size_cache, max_cache_entries) = if size_cache_entries > 0 {
@@ -261,7 +234,7 @@ impl Backend {
             (None, None)
         };
 
-        Ok(Backend {
+        Backend {
             client,
             bucket,
             prefix,
@@ -271,11 +244,81 @@ impl Backend {
             max_cache_entries,
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
-        })
+        }
+    }
+
+    /// Checks that the bucket exists and that our credentials work, and that
+    /// transfer acceleration is enabled if we expect to use it. This catches
+    /// very common configuration errors early on in application startup.
+    pub async fn check(&self) -> Result<(), anyhow::Error> {
+        let bucket = &self.bucket;
+
+        self.client
+            .head_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .with_context(|| {
+                format!("Failed to connect to S3 bucket '{bucket}'")
+            })?;
+
+        tracing::info!(
+            "Connected to S3 bucket '{}' at region '{}'",
+            bucket,
+            self.client
+                .config()
+                .region()
+                .map_or("us-east-1", |region| region.as_ref())
+        );
+
+        if self.accelerate_client.is_some() {
+            let resp = self
+                .client
+                .get_bucket_accelerate_configuration()
+                .bucket(bucket)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to check S3 transfer acceleration for bucket \
+                         '{bucket}'"
+                    )
+                })?;
+
+            match resp.status {
+                Some(BucketAccelerateStatus::Enabled) => tracing::info!(
+                    "S3 transfer acceleration is enabled for bucket '{}'",
+                    bucket
+                ),
+                Some(BucketAccelerateStatus::Suspended) => anyhow::bail!(
+                    "S3 transfer acceleration is suspended for bucket \
+                     '{bucket}'. Please enable S3 transfer acceleration for \
+                     this bucket or disable configuration"
+                ),
+                // S3 omits the status if acceleration was never configured.
+                None => anyhow::bail!(
+                    "S3 transfer acceleration is not enabled for bucket \
+                     '{bucket}'. Please enable S3 transfer acceleration for \
+                     this bucket or disable configuration"
+                ),
+                status => tracing::warn!(
+                    "S3 transfer acceleration is in an unknown state '{:?}' \
+                     for bucket '{}'",
+                    status,
+                    bucket
+                ),
+            }
+        }
+
+        Ok(())
     }
 
     fn key_to_path(&self, key: &StorageKey) -> String {
-        format!("{}/{}/{}", self.prefix, key.namespace(), key.oid().path())
+        if self.prefix.is_empty() {
+            format!("{}/{}", key.namespace(), key.oid().path())
+        } else {
+            format!("{}/{}/{}", self.prefix, key.namespace(), key.oid().path())
+        }
     }
 
     /// Returns cache statistics: (hits, misses, current_entries)
@@ -554,5 +597,149 @@ impl Storage for Backend {
         };
 
         Some(presigned_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lfs::Oid;
+    use crate::storage::Namespace;
+    use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
+
+    const ACCESS_KEY_ID: &str = "AKIDLFSRSTESTPLUMBING";
+
+    /// A configuration with fixed credentials, built without consulting the
+    /// environment so the test can't pick up a developer's real credentials.
+    fn config() -> SdkConfig {
+        SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::v2024_03_28())
+            .region(Region::new("us-west-2"))
+            .credentials_provider(SharedCredentialsProvider::new(
+                Credentials::new(ACCESS_KEY_ID, "secret", None, None, "test"),
+            ))
+            .build()
+    }
+
+    fn key() -> StorageKey {
+        StorageKey::new(
+            Namespace::new("org".into(), "project".into()),
+            Oid::from([0xab; 32]),
+        )
+    }
+
+    fn assert_accelerated(url: &str, backend: &Backend) {
+        let url = url::Url::parse(url).unwrap();
+        assert_eq!(url.host_str(), Some("bucket.s3-accelerate.amazonaws.com"));
+        assert_eq!(url.path(), format!("/{}", backend.key_to_path(&key())));
+
+        let credential = url
+            .query_pairs()
+            .find(|(name, _)| name == "X-Amz-Credential")
+            .map(|(_, value)| value.into_owned())
+            .expect("presigned URL is not signed");
+        assert!(
+            credential.starts_with(&format!("{ACCESS_KEY_ID}/"))
+                && credential.ends_with("/us-west-2/s3/aws4_request"),
+            "signed with unexpected credential scope: {credential}"
+        );
+    }
+
+    /// The accelerate client must sign with the same credentials and region
+    /// as the main client. Presigning is local, so this needs no bucket.
+    #[tokio::test]
+    async fn accelerate_urls_use_configured_credentials() {
+        let backend = Backend::from_config(
+            &config(),
+            "bucket".into(),
+            "lfs".into(),
+            None,
+            true,
+            0,
+        );
+        let expires_in = Duration::from_secs(60);
+
+        let url = backend.upload_url(&key(), expires_in).await.unwrap();
+        assert_accelerated(&url, &backend);
+
+        let url = backend.download_url(&key(), expires_in).await.unwrap();
+        assert_accelerated(&url, &backend);
+    }
+
+    /// Without acceleration or a CDN, transfers go through the server.
+    #[tokio::test]
+    async fn no_presigned_urls_without_acceleration() {
+        let backend = Backend::from_config(
+            &config(),
+            "bucket".into(),
+            "lfs".into(),
+            None,
+            false,
+            0,
+        );
+        let expires_in = Duration::from_secs(60);
+
+        assert_eq!(backend.upload_url(&key(), expires_in).await, None);
+        assert_eq!(backend.download_url(&key(), expires_in).await, None);
+    }
+
+    #[test]
+    fn key_paths() {
+        let path = |prefix: &str| {
+            Backend::from_config(
+                &config(),
+                "bucket".into(),
+                prefix.into(),
+                None,
+                false,
+                0,
+            )
+            .key_to_path(&key())
+        };
+        let oid = key().oid().path().to_string();
+
+        assert_eq!(path("lfs"), format!("lfs/org/project/{oid}"));
+        assert_eq!(path("lfs//"), format!("lfs/org/project/{oid}"));
+        assert_eq!(path(""), format!("org/project/{oid}"));
+        assert_eq!(path("/"), format!("org/project/{oid}"));
+    }
+
+    /// Presigns a GET with the backend's main client and returns the URL, to
+    /// see how the client addresses the bucket.
+    async fn presigned_get(sdk_config: &SdkConfig) -> url::Url {
+        let backend = Backend::from_config(
+            sdk_config,
+            "bucket".into(),
+            "lfs".into(),
+            None,
+            false,
+            0,
+        );
+        let request = backend
+            .client
+            .get_object()
+            .bucket("bucket")
+            .key(backend.key_to_path(&key()))
+            .presigned(
+                PresigningConfig::expires_in(Duration::from_secs(60)).unwrap(),
+            )
+            .await
+            .unwrap();
+        url::Url::parse(request.uri()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_uses_path_style() {
+        let custom = config()
+            .into_builder()
+            .endpoint_url("http://s3.test:9000")
+            .build();
+        let url = presigned_get(&custom).await;
+        assert_eq!(url.host_str(), Some("s3.test"));
+        assert!(url.path().starts_with("/bucket/lfs/"), "{url}");
+
+        let url = presigned_get(&config()).await;
+        assert_eq!(url.host_str(), Some("bucket.s3.us-west-2.amazonaws.com"));
+        assert!(url.path().starts_with("/lfs/"), "{url}");
     }
 }

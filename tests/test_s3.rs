@@ -18,26 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! This integration test only runs if the file `.test_credentials.toml` is in
-//! the same directory. Otherwise, it succeeds and does nothing.
+//! Integration tests against S3 or an S3-compatible server. These skip unless
+//! `LFS_TEST_S3_BUCKET` is set; see `tests/common.rs` for the configuration.
 //!
-//! To run this test, create `tests/.test_credentials.toml` with the following
-//! contents:
-//!
-//! ```toml
-//! access_key_id = "XXXXXXXXXXXXXXXXXXXX"
-//! secret_access_key = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-//! default_region = "us-east-1"
-//! bucket = "my-test-bucket"
-//! ```
-//!
-//! Be sure to *only* use non-production credentials for testing purposes. We
-//! intentionally do not load the credentials from the environment to avoid
-//! clobbering any existing S3 bucket.
+//! Be sure to *only* use non-production credentials and buckets for testing
+//! purposes.
 
 mod common;
 
-use std::fs;
 use std::path::Path;
 
 use futures::future::Either;
@@ -45,136 +33,32 @@ use lfs_rs::S3ServerBuilder;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use common::{init_logger, GitRepo, SERVER_ADDR};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Credentials {
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    default_region: String,
-    bucket: String,
-    #[serde(default)]
-    s3ta_enabled: bool,
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+/// Pushes and pulls LFS objects through S3 without a local cache. Each caller
+/// needs its own prefix: the objects are deterministic, so encrypted and
+/// unencrypted runs would otherwise find each other's objects.
+async fn s3_smoke_test(
+    test: &str,
+    prefix: &str,
+    key: Option<[u8; 32]>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = init_logger();
 
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
-    };
-
-    // Try to load S3 credentials `.test_credentials.toml`. If they don't exist,
-    // then we can't really run this test. Note that these should be completely
-    // separate credentials than what is used in production.
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
-
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
-
-    // Make sure our seed is deterministic. This prevents us from filling up our
-    // S3 bucket with a bunch of random files if this test gets ran a bunch of
-    // times.
-    let mut rng = StdRng::seed_from_u64(42);
-
-    let key = rng.gen();
-
-    let mut server = S3ServerBuilder::new(creds.bucket, key);
-    server.prefix("test_lfs".into());
-
-    let locks = lfs_rs::NoneLs::new();
-
-    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-    let server = tokio::spawn(futures::future::select(shutdown_rx, server));
-
-    let repo = GitRepo::init(addr)?;
-    repo.add_random(Path::new("4mb.bin"), 4 * 1024 * 1024, &mut rng)?;
-    repo.add_random(Path::new("8mb.bin"), 8 * 1024 * 1024, &mut rng)?;
-    repo.add_random(Path::new("16mb.bin"), 16 * 1024 * 1024, &mut rng)?;
-    repo.commit("Add LFS objects")?;
-
-    // Make sure we can push LFS objects to the server.
-    repo.lfs_push().unwrap();
-
-    // Make sure we can re-download the same objects.
-    repo.clean_lfs().unwrap();
-    repo.lfs_pull().unwrap();
-
-    // Push again. This should be super fast.
-    repo.lfs_push().unwrap();
-
-    shutdown_tx.send(()).expect("server died too soon");
-
-    if let Either::Right((result, _)) = server.await.unwrap() {
-        // If the server exited first, then propagate the error.
-        result.expect("server failed unexpectedly");
-    }
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = init_logger();
-
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
-    };
-
-    // Try to load S3 credentials `.test_credentials.toml`. If they don't exist,
-    // then we can't really run this test. Note that these should be completely
-    // separate credentials than what is used in production.
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
-
-    if creds.s3ta_enabled {
-        eprintln!(
-            "Skipping test. S3 Transfer Acceleration is required and not set \
-             in test credentials config."
-        );
+    let Some(target) = common::s3_target(test).await else {
         return Ok(());
-    }
-
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
+    };
 
     // Make sure our seed is deterministic. This prevents us from filling up our
     // S3 bucket with a bunch of random files if this test gets ran a bunch of
     // times.
     let mut rng = StdRng::seed_from_u64(42);
 
-    let key = rng.gen();
-
-    let mut server = S3ServerBuilder::new(creds.bucket, key);
-    server.s3_accelerate(true);
-    server.prefix("test_lfs".into());
+    let mut server = S3ServerBuilder::new(target.bucket, key);
+    server.prefix(prefix.into());
+    server.sdk_config(target.config);
 
     let locks = lfs_rs::NoneLs::new();
 
@@ -191,23 +75,68 @@ async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     repo.commit("Add LFS objects")?;
 
     // Make sure we can push LFS objects to the server.
-    repo.lfs_push().unwrap();
+    repo.lfs_push()?;
 
     // Make sure we can re-download the same objects.
-    repo.clean_lfs().unwrap();
-    repo.lfs_pull().unwrap();
+    repo.clean_lfs()?;
+    repo.lfs_pull()?;
 
     // Push again. This should be super fast.
-    repo.lfs_push().unwrap();
+    repo.lfs_push()?;
 
     shutdown_tx.send(()).expect("server died too soon");
 
-    if let Either::Right((result, _)) = server.await.unwrap() {
+    if let Either::Right((result, _)) = server.await? {
         // If the server exited first, then propagate the error.
-        result.expect("server failed unexpectedly");
+        result?;
     }
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_smoke_test_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
+    s3_smoke_test("S3 unencrypted", "test_lfs_unencrypted", None).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_smoke_test_encrypted() -> Result<(), Box<dyn std::error::Error>> {
+    let key = StdRng::seed_from_u64(42).gen();
+    s3_smoke_test("S3 encrypted", "test_lfs_encrypted", Some(key)).await
+}
+
+/// The configuration production runs, less transfer acceleration: S3 behind a
+/// local disk cache, unencrypted, with DynamoDB locks and GitHub
+/// authentication (mocked).
+#[cfg(feature = "dynamodb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_production_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = init_logger();
+    let startup_span = common::startup();
+
+    let test = "S3 production";
+    let Some(s3) = common::s3_target(test).await else {
+        return Ok(());
+    };
+    let Some(dynamodb) = common::dynamodb_target(test, "s3") else {
+        return Ok(());
+    };
+
+    GitRepo::setup_dynamodb_table(&dynamodb).await?;
+    let locks = lfs_rs::DynamoLs::from_config(&dynamodb.config, dynamodb.table);
+
+    let cache = tempfile::TempDir::new()?;
+    let mock = GitRepo::setup_mock_gh_auth().await;
+
+    let mut server = S3ServerBuilder::new(s3.bucket, None);
+    server.prefix("test_lfs_production".into());
+    server.sdk_config(s3.config);
+    server.cache(lfs_rs::Cache::new(cache.path().into(), 1024 * 1024 * 1024));
+    server.authenticated(true);
+    server.authentication_server(mock.uri());
+    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
+
+    common::lock_smoke_test(server, addr, Some(startup_span)).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -217,34 +146,20 @@ async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
 
     let _guard = init_logger();
 
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
+    let Some(target) = common::s3_target("S3 size cache").await else {
+        return Ok(());
     };
 
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
-
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
-
     // Create S3 backend with a very small cache (3 entries) to test eviction
-    let backend = lfs_rs::storage::S3::new(
-        creds.bucket,
+    let backend = lfs_rs::storage::S3::from_config(
+        &target.config,
+        target.bucket,
         "test_lfs_cache".to_string(),
         None,
         false,
         3, // Small cache size for testing
-    )
-    .await?;
+    );
+    backend.check().await?;
 
     let mut rng = StdRng::seed_from_u64(123);
     let namespace = lfs_rs::storage::Namespace::new(
