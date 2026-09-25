@@ -187,6 +187,7 @@ where
 
         Ok(Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(full(template.render()?))?)
     }
 

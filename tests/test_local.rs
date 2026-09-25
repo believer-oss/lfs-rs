@@ -90,3 +90,28 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+/// The index page is the health check, and browsers need its content type.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_is_html() -> Result<(), Box<dyn std::error::Error>> {
+    use http_body_util::Empty;
+    use hyper::header::CONTENT_TYPE;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let data = tempfile::TempDir::new()?;
+    let server = LocalServerBuilder::new(data.path().into(), None);
+    let (server, addr) =
+        server.spawn(SERVER_ADDR, lfs_rs::NoneLs::new()).await?;
+    let server = tokio::spawn(server);
+
+    let client = Client::builder(TokioExecutor::new())
+        .build_http::<Empty<bytes::Bytes>>();
+    let response = client.get(format!("http://{addr}/").parse()?).await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+
+    server.abort();
+    Ok(())
+}

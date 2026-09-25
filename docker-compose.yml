@@ -1,11 +1,11 @@
 # Copy this file to another location and modify as necessary.
-version: '3'
 services:
   app:
-    image: jasonwhite0/rudolfs:latest
-    #build:
-    #  context: .
-    #  dockerfile: Dockerfile
+    # Built from this repository. To use a published image instead, replace
+    # this with `image: ghcr.io/believer-oss/lfs-rs:<commit>`.
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8081:8080"
     volumes:
@@ -15,22 +15,15 @@ services:
       - AWS_ACCESS_KEY_ID
       - AWS_SECRET_ACCESS_KEY
       - AWS_DEFAULT_REGION
-      - LFS_ENCRYPTION_KEY
-      - LFS_S3_BUCKET
-      - LFS_MAX_CACHE_SIZE
-    entrypoint:
-      - /tini
-      - --
-      - /rudolfs
+      # Passed through only if set, in `.env` or the environment. Leave
+      # RUDOLFS_KEY unset to store objects unencrypted.
+      - RUDOLFS_KEY
+      - RUDOLFS_MAX_CACHE_SIZE
+      - RUDOLFS_S3_BUCKET
+    command:
       - --cache-dir
       - /data
-      - --key
-      - ${LFS_ENCRYPTION_KEY}
-      - --max-cache-size
-      - ${LFS_MAX_CACHE_SIZE}
       - s3
-      - --bucket
-      - ${LFS_S3_BUCKET}
 
   # A real production server should use nginx. How to configure this depends on
   # your needs. Use your Google-search skills to configure this correctly.

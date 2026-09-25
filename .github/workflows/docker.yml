@@ -18,10 +18,22 @@ jobs:
       - name: Log in to registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
 
+      # Each platform builds natively, so arm64 builds under qemu emulation. This
+      # registers qemu the way docker/setup-qemu-action does, without adding a
+      # third-party action.
+      - name: Set up emulation and buildx
+        run: |
+          docker run --privileged --rm \
+            tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
+            --install arm64
+          docker buildx create --use --driver docker-container
+
       - name: Build, tag, and push image
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG .
-          docker push ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG \
+            --push \
+            .
