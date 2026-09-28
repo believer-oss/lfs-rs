@@ -93,6 +93,7 @@ pub struct S3ServerBuilder {
     authenticated: bool,
     authentication_server: Option<String>,
     size_cache_entries: usize,
+    credential_refresh_buffer: Duration,
     sdk_config: Option<aws_config::SdkConfig>,
 }
 
@@ -108,6 +109,8 @@ impl S3ServerBuilder {
             authenticated: false,
             authentication_server: None,
             size_cache_entries: 256000, // Default to 256k entries
+            credential_refresh_buffer:
+                storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER,
             sdk_config: None,
         }
     }
@@ -171,6 +174,14 @@ impl S3ServerBuilder {
         self
     }
 
+    /// Sets how long before they expire the S3 credentials are refreshed.
+    /// Zero keeps the SDK's default. See
+    /// [`storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER`].
+    pub fn credential_refresh_buffer(&mut self, buffer: Duration) -> &mut Self {
+        self.credential_refresh_buffer = buffer;
+        self
+    }
+
     /// Sets the AWS configuration to use instead of loading it from the
     /// environment. A custom endpoint in this configuration selects
     /// path-style addressing, as `$AWS_S3_ENDPOINT` does.
@@ -216,6 +227,7 @@ impl S3ServerBuilder {
             self.cdn,
             self.s3_accelerate,
             self.size_cache_entries,
+            self.credential_refresh_buffer,
         );
         s3.check().await?;
 

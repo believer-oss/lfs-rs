@@ -19,9 +19,11 @@
 // SOFTWARE.
 use anyhow::Context;
 use async_trait::async_trait;
+use aws_config::identity::IdentityCache;
 use aws_config::{Region, SdkConfig};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::config::{ProvideCredentials as _, SharedCredentialsProvider};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::{
     complete_multipart_upload::CompleteMultipartUploadError,
@@ -106,6 +108,34 @@ impl From<SdkError<HeadObjectError, HttpResponse>> for Error {
 
 impl ::std::error::Error for Error {}
 
+/// How long before its credentials expire the S3 clients get new ones, by
+/// default.
+///
+/// A presigned URL can't outlive the credentials that signed it, and the SDK
+/// only refreshes credentials 10 seconds before they expire. So URLs signed
+/// near the end of a credential period expired early, the SDK logged an
+/// EXPIRATION_WARNING, and clients could get 403s partway through a batch.
+///
+/// The SDK randomizes the buffer: it refreshes credentials anywhere from half
+/// the buffer to the whole of it before they expire. So credentials used to
+/// sign a URL have at least half the buffer left, and presigned URLs, which
+/// last `PRESIGNED_URL_EXPIRATION` (15 minutes, in `app.rs`), must last no more
+/// than that to get their full lifetime. `app.rs` checks this at compile time.
+///
+/// This relies on the credential source handing out *new* credentials when
+/// asked this long before they expire. EKS Pod Identity does (its agent renews
+/// its 6-hour credentials after at most 3 hours), as do IRSA / web identity,
+/// SSO and AssumeRole profiles, which fetch new credentials every time. Static
+/// keys don't expire, so this changes nothing for them.
+///
+/// An EC2 instance role (IMDS) or an ECS task role does NOT: the credentials
+/// endpoint serves the same credentials until shortly before they expire (about
+/// 5 minutes, for IMDS). The SDK would then ask it again on almost every
+/// request for the rest of each credential period, and IMDS rate-limits. Use
+/// `--s3-credential-refresh-buffer 0` there, which keeps the SDK's default.
+pub const DEFAULT_CREDENTIAL_REFRESH_BUFFER: Duration =
+    Duration::from_secs(35 * 60);
+
 /// Amazon S3 storage backend.
 pub struct Backend {
     /// S3 client.
@@ -129,6 +159,13 @@ pub struct Backend {
 
     /// Maximum number of entries in the size cache
     max_cache_entries: Option<usize>,
+
+    /// See [`DEFAULT_CREDENTIAL_REFRESH_BUFFER`]. Zero is the SDK's default.
+    credential_refresh_buffer: Duration,
+
+    /// Only used to report the credentials' lifetime at startup; the clients
+    /// have their own, behind the credential cache.
+    credentials_provider: Option<SharedCredentialsProvider>,
 
     /// Number of cache hits (only tracked when cache is enabled)
     cache_hits: AtomicUsize,
@@ -155,6 +192,7 @@ impl Backend {
             cdn,
             s3_accelerate,
             size_cache_entries,
+            DEFAULT_CREDENTIAL_REFRESH_BUFFER,
         );
         backend.check().await?;
         Ok(backend)
@@ -199,13 +237,23 @@ impl Backend {
         cdn: Option<String>,
         s3_accelerate: bool,
         size_cache_entries: usize,
+        credential_refresh_buffer: Duration,
     ) -> Self {
         // Ensure the prefix doesn't end with a '/'.
         while prefix.ends_with('/') {
             prefix.pop();
         }
 
+        // One credential cache for both clients, so they refresh together.
+        let mut identity_cache = IdentityCache::lazy();
+        if !credential_refresh_buffer.is_zero() {
+            identity_cache =
+                identity_cache.buffer_time(credential_refresh_buffer);
+        }
+        let identity_cache = identity_cache.build();
+
         let service_config = aws_sdk_s3::config::Builder::from(sdk_config)
+            .identity_cache(identity_cache.clone())
             .force_path_style(sdk_config.endpoint_url().is_some())
             .build();
         let client = Client::from_conf(service_config);
@@ -213,6 +261,7 @@ impl Backend {
         // S3 client used for signing accelerate upload and download URLs.
         let accelerate_client = if s3_accelerate {
             let service_config = aws_sdk_s3::config::Builder::from(sdk_config)
+                .identity_cache(identity_cache)
                 .accelerate(true)
                 .build();
             Some(Client::from_conf(service_config))
@@ -243,6 +292,8 @@ impl Backend {
             accelerate_client,
             size_cache,
             max_cache_entries,
+            credential_refresh_buffer,
+            credentials_provider: sdk_config.credentials_provider(),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
         }
@@ -271,6 +322,8 @@ impl Backend {
                 .region()
                 .map_or("us-east-1", |region| region.as_ref())
         );
+
+        self.check_credential_lifetime().await;
 
         if self.accelerate_client.is_some() {
             let resp = self
@@ -312,6 +365,53 @@ impl Backend {
         }
 
         Ok(())
+    }
+
+    /// Logs how long the credentials last, and warns if that is too short for
+    /// the refresh buffer: the SDK would then fetch credentials on almost every
+    /// request. This is a sample at startup, not a guarantee; see
+    /// [`DEFAULT_CREDENTIAL_REFRESH_BUFFER`].
+    async fn check_credential_lifetime(&self) {
+        let Some(provider) = &self.credentials_provider else {
+            return;
+        };
+        let credentials = match provider.provide_credentials().await {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                tracing::debug!(
+                    "Couldn't check the credentials' lifetime: {err}"
+                );
+                return;
+            }
+        };
+        // Static keys don't expire.
+        let Some(expiry) = credentials.expiry() else {
+            return;
+        };
+
+        let remaining = expiry
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        let remaining = Duration::from_secs(remaining.as_secs());
+        tracing::info!(
+            "AWS credentials expire in {}",
+            humantime::format_duration(remaining)
+        );
+
+        let buffer = self.credential_refresh_buffer;
+        if !buffer.is_zero() && remaining < buffer + Duration::from_secs(5 * 60)
+        {
+            tracing::warn!(
+                "AWS credentials have only {} left, and are refreshed {} \
+                 before they expire (--s3-credential-refresh-buffer). If the \
+                 credential source keeps serving the same credentials until \
+                 they nearly expire, as EC2 instance and ECS task roles do, \
+                 they will be fetched again on almost every request. Set \
+                 --s3-credential-refresh-buffer 0 for those.",
+                humantime::format_duration(remaining),
+                humantime::format_duration(buffer),
+            );
+        }
     }
 
     fn key_to_path(&self, key: &StorageKey) -> String {
@@ -659,6 +759,7 @@ mod tests {
             None,
             true,
             0,
+            Duration::ZERO,
         );
         let expires_in = Duration::from_secs(60);
 
@@ -679,6 +780,7 @@ mod tests {
             None,
             false,
             0,
+            Duration::ZERO,
         );
         let expires_in = Duration::from_secs(60);
 
@@ -696,6 +798,7 @@ mod tests {
                 None,
                 false,
                 0,
+                Duration::ZERO,
             )
             .key_to_path(&key())
         };
@@ -717,6 +820,7 @@ mod tests {
             None,
             false,
             0,
+            Duration::ZERO,
         );
         let request = backend
             .client
@@ -744,6 +848,151 @@ mod tests {
         let url = presigned_get(&config()).await;
         assert_eq!(url.host_str(), Some("bucket.s3.us-west-2.amazonaws.com"));
         assert!(url.path().starts_with("/lfs/"), "{url}");
+    }
+
+    mod credential_refresh {
+        use super::*;
+        use aws_credential_types::provider::future;
+        use std::time::SystemTime;
+
+        /// Hands out credentials numbered from 0. The first expire in 10
+        /// minutes, within even the shortest refresh the SDK's jitter picks
+        /// (half the 35-minute buffer), and later ones in an hour, beyond the
+        /// longest (all of it).
+        #[derive(Debug, Default)]
+        struct Rotating(AtomicUsize);
+
+        impl aws_sdk_s3::config::ProvideCredentials for Rotating {
+            fn provide_credentials<'a>(
+                &'a self,
+            ) -> future::ProvideCredentials<'a>
+            where
+                Self: 'a,
+            {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let lifetime = if n == 0 { 10 * 60 } else { 60 * 60 };
+                future::ProvideCredentials::ready(Ok(Credentials::new(
+                    format!("AKIDROTATING{n}"),
+                    "secret",
+                    None,
+                    Some(SystemTime::now() + Duration::from_secs(lifetime)),
+                    "test",
+                )))
+            }
+        }
+
+        fn backend(buffer: Duration) -> Backend {
+            let config = SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::v2026_01_12())
+                .region(Region::new("us-west-2"))
+                .credentials_provider(SharedCredentialsProvider::new(
+                    Rotating::default(),
+                ))
+                .build();
+            Backend::from_config(
+                &config,
+                "bucket".into(),
+                "lfs".into(),
+                None,
+                true,
+                0,
+                buffer,
+            )
+        }
+
+        /// The access key ids that sign two successive presigned URLs.
+        async fn signing_keys(buffer: Duration) -> Vec<String> {
+            let backend = backend(buffer);
+
+            let mut keys = Vec::new();
+            for _ in 0..2 {
+                let url = backend
+                    .upload_url(&key(), Duration::from_secs(15 * 60))
+                    .await
+                    .unwrap();
+                let url = url::Url::parse(&url).unwrap();
+                let (_, credential) = url
+                    .query_pairs()
+                    .find(|(name, _)| name == "X-Amz-Credential")
+                    .unwrap();
+                keys.push(credential.split('/').next().unwrap().to_string());
+            }
+            keys
+        }
+
+        /// The first credentials are used as they come; once they are within
+        /// the buffer of expiring, new ones are fetched before signing.
+        ///
+        /// Each client draws its own random jitter, so this is repeated: with
+        /// credentials the jitter only sometimes catches, it failed about one
+        /// time in seven.
+        #[tokio::test]
+        async fn refreshes_credentials_that_would_cut_urls_short() {
+            for _ in 0..50 {
+                assert_eq!(
+                    signing_keys(DEFAULT_CREDENTIAL_REFRESH_BUFFER).await,
+                    ["AKIDROTATING0", "AKIDROTATING1"]
+                );
+            }
+        }
+
+        /// Zero keeps the SDK's 10-second buffer, so the 10-minute credentials
+        /// keep signing URLs that will expire with them.
+        #[tokio::test]
+        async fn zero_keeps_the_sdk_default() {
+            assert_eq!(
+                signing_keys(Duration::ZERO).await,
+                ["AKIDROTATING0", "AKIDROTATING0"]
+            );
+        }
+
+        /// What `check_credential_lifetime` logs, with the fake provider's
+        /// 10-minute credentials.
+        async fn lifetime_log(buffer: Duration) -> String {
+            use std::sync::{Arc, Mutex};
+            use tracing::instrument::WithSubscriber;
+
+            #[derive(Clone, Default)]
+            struct Buffer(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Buffer {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let buffer_out = Buffer::default();
+            let writer = buffer_out.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            backend(buffer)
+                .check_credential_lifetime()
+                .with_subscriber(subscriber)
+                .await;
+
+            let bytes = buffer_out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        }
+
+        #[tokio::test]
+        async fn warns_when_credentials_are_too_short_for_the_buffer() {
+            let log = lifetime_log(DEFAULT_CREDENTIAL_REFRESH_BUFFER).await;
+            assert!(log.contains("AWS credentials expire in"), "{log}");
+            assert!(log.contains("WARN"), "{log}");
+            assert!(log.contains("--s3-credential-refresh-buffer 0"), "{log}");
+        }
+
+        #[tokio::test]
+        async fn no_warning_with_the_sdk_default() {
+            let log = lifetime_log(Duration::ZERO).await;
+            assert!(log.contains("AWS credentials expire in"), "{log}");
+            assert!(!log.contains("WARN"), "{log}");
+        }
     }
 
     /// Retries are left to the SDK. These check what it retries, against a fake
@@ -776,6 +1025,7 @@ mod tests {
                 None,
                 false,
                 0,
+                Duration::ZERO,
             )
         }
 

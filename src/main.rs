@@ -234,6 +234,20 @@ struct S3Args {
         env = "RUDOLFS_S3_SIZE_CACHE_ENTRIES"
     )]
     size_cache_entries: usize,
+
+    /// How long before they expire to refresh the AWS credentials used for
+    /// S3, so that presigned URLs (with --s3ta) are valid for their full 15
+    /// minutes. The AWS SDK refreshes somewhere between half this and all of
+    /// it, so it should be at least 30 minutes. Set to 0 to keep the SDK's
+    /// default (10s) where the credential source serves the same credentials
+    /// until they nearly expire, like EC2 instance and ECS task roles.
+    #[clap(
+        long = "s3-credential-refresh-buffer",
+        default_value = "35m",
+        value_parser = humantime::parse_duration,
+        env = "RUDOLFS_S3_CREDENTIAL_REFRESH_BUFFER"
+    )]
+    credential_refresh_buffer: Duration,
 }
 
 #[derive(Parser)]
@@ -298,6 +312,7 @@ impl S3Args {
         builder.prefix(self.prefix);
         builder.authenticated(global_args.github_auth);
         builder.size_cache_entries(self.size_cache_entries);
+        builder.credential_refresh_buffer(self.credential_refresh_buffer);
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);

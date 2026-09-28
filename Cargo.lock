@@ -1828,6 +1828,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
  "aws-smithy-types",

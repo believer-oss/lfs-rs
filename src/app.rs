@@ -65,7 +65,19 @@ use tracing::instrument;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-const PRESIGNED_URL_EXPIRATION: Duration = Duration::from_secs(30 * 60);
+/// How long presigned URLs last. git-lfs asks for new URLs once they expire,
+/// and S3 only checks the signature when a transfer starts.
+///
+/// A URL can't outlive the credentials that signed it, and those are only
+/// known to have half the credential refresh buffer left, so this must be at
+/// most that. See `storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER`.
+const PRESIGNED_URL_EXPIRATION: Duration = Duration::from_secs(15 * 60);
+
+const _: () = assert!(
+    PRESIGNED_URL_EXPIRATION.as_secs() * 2
+        <= crate::storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER.as_secs(),
+    "presigned URLs must last at most half the credential refresh buffer",
+);
 
 fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
     match err.downcast_ref::<LockStoreError>() {
@@ -946,7 +958,11 @@ where
                         download: Some(lfs::Action {
                             href: download_url,
                             header,
-                            expires_in: None,
+                            // So that git-lfs asks for a new URL, rather than
+                            // using one that has expired.
+                            expires_in: presigned.then_some(
+                                PRESIGNED_URL_EXPIRATION.as_secs() as i32,
+                            ),
                             expires_at: None,
                         }),
                         upload: None,

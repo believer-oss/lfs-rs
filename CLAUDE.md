@@ -93,6 +93,14 @@ Rules about the order:
   into the cache at the same time.
 - `--cdn` turns off both the disk cache and encryption, because data no
   longer passes through the server.
+- The S3 clients refresh credentials 35 minutes before they expire
+  (`--s3-credential-refresh-buffer`), so that presigned URLs get their full
+  15 minutes. The SDK refreshes somewhere between half the buffer and all of
+  it before expiry, and `app.rs` checks at compile time that URLs last at most
+  half. This only suits credential sources that hand out new credentials when
+  asked early (Pod Identity, IRSA, SSO). See the comment on
+  `DEFAULT_CREDENTIAL_REFRESH_BUFFER` in `s3.rs` for why EC2 instance and ECS
+  task roles need `0`.
 - `S3` has its own LRU for object sizes (`--s3-size-cache-entries`), which
   avoids repeated HEAD requests during batch calls. It switches to multipart
   upload for large objects.

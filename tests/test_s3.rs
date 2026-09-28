@@ -183,6 +183,7 @@ async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
         None,
         false,
         3, // Small cache size for testing
+        std::time::Duration::ZERO,
     );
     backend.check().await?;
 

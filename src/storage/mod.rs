@@ -31,7 +31,7 @@ pub use disk::Backend as Disk;
 pub use encrypt::Backend as Encrypted;
 #[cfg(feature = "faulty")]
 pub use faulty::Backend as Faulty;
-pub use s3::Backend as S3;
+pub use s3::{Backend as S3, DEFAULT_CREDENTIAL_REFRESH_BUFFER};
 pub use verify::Backend as Verify;
 
 use crate::lfs::Oid;
