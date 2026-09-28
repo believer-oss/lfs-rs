@@ -31,6 +31,9 @@ pub enum LockStoreError {
     DeleteNotFound(String),
     #[error("lock not found: {0}")]
     LockNotFound(String),
+    /// A request the client should not have made, such as a bad cursor.
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[cfg(feature = "redis")]
     #[error("redis error: {0}")]
     RedisError(#[from] ::redis::RedisError),

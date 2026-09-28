@@ -138,6 +138,18 @@ fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
                 .unwrap_or_default(),
             ),
         ),
+        Some(LockStoreError::BadRequest(e)) => (
+            StatusCode::BAD_REQUEST,
+            full(
+                into_json(&lfs::BatchResponseError {
+                    locks: None,
+                    message: e.to_string(),
+                    documentation_url: None,
+                    request_id: None,
+                })
+                .unwrap_or_default(),
+            ),
+        ),
         Some(LockStoreError::InternalServerError(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             full(

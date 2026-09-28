@@ -1,8 +1,8 @@
 // Remove this when implemented
 #![allow(dead_code, unused_variables)]
 use super::{
-    ListLocksResponse, Lock, LockBatch, LockFailure, LockStorage, OwnerInfo,
-    VerifyLocksResponse,
+    ListLocksResponse, Lock, LockBatch, LockFailure, LockStorage,
+    LockStoreError, OwnerInfo, VerifyLocksResponse,
 };
 use anyhow::bail;
 use anyhow::{Result, anyhow};
@@ -10,10 +10,10 @@ use async_trait::async_trait;
 
 use aws_sdk_dynamodb::{
     Client, types::AttributeValue, types::DeleteRequest,
-    types::KeysAndAttributes, types::PutRequest, types::WriteRequest,
+    types::KeysAndAttributes, types::WriteRequest,
 };
 use base64::{Engine as _, engine::general_purpose};
-use futures::future;
+use futures::{StreamExt, future, stream};
 
 use uuid::Uuid;
 
@@ -21,9 +21,40 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::batch_write_item::{
     BatchWriteItemError, BatchWriteItemOutput,
 };
+use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use std::collections::{BTreeMap, HashMap};
 use std::str;
 use tracing::{info, instrument};
+
+/// Reads a lock from its item. An item missing an attribute is an error
+/// rather than a panic: one bad item would otherwise break every listing of
+/// its repo.
+fn lock_from_item(item: &HashMap<String, AttributeValue>) -> Result<Lock> {
+    let attr = |name: &str| -> Result<String> {
+        item.get(name)
+            .and_then(|value| value.as_s().ok())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(LockStoreError::InternalServerError(format!(
+                    "lock item without a string `{name}`"
+                )))
+            })
+    };
+    Ok(Lock {
+        id: attr("id")?,
+        path: attr("path")?,
+        locked_at: attr("locked_at")?,
+        owner: Some(OwnerInfo {
+            name: attr("owner")?,
+        }),
+    })
+}
+
+/// A client's page size, as DynamoDB takes it: at least 1, and at most
+/// `i32::MAX`.
+fn page_limit(limit: u64) -> i32 {
+    i32::try_from(limit.max(1)).unwrap_or(i32::MAX)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct DynamoCursor {
@@ -31,16 +62,19 @@ struct DynamoCursor {
 }
 
 impl DynamoCursor {
+    /// Parses a cursor that a client sent back. Clients can send anything, so
+    /// a bad one is a [`LockStoreError::BadRequest`].
     fn from_cursor_string(cursor: String) -> Result<Self> {
-        let cursor: BTreeMap<String, String> = serde_json::from_str(
-            str::from_utf8(
-                general_purpose::STANDARD
-                    .decode(cursor.as_bytes())
-                    .unwrap()
-                    .as_slice(),
-            )
-            .unwrap(),
-        )?;
+        let bad = |what: &str| {
+            anyhow!(LockStoreError::BadRequest(format!(
+                "invalid cursor: {what}"
+            )))
+        };
+        let json = general_purpose::STANDARD
+            .decode(cursor.as_bytes())
+            .map_err(|_| bad("not base64"))?;
+        let cursor: BTreeMap<String, String> =
+            serde_json::from_slice(&json).map_err(|_| bad("not a cursor"))?;
 
         Ok(DynamoCursor::from(cursor))
     }
@@ -75,7 +109,10 @@ impl From<&DynamoCursor> for BTreeMap<String, String> {
 
         let mut cursor = BTreeMap::new();
         for (k, v) in last_evaluated_key {
-            cursor.insert(k, v.as_s().unwrap().to_string());
+            // The table's keys are all strings.
+            if let Ok(v) = v.as_s() {
+                cursor.insert(k, v.clone());
+            }
         }
 
         cursor
@@ -174,22 +211,7 @@ impl DynamoLockStore {
                                 responses.get(&self.table_name)
                         {
                             for data in existing_locks.iter() {
-                                let extract = |v| {
-                                    data.get(v)
-                                        .unwrap()
-                                        .as_s()
-                                        .unwrap()
-                                        .to_string()
-                                };
-
-                                all_locks.push(Lock {
-                                    id: extract("id"),
-                                    path: extract("path"),
-                                    locked_at: extract("locked_at"),
-                                    owner: Some(OwnerInfo {
-                                        name: extract("owner"),
-                                    }),
-                                });
+                                all_locks.push(lock_from_item(data)?);
                             }
                         }
 
@@ -298,11 +320,90 @@ impl DynamoLockStore {
     }
 }
 
+/// How many locks of a batch are written at once.
+const CONCURRENT_LOCK_WRITES: usize = 16;
+
+impl DynamoLockStore {
+    /// The lock on `path`, read consistently, so that a lock just written is
+    /// seen.
+    async fn get_lock(&self, repo: &str, path: &str) -> Result<Option<Lock>> {
+        let output = self
+            .client
+            .get_item()
+            .table_name(self.table_name.clone())
+            .key("repo", AttributeValue::S(repo.to_string()))
+            .key("path", AttributeValue::S(path.to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(aws_sdk_dynamodb::Error::from)?;
+        output.item().map(lock_from_item).transpose()
+    }
+
+    /// Locks `path` for `owner`, or returns the lock that already holds it.
+    ///
+    /// The write is conditional on there being no lock on the path, so of
+    /// several clients locking it at once exactly one succeeds. Checking first
+    /// and writing afterwards let them all "succeed", the last write winning.
+    async fn put_lock(
+        &self,
+        repo: &str,
+        path: &str,
+        owner: &str,
+    ) -> Result<Result<Lock, Lock>> {
+        // At most twice: again if the lock that blocked this one was released
+        // before it could be read.
+        for _ in 0..2 {
+            let lock = Lock::new(
+                Uuid::new_v4().to_string(),
+                path.to_string(),
+                owner.to_string(),
+            );
+            let written = self
+                .client
+                .put_item()
+                .table_name(self.table_name.clone())
+                .item("repo", AttributeValue::S(repo.to_string()))
+                .item("path", AttributeValue::S(path.to_string()))
+                .item("owner", AttributeValue::S(owner.to_string()))
+                .item("id", AttributeValue::S(lock.id.clone()))
+                .item("locked_at", AttributeValue::S(lock.locked_at.clone()))
+                .condition_expression("attribute_not_exists(#path)")
+                .expression_attribute_names("#path", "path")
+                .send()
+                .await;
+
+            match written {
+                Ok(_) => return Ok(Ok(lock)),
+                Err(err)
+                    if matches!(
+                        err.as_service_error(),
+                        Some(PutItemError::ConditionalCheckFailedException(_))
+                    ) =>
+                {
+                    if let Some(existing) = self.get_lock(repo, path).await? {
+                        return Ok(Err(existing));
+                    }
+                }
+                Err(err) => {
+                    let err = aws_sdk_dynamodb::Error::from(err);
+                    tracing::error!("Error locking file {}: {}", path, err);
+                    return Err(err.into());
+                }
+            }
+        }
+
+        Err(anyhow!(LockStoreError::InternalServerError(format!(
+            "could not lock '{path}'"
+        ))))
+    }
+}
+
 #[async_trait]
 impl LockStorage for DynamoLockStore {
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(level = "info", skip(self), ret(level = "debug"))
     )]
     async fn create_lock(
         &self,
@@ -310,49 +411,20 @@ impl LockStorage for DynamoLockStore {
         path: String,
         owner: String,
     ) -> Result<Lock> {
-        let id = Uuid::new_v4();
-        let lock = Lock::new(id.to_string(), path.clone(), owner.clone());
-
-        let request = self
-            .client
-            .get_item()
-            .table_name(self.table_name.clone())
-            .key("path", AttributeValue::S(path.clone()))
-            .key("repo", AttributeValue::S(repo.clone()));
-
-        let output = request.send().await?;
-        if output.item().is_some() {
-            return Err(anyhow!(super::LockStoreError::CreateConflict(lock)));
-        }
-
-        match self
-            .client
-            .put_item()
-            .table_name(self.table_name.clone())
-            .item("repo", AttributeValue::S(repo))
-            .item("path", AttributeValue::S(path.clone()))
-            .item("owner", AttributeValue::S(owner))
-            .item("id", AttributeValue::S(lock.id.clone()))
-            .item("locked_at", AttributeValue::S(lock.locked_at.clone()))
-            .send()
-            .await
-        {
-            Err(e) => {
-                let unified_error: aws_sdk_dynamodb::Error = e.into();
-                tracing::error!(
-                    "Errror locking file {}: {}",
-                    path,
-                    unified_error
-                );
-                Err(unified_error.into())
+        match self.put_lock(&repo, &path, &owner).await? {
+            Ok(lock) => Ok(lock),
+            Err(existing) => {
+                Err(anyhow!(super::LockStoreError::CreateConflict(existing)))
             }
-            Ok(_) => Ok(lock),
         }
     }
 
+    /// Locks each path with its own conditional write, several at once.
+    /// `BatchWriteItem` can't be conditional, so it could overwrite a lock
+    /// taken after any check made first.
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(level = "info", skip(self), ret(level = "debug"))
     )]
     async fn create_locks(
         &self,
@@ -360,62 +432,40 @@ impl LockStorage for DynamoLockStore {
         paths: Vec<String>,
         owner: String,
     ) -> Result<LockBatch> {
-        // // Filter out any keys that already exist
-        let existing_locks = self.get_locks_for_paths(&repo, &paths).await?;
+        let (repo, owner_ref) = (&repo, &owner);
+        let results: Vec<(String, Result<Result<Lock, Lock>>)> =
+            stream::iter(paths)
+                .map(|path| async move {
+                    let result = self.put_lock(repo, &path, owner_ref).await;
+                    (path, result)
+                })
+                .buffered(CONCURRENT_LOCK_WRITES)
+                .collect()
+                .await;
 
-        let mut filtered_paths: Vec<String> = paths;
-        let failures: Vec<LockFailure> = existing_locks
-            .iter()
-            .map(|existing| {
-                filtered_paths.remove(
-                    filtered_paths.iter().position(|v| v.eq(v)).unwrap(),
-                );
-                let lock_owner: &str =
-                    existing.owner.as_ref().map_or("", |v| &v.name);
-                LockFailure {
-                    path: existing.path.clone(),
-                    reason: if owner.eq(lock_owner) {
+        let mut locked = Vec::new();
+        let mut failures = Vec::new();
+        for (path, result) in results {
+            let reason = match result {
+                Ok(Ok(_)) => {
+                    locked.push(path);
+                    continue;
+                }
+                Ok(Err(existing)) => {
+                    let holder =
+                        existing.owner.as_ref().map_or("", |o| &o.name);
+                    if holder == owner {
                         "lock already held".to_string()
                     } else {
-                        format!("lock held by user {}", lock_owner)
-                    },
+                        format!("lock held by user {holder}")
+                    }
                 }
-            })
-            .collect();
-
-        // Write the locks to the db
-        let batch = LockBatch::new(filtered_paths, failures, owner.clone());
-
-        let ids: Vec<String> = batch
-            .paths
-            .iter()
-            .map(|_| Uuid::new_v4().to_string())
-            .collect();
-
-        let mut writes: Vec<WriteRequest> = vec![];
-        for (id, path) in std::iter::zip(ids, &batch.paths) {
-            writes.push(
-                WriteRequest::builder()
-                    .put_request(
-                        PutRequest::builder()
-                            .item("repo", AttributeValue::S(repo.clone()))
-                            .item("path", AttributeValue::S(path.clone()))
-                            .item("owner", AttributeValue::S(owner.clone()))
-                            .item("id", AttributeValue::S(id.clone()))
-                            .item(
-                                "locked_at",
-                                AttributeValue::S(batch.timestamp.clone()),
-                            )
-                            .build()
-                            .expect("Failed to build put request"),
-                    )
-                    .build(),
-            );
+                Err(err) => err.to_string(),
+            };
+            failures.push(LockFailure { path, reason });
         }
 
-        self.write_batch(writes).await?;
-
-        Ok(batch)
+        Ok(LockBatch::new(locked, failures, owner))
     }
 
     #[cfg_attr(
@@ -453,37 +503,28 @@ impl LockStorage for DynamoLockStore {
         }
 
         if let Some(limit) = limit {
-            request = request.limit(limit.try_into().unwrap())
+            request = request.limit(page_limit(limit))
         }
 
         if let Some(cursor) = cursor {
             request = request.set_exclusive_start_key(Some(
-                DynamoCursor::from_cursor_string(cursor)
-                    .unwrap()
-                    .last_evaluated_key,
+                DynamoCursor::from_cursor_string(cursor)?.last_evaluated_key,
             ));
         }
 
         let results = request.send().await?;
         if let Some(items) = &results.items {
-            let locks: Vec<Lock> = items
+            let locks = items
                 .iter()
-                .map(|lock| Lock {
-                    id: lock["id"].as_s().unwrap().to_string(),
-                    path: lock["path"].as_s().unwrap().to_string(),
-                    locked_at: lock["locked_at"].as_s().unwrap().to_string(),
-                    owner: Some(OwnerInfo {
-                        name: lock["owner"].as_s().unwrap().to_string(),
-                    }),
-                })
-                .collect();
+                .map(lock_from_item)
+                .collect::<Result<Vec<Lock>>>()?;
 
             let next_cursor = match results.last_evaluated_key() {
                 Some(last_evaluated_key) => {
                     let dynamo_cursor = DynamoCursor {
                         last_evaluated_key: last_evaluated_key.clone(),
                     };
-                    Some(dynamo_cursor.to_cursor_string().unwrap())
+                    Some(dynamo_cursor.to_cursor_string()?)
                 }
                 None => None,
             };
@@ -534,14 +575,12 @@ impl LockStorage for DynamoLockStore {
             .expression_attribute_values(":repo", AttributeValue::S(repo));
 
         if let Some(limit) = limit {
-            request = request.limit(limit.try_into().unwrap())
+            request = request.limit(page_limit(limit))
         }
 
         if let Some(cursor) = cursor {
             request = request.set_exclusive_start_key(Some(
-                DynamoCursor::from_cursor_string(cursor)
-                    .unwrap()
-                    .last_evaluated_key,
+                DynamoCursor::from_cursor_string(cursor)?.last_evaluated_key,
             ));
         }
 
@@ -551,16 +590,9 @@ impl LockStorage for DynamoLockStore {
             let mut theirs: Vec<Lock> = Vec::new();
 
             for lock in items.iter() {
-                let lock = Lock {
-                    id: lock["id"].as_s().unwrap().to_string(),
-                    path: lock["path"].as_s().unwrap().to_string(),
-                    locked_at: lock["locked_at"].as_s().unwrap().to_string(),
-                    owner: Some(OwnerInfo {
-                        name: lock["owner"].as_s().unwrap().to_string(),
-                    }),
-                };
+                let lock = lock_from_item(lock)?;
 
-                if lock.owner.as_ref().unwrap().name == owner {
+                if lock.owner.as_ref().is_some_and(|o| o.name == owner) {
                     ours.push(lock);
                 } else {
                     theirs.push(lock);
@@ -574,7 +606,7 @@ impl LockStorage for DynamoLockStore {
                         let dynamo_cursor = DynamoCursor {
                             last_evaluated_key: last_evaluated_key.clone(),
                         };
-                        Some(dynamo_cursor.to_cursor_string().unwrap())
+                        Some(dynamo_cursor.to_cursor_string()?)
                     }
                     None => None,
                 },
@@ -617,16 +649,9 @@ impl LockStorage for DynamoLockStore {
         let output = request.send().await?;
 
         if let Some(item) = output.items().first() {
-            let lock = Lock {
-                id: item["id"].as_s().unwrap().to_string(),
-                path: item["path"].as_s().unwrap().to_string(),
-                locked_at: item["locked_at"].as_s().unwrap().to_string(),
-                owner: Some(OwnerInfo {
-                    name: item["owner"].as_s().unwrap().to_string(),
-                }),
-            };
+            let lock = lock_from_item(item)?;
 
-            if lock.owner.as_ref().unwrap().name == owner
+            if lock.owner.as_ref().is_some_and(|o| o.name == owner)
                 || force.unwrap_or(false)
             {
                 self.client
