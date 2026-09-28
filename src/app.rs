@@ -225,6 +225,19 @@ where
             .body(empty())?)
     }
 
+    /// A "403 forbidden" for lock requests from a user whose GitHub username
+    /// couldn't be found (GitHub's `GET /user` failed, e.g. for a token that
+    /// can't read the user). Locks record their owner, so there is none to
+    /// record.
+    fn no_username() -> Result<Response<BoxBody>, Error> {
+        Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(full(
+                r#"{"message":"Locking needs your GitHub username, and GitHub didn't return one for these credentials."}"#,
+            ))?)
+    }
+
     /// Handles `/api` routes.
     #[cfg_attr(
         feature = "otel",
@@ -298,13 +311,12 @@ where
                                 return Self::forbidden(req);
                             }
 
-                            Self::create_lock(
-                                locks,
-                                req,
-                                namespace,
-                                user.username.unwrap(),
-                            )
-                            .await
+                            let Some(owner) = user.username.clone() else {
+                                return Self::no_username();
+                            };
+
+                            Self::create_lock(locks, req, namespace, owner)
+                                .await
                         }
                         (&Method::POST, Some("batch")) => {
                             if !user.permissions.unwrap_or_default().push {
@@ -313,20 +325,22 @@ where
 
                             match parts.next() {
                                 Some("lock") => {
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username();
+                                    };
                                     Self::create_lock_batch(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, owner,
                                     )
                                     .await
                                 }
                                 Some("unlock") => {
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username();
+                                    };
                                     Self::release_lock_batch(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, owner,
                                     )
                                     .await
                                 }
@@ -338,11 +352,12 @@ where
                                 return Self::forbidden(req);
                             }
 
+                            let Some(owner) = user.username.clone() else {
+                                return Self::no_username();
+                            };
+
                             Self::list_locks_for_verification(
-                                locks,
-                                req,
-                                namespace,
-                                user.username.unwrap(),
+                                locks, req, namespace, owner,
                             )
                             .await
                         }
@@ -354,12 +369,12 @@ where
                             match parts.next() {
                                 Some("unlock") => {
                                     let id = id.to_owned();
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username();
+                                    };
                                     Self::release_lock(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        id,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, id, owner,
                                     )
                                     .await
                                 }

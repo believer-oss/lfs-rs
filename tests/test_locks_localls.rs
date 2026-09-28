@@ -31,3 +31,53 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     common::smoke_test(locks, Some(startup_span)).await
 }
+
+/// Locks record their owner's GitHub username. If GitHub doesn't return one
+/// for the credentials, locking is refused, rather than panicking.
+#[tokio::test(flavor = "multi_thread")]
+async fn locking_without_a_github_username_is_forbidden()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Push access to the repo, but no `GET /user`, so no username.
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/test/test"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"permissions":{"push":true,"pull":true}}"#,
+            "application/json",
+        ))
+        .mount(&github)
+        .await;
+
+    let data = tempfile::TempDir::new()?;
+    let lock_data = tempfile::TempDir::new()?;
+    let locks =
+        lfs_rs::LocalLs::new(lock_data.path().join("locking.json")).await?;
+    let mut server = lfs_rs::LocalServerBuilder::new(data.path().into(), None);
+    server.authenticated(true);
+    server.authentication_server(github.uri());
+    let (server, addr) = server.spawn(common::SERVER_ADDR, locks).await?;
+    let server = tokio::spawn(server);
+
+    let request =
+        hyper::Request::post(format!("http://{addr}/api/test/test/locks"))
+            .header("authorization", "Basic dXNlcjp0b2tlbg==")
+            .header("content-type", "application/vnd.git-lfs+json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"path":"a.bin","ref":{"name":"refs/heads/main"}}"#,
+            )))?;
+    let response = Client::builder(TokioExecutor::new())
+        .build_http()
+        .request(request)
+        .await?;
+    assert_eq!(response.status(), 403);
+
+    server.abort();
+    Ok(())
+}
