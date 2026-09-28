@@ -258,6 +258,14 @@ pub struct VerifyStream<S> {
 
     /// The current state of the hasher.
     hasher: sha2::Sha256,
+
+    /// Whether the digest has been checked. It is checked on the chunk that
+    /// completes the stream, or at its end if no chunk did: an empty stream,
+    /// or one shorter than `total`.
+    checked: bool,
+
+    /// Whether the source has ended. It isn't polled again after that.
+    ended: bool,
 }
 
 impl<S> VerifyStream<S> {
@@ -268,6 +276,8 @@ impl<S> VerifyStream<S> {
             len: 0,
             expected,
             hasher: sha2::Sha256::default(),
+            checked: false,
+            ended: false,
         }
     }
 }
@@ -284,6 +294,10 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Option<Self::Item>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
+
         match ready!(Stream::poll_next(Pin::new(&mut self.stream), cx)) {
             Some(bytes) => match bytes {
                 Ok(bytes) => {
@@ -292,9 +306,25 @@ where
                     // Continuously hash the bytes as we receive them.
                     self.hasher.update(bytes.as_ref());
 
+                    if self.checked {
+                        // Past the end of the object, where only empty chunks
+                        // may come.
+                        if bytes.as_ref().is_empty() {
+                            return Poll::Ready(Some(Ok(bytes)));
+                        }
+                        let found = Sha256::from(self.hasher.finalize_reset());
+                        return Poll::Ready(Some(Err(E::from(
+                            Sha256VerifyError {
+                                found,
+                                expected: self.expected,
+                            },
+                        ))));
+                    }
+
                     if self.len >= self.total {
                         // This is the last chunk in the stream. Verify that the
                         // digest matches.
+                        self.checked = true;
                         let found = Sha256::from(self.hasher.finalize_reset());
 
                         if found == self.expected {
@@ -311,9 +341,25 @@ where
                 }
                 Err(err) => Poll::Ready(Some(Err(err))),
             },
-            None => {
-                // End of stream.
+            None if self.checked => {
+                self.ended = true;
                 Poll::Ready(None)
+            }
+            None => {
+                self.ended = true;
+                // The stream ended without a chunk completing it: it is empty,
+                // or shorter than it should be. Otherwise an empty upload would
+                // be stored under any OID.
+                self.checked = true;
+                let found = Sha256::from(self.hasher.finalize_reset());
+                if self.len == self.total && found == self.expected {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(E::from(Sha256VerifyError {
+                        found,
+                        expected: self.expected,
+                    }))))
+                }
             }
         }
     }
@@ -328,5 +374,87 @@ mod tests {
         let s =
             "b1fbeefc23e6a149a6f7d0c2fb635bfc78f7ddc2da963ea9c6a63eb324260e6d";
         assert_eq!(Sha256::from_str(s).unwrap().to_string(), s);
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use futures::StreamExt;
+    use futures::stream;
+
+    type Chunk = Result<Vec<u8>, Sha256VerifyError>;
+
+    fn oid(data: &[u8]) -> Sha256 {
+        Sha256::from(sha2::Sha256::digest(data))
+    }
+
+    /// Runs `chunks` through a verifier expecting `data`, and returns whether
+    /// it reported a mismatch.
+    fn rejects(data: &[u8], chunks: &[&[u8]]) -> bool {
+        let chunks: Vec<Chunk> =
+            chunks.iter().map(|c| Ok(c.to_vec())).collect();
+        let stream = VerifyStream::new(
+            stream::iter(chunks),
+            data.len() as u64,
+            oid(data),
+        );
+        let results: Vec<Chunk> = futures::executor::block_on(stream.collect());
+        results.iter().any(Result::is_err)
+    }
+
+    #[test]
+    fn accepts_the_right_bytes_however_chunked() {
+        assert!(!rejects(b"hello world", &[b"hello world"]));
+        assert!(!rejects(b"hello world", &[b"hello", b" ", b"world"]));
+        // An empty chunk after the end is harmless.
+        assert!(!rejects(b"hello world", &[b"hello world", b""]));
+        assert!(!rejects(b"", &[]));
+        assert!(!rejects(b"", &[b""]));
+    }
+
+    #[test]
+    fn rejects_the_wrong_bytes() {
+        assert!(rejects(b"hello world", &[b"hello there"]));
+        // More than expected.
+        assert!(rejects(b"hello world", &[b"hello world", b"!"]));
+    }
+
+    /// A source that panics if polled again after it ended, as some streams
+    /// may.
+    struct Unfused(std::collections::VecDeque<Chunk>, bool);
+
+    impl Stream for Unfused {
+        type Item = Chunk;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _: &mut Context,
+        ) -> Poll<Option<Chunk>> {
+            assert!(!self.1, "polled after it ended");
+            let next = self.0.pop_front();
+            self.1 = next.is_none();
+            Poll::Ready(next)
+        }
+    }
+
+    /// After reporting a short stream at its end, the verifier ends too,
+    /// rather than polling its finished source again.
+    #[test]
+    fn ends_after_reporting_a_short_stream() {
+        let source = Unfused([Ok(b"hello".to_vec())].into(), false);
+        let stream = VerifyStream::new(source, 11, oid(b"hello world"));
+        let results: Vec<Chunk> = futures::executor::block_on(stream.collect());
+        assert_eq!(results.len(), 2);
+        assert!(results[1].is_err());
+    }
+
+    /// A stream that ends early, or an empty one, was never checked, so an
+    /// empty upload could be stored under any OID.
+    #[test]
+    fn rejects_short_and_empty_streams() {
+        assert!(rejects(b"hello world", &[b"hello"]));
+        assert!(rejects(b"hello world", &[]));
+        assert!(rejects(b"hello world", &[b""]));
     }
 }
