@@ -101,6 +101,11 @@ Rules about the order:
   asked early (Pod Identity, IRSA, SSO). See the comment on
   `DEFAULT_CREDENTIAL_REFRESH_BUFFER` in `s3.rs` for why EC2 instance and ECS
   task roles need `0`.
+- git-lfs uploads each object in one PUT, and S3 takes at most 5 GiB per PUT.
+  So uploads over 5 GiB are never presigned. They go through the server, which
+  sends them to S3 as a multipart upload (100 MiB parts, reading the next part
+  while one uploads, aborting on failure). Objects over a quarter of the disk
+  cache bypass it both ways.
 - `S3` has its own LRU for object sizes (`--s3-size-cache-entries`), which
   avoids repeated HEAD requests during batch calls. It switches to multipart
   upload for large objects.

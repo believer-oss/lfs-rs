@@ -79,6 +79,11 @@ const _: () = assert!(
     "presigned URLs must last at most half the credential refresh buffer",
 );
 
+/// The largest upload that is sent to a presigned URL: S3's limit for a single
+/// PUT. git-lfs uploads each object in one request, so larger objects are
+/// uploaded through the server, which sends them to S3 in parts.
+const MAX_PRESIGNED_UPLOAD_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
 fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
     match err.downcast_ref::<LockStoreError>() {
         Some(e @ LockStoreError::CreateConflict(l)) => (
@@ -865,15 +870,22 @@ where
                     actions: None,
                 },
                 None => {
+                    let presigned_url = if object.size
+                        <= MAX_PRESIGNED_UPLOAD_SIZE
+                    {
+                        storage
+                            .upload_url(
+                                &StorageKey::new(namespace.clone(), object.oid),
+                                PRESIGNED_URL_EXPIRATION,
+                            )
+                            .await
+                    } else {
+                        None
+                    };
+
                     // If we're returning a pre-signed URL, don't also reflect
                     // the auth header back to the client.
-                    let (upload_url, header) = match storage
-                        .upload_url(
-                            &StorageKey::new(namespace.clone(), object.oid),
-                            PRESIGNED_URL_EXPIRATION,
-                        )
-                        .await
-                    {
+                    let (upload_url, header) = match presigned_url {
                         Some(url) => {
                             STATS.presigned_upload();
                             (url, None)
@@ -1068,5 +1080,115 @@ where
         } else {
             Box::pin(future::ready(Self::not_found(req)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StorageStream;
+    use async_trait::async_trait;
+
+    /// A store that presigns every upload and holds nothing.
+    struct Presigning;
+
+    #[async_trait]
+    impl Storage for Presigning {
+        type Error = std::io::Error;
+
+        async fn get(
+            &self,
+            _: &StorageKey,
+        ) -> Result<Option<LFSObject>, Self::Error> {
+            Ok(None)
+        }
+        async fn put(
+            &self,
+            _: StorageKey,
+            _: LFSObject,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn size(
+            &self,
+            _: &StorageKey,
+        ) -> Result<Option<u64>, Self::Error> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &StorageKey) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list(&self) -> StorageStream<(StorageKey, u64), Self::Error> {
+            Box::pin(futures::stream::empty())
+        }
+        fn public_url(&self, _: &StorageKey) -> Option<String> {
+            None
+        }
+        async fn upload_url(
+            &self,
+            _: &StorageKey,
+            _: Duration,
+        ) -> Option<String> {
+            Some("https://presigned.example/upload".into())
+        }
+        async fn download_url(
+            &self,
+            _: &StorageKey,
+            _: Duration,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// The upload action the batch response gives for a new object of `size`.
+    async fn upload_action(size: u64) -> lfs::Action {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Basic dXNlcjp0b2tlbg==".parse().unwrap(),
+        );
+        let object = lfs::RequestObject {
+            oid: "b1fbeefc23e6a149a6f7d0c2fb635bfc78f7ddc2da963ea9c6a63eb324260e6d"
+                .parse()
+                .unwrap(),
+            size,
+        };
+
+        let response = basic_response(
+            "http://lfs.example/".parse().unwrap(),
+            &headers,
+            &Presigning,
+            object,
+            lfs::Operation::Upload,
+            Ok::<_, std::io::Error>(None),
+            Namespace::new("org".into(), "project".into()),
+        )
+        .await;
+
+        response.actions.unwrap().upload.unwrap()
+    }
+
+    /// S3 takes a single PUT of up to 5 GiB; git-lfs can't split an upload.
+    #[tokio::test]
+    async fn uploads_up_to_5_gib_are_presigned() {
+        let action = upload_action(MAX_PRESIGNED_UPLOAD_SIZE).await;
+        assert_eq!(action.href, "https://presigned.example/upload");
+        assert!(action.header.is_none());
+    }
+
+    /// Larger uploads go through the server, which sends them to S3 in parts.
+    #[tokio::test]
+    async fn larger_uploads_go_through_the_server() {
+        let action = upload_action(MAX_PRESIGNED_UPLOAD_SIZE + 1).await;
+        assert!(
+            action
+                .href
+                .starts_with("http://lfs.example/api/org/project/object/"),
+            "{}",
+            action.href
+        );
+        // The client needs its credentials to upload to the server.
+        let header = action.header.unwrap();
+        assert_eq!(header["authorization"], "Basic dXNlcjp0b2tlbg==");
     }
 }

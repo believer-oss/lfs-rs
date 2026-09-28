@@ -134,6 +134,13 @@ where
     }
 }
 
+/// Whether an object is too big to go in a cache of `max_size` bytes (0 is
+/// unlimited). Caching one close to the cache's size would evict everything
+/// else, and one over it would be written to disk only to be evicted at once.
+fn too_big_to_cache(len: u64, max_size: u64) -> bool {
+    max_size != 0 && len > max_size / 4
+}
+
 /// Returns a future that prunes the least recently used entries that cause the
 /// storage to exceed the given maximum size.
 async fn prune_cache<S>(
@@ -279,6 +286,14 @@ where
         let obj = self.storage.get(&key).await.map_err(Error::from_storage)?;
 
         match obj {
+            Some(obj) if too_big_to_cache(obj.len(), max_size) => {
+                tracing::debug!(
+                    "Not caching {} ({} bytes): too big for the cache",
+                    key,
+                    obj.len()
+                );
+                Ok(Some(obj))
+            }
             Some(obj) => {
                 // Cache the returned LFS object.
                 let (f, a, b) = obj.fanout();
@@ -319,6 +334,19 @@ where
         key: StorageKey,
         value: LFSObject,
     ) -> Result<(), Self::Error> {
+        if too_big_to_cache(value.len(), self.max_size) {
+            tracing::debug!(
+                "Not caching {} ({} bytes): too big for the cache",
+                key,
+                value.len()
+            );
+            return self
+                .storage
+                .put(key, value)
+                .await
+                .map_err(Error::from_storage);
+        }
+
         let lru = self.lru.clone();
         let max_size = self.max_size;
         let cache = self.cache.clone();
@@ -584,6 +612,46 @@ mod tests {
 
         release.notify_one();
         assert!(download.await.unwrap().unwrap());
+    }
+
+    fn object(data: &'static [u8]) -> LFSObject {
+        LFSObject::new(
+            data.len() as u64,
+            Box::pin(stream::once(future::ok(Bytes::from_static(data)))),
+        )
+    }
+
+    fn numbered(n: u8) -> StorageKey {
+        StorageKey::new(
+            Namespace::new("org".into(), "project".into()),
+            Oid::from([n; 32]),
+        )
+    }
+
+    /// Objects over a quarter of the cache go straight to permanent storage,
+    /// both ways, so a huge object can't flush the cache or fill the disk.
+    #[tokio::test]
+    async fn big_objects_bypass_the_cache() {
+        let backend = Backend::new(100, Memory::default(), Memory::default())
+            .await
+            .unwrap();
+        let (small, big) = (numbered(1), numbered(2));
+
+        backend.put(small.clone(), object(&[1; 25])).await.unwrap();
+        backend.put(big.clone(), object(&[2; 26])).await.unwrap();
+
+        assert!(backend.storage.objects.lock().contains_key(&small));
+        assert!(backend.storage.objects.lock().contains_key(&big));
+        assert!(backend.cache.objects.lock().contains_key(&small));
+        assert!(!backend.cache.objects.lock().contains_key(&big));
+
+        // Downloading the big object doesn't cache it either. Caching happens
+        // in the background, so give it a chance to run.
+        let got = backend.get(&big).await.unwrap().unwrap();
+        let data: Vec<Bytes> = got.stream().try_collect().await.unwrap();
+        assert_eq!(data.concat(), [2; 26]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!backend.cache.objects.lock().contains_key(&big));
     }
 
     /// Pruning deletes evicted objects from the cache. Those deletes must not

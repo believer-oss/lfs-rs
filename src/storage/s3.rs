@@ -25,6 +25,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{ProvideCredentials as _, SharedCredentialsProvider};
 use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::{
     complete_multipart_upload::CompleteMultipartUploadError,
     create_multipart_upload::CreateMultipartUploadError,
@@ -37,9 +38,11 @@ use aws_sdk_s3::types::{
 };
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
-use bytes::BytesMut;
+use aws_smithy_types::error::display::DisplayErrorContext;
+use bytes::{Bytes, BytesMut};
 use futures::{TryStreamExt, stream};
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinHandle;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
@@ -51,8 +54,11 @@ use crate::lru;
 use crate::stats::STATS;
 use derive_more::{Display, From};
 use parking_lot::Mutex;
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Poll, ready};
 use std::time::Duration;
 
 #[derive(Debug, From, Display)]
@@ -136,6 +142,14 @@ impl ::std::error::Error for Error {}
 pub const DEFAULT_CREDENTIAL_REFRESH_BUFFER: Duration =
     Duration::from_secs(35 * 60);
 
+/// The size of the parts objects are uploaded in. S3 allows up to 10,000 parts,
+/// so this caps objects at about 1 TB, and at least 5 MiB except for the last.
+/// A multipart upload holds up to two parts in memory.
+pub const DEFAULT_PART_SIZE: usize = 100 * 1024 * 1024;
+
+/// S3's minimum part size, except for the last part.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
 /// Amazon S3 storage backend.
 pub struct Backend {
     /// S3 client.
@@ -162,6 +176,9 @@ pub struct Backend {
 
     /// See [`DEFAULT_CREDENTIAL_REFRESH_BUFFER`]. Zero is the SDK's default.
     credential_refresh_buffer: Duration,
+
+    /// See [`DEFAULT_PART_SIZE`].
+    part_size: usize,
 
     /// Only used to report the credentials' lifetime at startup; the clients
     /// have their own, behind the credential cache.
@@ -294,6 +311,7 @@ impl Backend {
             max_cache_entries,
             credential_refresh_buffer,
             credentials_provider: sdk_config.credentials_provider(),
+            part_size: DEFAULT_PART_SIZE,
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
         }
@@ -367,6 +385,21 @@ impl Backend {
         Ok(())
     }
 
+    /// Sets the size of the parts objects are uploaded in; see
+    /// [`DEFAULT_PART_SIZE`].
+    ///
+    /// # Panics
+    ///
+    /// If `part_size` is less than S3's minimum, [`MIN_PART_SIZE`].
+    pub fn with_part_size(mut self, part_size: usize) -> Self {
+        assert!(
+            part_size >= MIN_PART_SIZE,
+            "S3 parts must be at least {MIN_PART_SIZE} bytes"
+        );
+        self.part_size = part_size;
+        self
+    }
+
     /// Logs how long the credentials last, and warns if that is too short for
     /// the refresh buffer: the SDK would then fetch credentials on almost every
     /// request. This is a sample at startup, not a guarantee; see
@@ -436,6 +469,229 @@ impl Backend {
     }
 }
 
+impl Backend {
+    /// Uploads `value` in parts, reading the next part while the previous one
+    /// uploads. Waits for any part in flight before returning, even on error,
+    /// so that an abort afterwards can't race it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the same error type as `Storage::put`, which it returns"
+    )]
+    async fn upload_parts(
+        &self,
+        path: &str,
+        upload_id: &str,
+        value: LFSObject,
+        in_flight: &InFlight,
+    ) -> Result<Vec<CompletedPart>, Error> {
+        let mut body = value.stream().into_async_read().compat();
+        let mut parts = Vec::new();
+        let mut part_number = 1;
+
+        let result = loop {
+            let chunk = match read_part(&mut body, self.part_size).await {
+                Ok(chunk) => chunk,
+                Err(err) => break Err(Error::Stream(err)),
+            };
+            let last = chunk.len() < self.part_size;
+
+            if let Some(previous) = join_in_flight(in_flight).await {
+                match previous {
+                    Ok(part) => parts.push(part),
+                    Err(err) => break Err(err),
+                }
+            }
+
+            // An object that ends on a part boundary needs no empty last part,
+            // but an empty object needs one part.
+            if chunk.is_empty() && part_number > 1 {
+                break Ok(());
+            }
+
+            *in_flight.lock() = Some(tokio::spawn(upload_part(
+                self.client.clone(),
+                self.bucket.clone(),
+                path.to_string(),
+                upload_id.to_string(),
+                part_number,
+                chunk,
+            )));
+            part_number += 1;
+
+            if last {
+                break Ok(());
+            }
+        };
+
+        // Waited for even on error, so that an abort can't race the part.
+        if let Some(part) = join_in_flight(in_flight).await
+            && result.is_ok()
+        {
+            parts.push(part?);
+        }
+
+        result.map(|()| parts)
+    }
+}
+
+/// A part being uploaded.
+type PartUpload = JoinHandle<Result<CompletedPart, Error>>;
+
+/// The part upload in flight, where [`AbortOnDrop`] can wait for it.
+type InFlight = Arc<Mutex<Option<PartUpload>>>;
+
+/// Aborts a multipart upload when dropped, unless disarmed.
+///
+/// When a client disconnects, hyper drops the request, and `put` with it, so
+/// `put` never sees an error and can't abort the upload itself. Its parts would
+/// otherwise stay in the bucket, billed, until a lifecycle rule removes them.
+struct AbortOnDrop {
+    client: Client,
+    bucket: String,
+    path: String,
+    upload_id: String,
+    in_flight: InFlight,
+    armed: bool,
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Without a runtime the process is exiting; a lifecycle rule has to
+        // clean up.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let part = self.in_flight.lock().take();
+        let client = self.client.clone();
+        let bucket = std::mem::take(&mut self.bucket);
+        let path = std::mem::take(&mut self.path);
+        let upload_id = std::mem::take(&mut self.upload_id);
+        runtime.spawn(async move {
+            // Let the part in flight finish first, or it could be stored after
+            // the abort.
+            if let Some(part) = part {
+                let _ = part.await;
+            }
+            tracing::info!(
+                "Aborting the multipart upload of {path}: the request was \
+                 dropped"
+            );
+            abort_upload(&client, &bucket, &path, &upload_id).await;
+        });
+    }
+}
+
+async fn abort_upload(
+    client: &Client,
+    bucket: &str,
+    path: &str,
+    upload_id: &str,
+) {
+    let abort = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(path)
+        .upload_id(upload_id)
+        .send()
+        .await;
+    match abort {
+        Ok(_) => {}
+        // Already aborted, e.g. by both `put` and its drop guard when `put` was
+        // dropped during its own abort.
+        Err(err)
+            if matches!(
+                err.as_service_error(),
+                Some(AbortMultipartUploadError::NoSuchUpload(_))
+            ) =>
+        {
+            tracing::debug!(
+                "Multipart upload {upload_id} of {path} was already gone"
+            );
+        }
+        Err(err) => tracing::warn!(
+            "Failed to abort multipart upload {upload_id} of {path}; its \
+             parts stay in the bucket until a lifecycle rule removes them: {}",
+            DisplayErrorContext(err)
+        ),
+    }
+}
+
+/// Reads up to `size` bytes, fewer only at the end of the stream.
+async fn read_part<R>(reader: &mut R, size: usize) -> std::io::Result<Bytes>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = BytesMut::with_capacity(size);
+    while buffer.len() < size {
+        let remaining = (size - buffer.len()) as u64;
+        if (&mut *reader).take(remaining).read_buf(&mut buffer).await? == 0 {
+            break;
+        }
+    }
+    Ok(buffer.freeze())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the same error type as `Storage::put`, which it returns"
+)]
+async fn upload_part(
+    client: Client,
+    bucket: String,
+    path: String,
+    upload_id: String,
+    part_number: i32,
+    chunk: Bytes,
+) -> Result<CompletedPart, Error> {
+    let resp = client
+        .upload_part()
+        .bucket(bucket)
+        .key(path)
+        .part_number(part_number)
+        .upload_id(upload_id)
+        .body(ByteStream::new(SdkBody::from(chunk)))
+        .send()
+        .await
+        .map_err(Error::from)?;
+
+    Ok(CompletedPart::builder()
+        .part_number(part_number)
+        .e_tag(resp.e_tag.unwrap_or_default())
+        .build())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the same error type as `Storage::put`, which it returns"
+)]
+/// Waits for the part in flight, if there is one, and empties the slot.
+///
+/// The part stays in the slot until it has finished, so that if `put` is
+/// dropped meanwhile, [`AbortOnDrop`] finds it and waits for it before
+/// aborting. The lock is only held within each poll, never across an await.
+async fn join_in_flight(
+    in_flight: &InFlight,
+) -> Option<Result<CompletedPart, Error>> {
+    std::future::poll_fn(|cx| {
+        let mut slot = in_flight.lock();
+        let Some(part) = slot.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = ready!(Pin::new(part).poll(cx));
+        *slot = None;
+        Poll::Ready(Some(result.unwrap_or_else(|err| {
+            Err(Error::Stream(std::io::Error::other(format!(
+                "part upload failed: {err}"
+            ))))
+        })))
+    })
+    .await
+}
+
 #[async_trait]
 impl Storage for Backend {
     type Error = Error;
@@ -471,91 +727,74 @@ impl Storage for Backend {
         Ok(resp)
     }
 
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    /// Uploads the object as a multipart upload, in parts of `part_size`, so
+    /// that objects over S3's 5 GiB limit for a single PUT can be stored.
+    ///
+    /// The next part is read from the client while the current one uploads,
+    /// so the client keeps sending; a stalled connection can be closed by a
+    /// load balancer's idle timeout. At most one part is in flight, so this
+    /// holds up to two parts in memory.
+    ///
+    /// If anything fails, the upload is aborted, so that the parts already
+    /// sent aren't left in the bucket (and billed).
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self, value)))]
     async fn put(
         &self,
         key: StorageKey,
         value: LFSObject,
     ) -> Result<(), Self::Error> {
-        let (_len, stream) = value.into_parts();
+        let path = self.key_to_path(&key);
 
-        // Create a multipart upload. Use UploadPart and CompleteMultipartUpload
-        // to upload the file.
-        let multipart_upload_resp = self
+        let upload_id = self
             .client
             .create_multipart_upload()
-            .bucket(self.bucket.clone())
-            .key(self.key_to_path(&key))
+            .bucket(&self.bucket)
+            .key(&path)
             .send()
             .await
-            .map_err(Error::from)?;
+            .map_err(Error::from)?
+            .upload_id
+            // Only missing if S3 has a bug.
+            .expect("CreateMultipartUpload returned no upload id");
 
-        // Okay to unwrap. This would only be None there is a bug in S3
-        let upload_id = multipart_upload_resp.upload_id.unwrap();
+        let mut guard = AbortOnDrop {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            path: path.clone(),
+            upload_id: upload_id.clone(),
+            in_flight: InFlight::default(),
+            armed: true,
+        };
 
-        // 100 MB
-        const CHUNK_SIZE: usize = 100 * 1024 * 1024;
+        let result = async {
+            let parts = self
+                .upload_parts(&path, &upload_id, value, &guard.in_flight)
+                .await?;
 
-        let mut buffer = BytesMut::with_capacity(CHUNK_SIZE);
-        let mut part_number = 1;
-        let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> =
-            Vec::new();
-        let mut streaming_body = stream.into_async_read().compat();
-
-        loop {
-            let size = streaming_body.read_buf(&mut buffer).await?;
-
-            if buffer.len() < CHUNK_SIZE && size != 0 {
-                continue;
-            }
-
-            let chunk = buffer.split().freeze();
-
-            let stream = ByteStream::new(SdkBody::from(chunk));
-
-            let upload_part_resp = self
-                .client
-                .upload_part()
-                .bucket(self.bucket.clone())
-                .key(self.key_to_path(&key))
-                .part_number(part_number)
-                .upload_id(upload_id.clone())
-                .body(stream)
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&path)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
                 .send()
                 .await
                 .map_err(Error::from)?;
-
-            completed_parts.push(
-                CompletedPart::builder()
-                    .part_number(part_number)
-                    .e_tag(upload_part_resp.e_tag.unwrap_or_default())
-                    .build(),
-            );
-
-            if size == 0 {
-                // The stream has ended.
-                break;
-            } else {
-                part_number += 1;
-            };
+            Ok(())
         }
+        .await;
 
-        let completed_multipart_upload = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
-            .build();
+        if result.is_err() {
+            // `upload_parts` has already waited for any part in flight.
+            abort_upload(&self.client, &self.bucket, &path, &upload_id).await;
+        }
+        guard.armed = false;
 
-        let _complete_multipart_upload_resp = self
-            .client
-            .complete_multipart_upload()
-            .bucket(self.bucket.clone())
-            .key(self.key_to_path(&key))
-            .multipart_upload(completed_multipart_upload)
-            .upload_id(upload_id)
-            .send()
-            .await
-            .map_err(Error::from)?;
-
-        Ok(())
+        result
     }
 
     #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
@@ -992,6 +1231,176 @@ mod tests {
             let log = lifetime_log(Duration::ZERO).await;
             assert!(log.contains("AWS credentials expire in"), "{log}");
             assert!(!log.contains("WARN"), "{log}");
+        }
+    }
+
+    /// What `abort_upload` logs when S3 answers the abort with `status` and
+    /// `body`.
+    async fn abort_log(status: u16, body: &str) -> String {
+        use std::sync::Mutex as StdMutex;
+        use tracing::instrument::WithSubscriber;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        let config = config().into_builder().endpoint_url(server.uri()).build();
+        let backend = Backend::from_config(
+            &config,
+            "bucket".into(),
+            "lfs".into(),
+            None,
+            false,
+            0,
+            Duration::ZERO,
+        );
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        abort_upload(&backend.client, "bucket", "lfs/key", "upload-1")
+            .with_subscriber(subscriber)
+            .await;
+
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// An upload that is already gone, e.g. aborted twice when `put` is
+    /// dropped during its own abort, is not a failure to warn about.
+    #[tokio::test]
+    async fn aborting_a_gone_upload_is_not_a_warning() {
+        let log = abort_log(
+            404,
+            "<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>",
+        )
+        .await;
+        assert!(!log.contains("WARN"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn failed_aborts_are_warnings() {
+        let log = abort_log(
+            500,
+            "<Error><Code>InternalError</Code><Message>oops</Message></Error>",
+        )
+        .await;
+        assert!(log.contains("WARN"), "{log}");
+    }
+
+    /// Against a fake S3 whose part uploads are slow, so that `put` can be
+    /// dropped while it waits for one.
+    mod dropped_while_waiting {
+        use super::*;
+        use futures::StreamExt;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Instant;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        const PART_UPLOAD_TIME: Duration = Duration::from_secs(2);
+
+        /// Responds as `template`, recording when each request arrived.
+        struct Recorded(Arc<StdMutex<Vec<Instant>>>, ResponseTemplate);
+
+        impl Respond for Recorded {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                self.0.lock().unwrap().push(Instant::now());
+                self.1.clone()
+            }
+        }
+
+        #[tokio::test]
+        async fn abort_waits_for_the_part_in_flight() {
+            let server = MockServer::start().await;
+            let parts = Arc::new(StdMutex::new(Vec::new()));
+            let aborts = Arc::new(StdMutex::new(Vec::new()));
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "<InitiateMultipartUploadResult><Bucket>bucket</\
+                     Bucket><Key>key</Key><UploadId>upload-1</UploadId></\
+                     InitiateMultipartUploadResult>",
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .respond_with(Recorded(
+                    parts.clone(),
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"part\"")
+                        .set_delay(PART_UPLOAD_TIME),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(Recorded(
+                    aborts.clone(),
+                    ResponseTemplate::new(204),
+                ))
+                .mount(&server)
+                .await;
+
+            let config =
+                config().into_builder().endpoint_url(server.uri()).build();
+            let backend = Backend::from_config(
+                &config,
+                "bucket".into(),
+                "lfs".into(),
+                None,
+                false,
+                0,
+                Duration::ZERO,
+            )
+            .with_part_size(MIN_PART_SIZE);
+
+            // Two parts arrive at once, so `put` is soon waiting for part 1
+            // to finish uploading before it can start part 2; then the client
+            // stalls.
+            let data: Vec<std::io::Result<Bytes>> =
+                vec![Ok(Bytes::from(vec![1u8; 2 * MIN_PART_SIZE]))];
+            let stream = stream::iter(data).chain(stream::pending());
+            let object =
+                LFSObject::new(3 * MIN_PART_SIZE as u64, Box::pin(stream));
+
+            let put = backend.put(key(), object);
+            let dropped =
+                tokio::time::timeout(Duration::from_millis(500), put).await;
+            assert!(dropped.is_err(), "put should still have been waiting");
+
+            let deadline = Instant::now() + PART_UPLOAD_TIME * 3;
+            while aborts.lock().unwrap().is_empty() && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let part_started = parts.lock().unwrap()[0];
+            let aborted =
+                *aborts.lock().unwrap().first().expect("never aborted");
+            assert!(
+                aborted.duration_since(part_started) >= PART_UPLOAD_TIME,
+                "aborted {:?} into a {:?} part upload",
+                aborted.duration_since(part_started),
+                PART_UPLOAD_TIME
+            );
         }
     }
 

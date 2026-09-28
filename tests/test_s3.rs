@@ -351,3 +351,178 @@ async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+/// Objects are uploaded to S3 in parts, which is what lets objects over 5 GiB
+/// be stored. With the smallest part size S3 allows, small objects exercise
+/// the same code.
+mod multipart {
+    use super::*;
+    use bytes::Bytes;
+    use futures::{StreamExt, TryStreamExt};
+    use lfs_rs::Oid;
+    use lfs_rs::storage::{
+        LFSObject, MIN_PART_SIZE, Namespace, S3, Storage, StorageKey,
+    };
+    use sha2::Digest;
+
+    const PREFIX: &str = "test_lfs_multipart";
+
+    fn backend(target: &common::S3Target) -> S3 {
+        S3::from_config(
+            &target.config,
+            target.bucket.clone(),
+            PREFIX.into(),
+            None,
+            false,
+            0,
+            std::time::Duration::ZERO,
+        )
+        .with_part_size(MIN_PART_SIZE)
+    }
+
+    fn key(data: &[u8]) -> StorageKey {
+        let oid = Oid::from(sha2::Sha256::digest(data));
+        StorageKey::new(Namespace::new("test".into(), "multipart".into()), oid)
+    }
+
+    /// A key no earlier run used, so that uploads a failed run left open can't
+    /// affect this one.
+    fn unique_key(name: &str) -> StorageKey {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        key(format!("{name} {nanos}").as_bytes())
+    }
+
+    /// `data` as a stream of chunks that don't line up with the parts.
+    fn object(data: &[u8]) -> LFSObject {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = data
+            .chunks(1024 * 1024 + 3)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        LFSObject::new(
+            data.len() as u64,
+            Box::pin(futures::stream::iter(chunks)),
+        )
+    }
+
+    async fn round_trip(len: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(target) = common::s3_target("S3 multipart").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        let mut data = vec![0u8; len];
+        StdRng::seed_from_u64(len as u64).fill(&mut data[..]);
+        let key = key(&data);
+
+        backend.put(key.clone(), object(&data)).await?;
+
+        assert_eq!(backend.size(&key).await?, Some(len as u64));
+        let stored = backend.get(&key).await?.expect("object was not stored");
+        let stored: Vec<Bytes> = stored.stream().try_collect().await?;
+        assert!(stored.concat() == data, "stored object differs");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_with_a_short_part() -> Result<(), Box<dyn std::error::Error>>
+    {
+        round_trip(2 * MIN_PART_SIZE + MIN_PART_SIZE * 2 / 5 + 7).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_on_a_part_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        round_trip(2 * MIN_PART_SIZE).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_object() -> Result<(), Box<dyn std::error::Error>> {
+        round_trip(0).await
+    }
+
+    /// Uploads of `key` still open. Only this key's: tests run in parallel, and
+    /// an earlier failed run may have left others open.
+    async fn open_uploads(
+        target: &common::S3Target,
+        key: &StorageKey,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let path = format!("{PREFIX}/{}/{}", key.namespace(), key.oid().path());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&target.config)
+                .force_path_style(true)
+                .build(),
+        );
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(&target.bucket)
+            .prefix(&path)
+            .send()
+            .await?;
+        Ok(uploads.uploads().len())
+    }
+
+    /// When a client disconnects, hyper drops the request, `put` included,
+    /// so it never sees an error. The upload must still be aborted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_upload_is_aborted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(target) = common::s3_target("S3 multipart drop").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        // A part and a bit, then the client stalls.
+        let first: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from(vec![9u8; MIN_PART_SIZE + 1024 * 1024]))];
+        let stream =
+            futures::stream::iter(first).chain(futures::stream::pending());
+        let object =
+            LFSObject::new((MIN_PART_SIZE * 3) as u64, Box::pin(stream));
+
+        let key = unique_key("dropped upload");
+        let put = backend.put(key.clone(), object);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_secs(3), put).await;
+        assert!(
+            dropped.is_err(),
+            "the upload should still have been waiting"
+        );
+
+        // The abort runs in the background once the part in flight is done.
+        for _ in 0..50 {
+            if open_uploads(&target, &key).await? == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("the dropped upload was left open");
+    }
+
+    /// A failed upload is aborted, so its parts aren't left in the bucket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_upload_is_aborted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Some(target) = common::s3_target("S3 multipart abort").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        // One full part, then the client goes away.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(vec![7u8; MIN_PART_SIZE + 1024 * 1024])),
+            Err(std::io::Error::other("client went away")),
+        ];
+        let key = unique_key("failed upload");
+        let object = LFSObject::new(
+            (MIN_PART_SIZE * 3) as u64,
+            Box::pin(futures::stream::iter(chunks)),
+        );
+        assert!(backend.put(key.clone(), object).await.is_err());
+        assert_eq!(open_uploads(&target, &key).await?, 0, "upload left open");
+        assert_eq!(backend.size(&key).await?, None);
+        Ok(())
+    }
+}
