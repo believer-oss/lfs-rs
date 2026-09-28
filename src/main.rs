@@ -78,7 +78,8 @@ struct GlobalArgs {
     port: u16,
 
     /// Encryption key to use. If not specified, then objects are *not*
-    /// encrypted.
+    /// encrypted. Ignored with --cdn or --s3ta, where objects are transferred
+    /// directly between clients and S3.
     #[clap(long = "key", value_parser = from_hex, env = "RUDOLFS_KEY")]
     key: Option<[u8; 32]>,
 

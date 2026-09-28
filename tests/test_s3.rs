@@ -526,3 +526,63 @@ mod multipart {
         Ok(())
     }
 }
+
+/// With a CDN (or S3TA), objects go straight between clients and S3, so they
+/// can't be encrypted. Objects that still go through the server, such as
+/// uploads over 5 GiB, must not be encrypted either, or they would be served
+/// through the CDN as ciphertext.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_is_ignored_with_a_cdn() -> Result<(), Box<dyn std::error::Error>> {
+    use futures::TryStreamExt;
+    use http_body_util::Full;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    use lfs_rs::storage::{Namespace, S3, Storage, StorageKey};
+    use sha2::Digest;
+
+    let _guard = init_logger();
+    let Some(target) = common::s3_target("S3 CDN with key").await else {
+        return Ok(());
+    };
+    let prefix = "test_lfs_cdn_key";
+
+    let mut server = S3ServerBuilder::new(target.bucket.clone(), Some([7; 32]));
+    server.prefix(prefix.into());
+    server.cdn("https://cdn.example".into());
+    server.sdk_config(target.config.clone());
+    let (server, addr) =
+        server.spawn(SERVER_ADDR, lfs_rs::NoneLs::new()).await?;
+    let server = tokio::spawn(server);
+
+    let data = b"stored as sent".to_vec();
+    let oid = lfs_rs::Oid::from(sha2::Sha256::digest(&data));
+    let request = hyper::Request::put(format!(
+        "http://{addr}/api/test/test/object/{oid}"
+    ))
+    .header("content-length", data.len())
+    .body(Full::new(bytes::Bytes::from(data.clone())))?;
+    let response = Client::builder(TokioExecutor::new())
+        .build_http()
+        .request(request)
+        .await?;
+    assert_eq!(response.status(), 200);
+
+    // Read what is in S3, without decrypting.
+    let raw = S3::from_config(
+        &target.config,
+        target.bucket.clone(),
+        prefix.into(),
+        None,
+        false,
+        0,
+        std::time::Duration::ZERO,
+    );
+    let key =
+        StorageKey::new(Namespace::new("test".into(), "test".into()), oid);
+    let stored = raw.get(&key).await?.expect("object was not stored");
+    let stored: Vec<bytes::Bytes> = stored.stream().try_collect().await?;
+    assert!(stored.concat() == data, "object was stored encrypted");
+
+    server.abort();
+    Ok(())
+}

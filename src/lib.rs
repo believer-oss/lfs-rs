@@ -121,7 +121,8 @@ impl S3ServerBuilder {
         self
     }
 
-    /// Sets the encryption key to use.
+    /// Sets the encryption key to use. It is ignored with a CDN or S3 Transfer
+    /// Acceleration, which transfer objects directly between clients and S3.
     pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
         self
@@ -133,8 +134,8 @@ impl S3ServerBuilder {
         self
     }
 
-    /// Sets the base URL of the CDN to use. This is incompatible with
-    /// encryption since the LFS object is not sent to Rudolfs.
+    /// Sets the base URL of the CDN to use. Objects are then not encrypted,
+    /// even with a key, since they are transferred directly to and from S3.
     pub fn cdn(&mut self, url: String) -> &mut Self {
         self.cdn = Some(url);
         self
@@ -202,18 +203,24 @@ impl S3ServerBuilder {
     > {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
 
-        if self.cdn.is_some() {
+        // With a CDN or S3TA, transfers go straight between clients and S3,
+        // where the server can't encrypt them. Some objects still go through
+        // the server (uploads over 5 GiB, which can't be presigned), and those
+        // must not be encrypted either: they would be served as ciphertext.
+        if self.key.is_some() && (self.cdn.is_some() || self.s3_accelerate) {
             tracing::warn!(
-                "A CDN was specified. Since uploads and downloads do not flow \
-                 through Rudolfs in this case, they will *not* be encrypted."
+                "--key is ignored with --cdn or --s3ta: objects are \
+                 transferred directly between clients and S3, so they are \
+                 stored unencrypted."
             );
+            self.key = None;
+        }
 
-            if self.cache.take().is_some() {
-                tracing::warn!(
-                    "A local disk cache does not work with a CDN and will be \
-                     disabled."
-                );
-            }
+        if self.cdn.is_some() && self.cache.take().is_some() {
+            tracing::warn!(
+                "A local disk cache does not work with a CDN and will be \
+                 disabled."
+            );
         }
 
         let sdk_config = match self.sdk_config {
