@@ -83,8 +83,8 @@ struct GlobalArgs {
     #[clap(long = "key", value_parser = from_hex, env = "RUDOLFS_KEY")]
     key: Option<[u8; 32]>,
 
-    /// Root directory of the object cache. If not specified or if the local
-    /// disk is the storage backend, then no local disk cache will be used.
+    /// Root directory of the object cache, for the s3 backend. If not
+    /// specified, no local disk cache is used. The local backend refuses it.
     #[clap(long = "cache-dir", env = "RUDOLFS_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
 
@@ -122,39 +122,25 @@ fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
     FromHex::from_hex(s)
 }
 
-#[derive(Parser, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Debug)]
 enum LockBackend {
-    /// Starts the server with DynamoDB as the lock backend.
+    /// Locks in DynamoDB.
     #[cfg(feature = "dynamodb")]
-    #[clap(name = "dynamodb")]
+    #[value(name = "dynamodb", alias = "dynamo")]
     DynamoDB,
 
-    /// Starts the server with DynamoDB as the lock backend.
+    /// Locks in Redis.
     #[cfg(feature = "redis")]
-    #[clap(name = "redis")]
+    #[value(name = "redis")]
     Redis,
 
-    /// Starts the server with the local disk as the lock backend.
-    #[clap(name = "local")]
+    /// Locks in a file on the local disk.
+    #[value(name = "local", alias = "localfs")]
     Local,
 
-    /// Default to not supporting locking endpoints
-    #[clap(name = "no-locks")]
+    /// No locking: the locking endpoints are not supported.
+    #[value(name = "no-locks", aliases = ["none", "false"])]
     None,
-}
-
-impl From<&str> for LockBackend {
-    fn from(value: &str) -> Self {
-        match value {
-            "local" | "localfs" => LockBackend::Local,
-            #[cfg(feature = "dynamodb")]
-            "dynamo" | "dynamodb" => LockBackend::DynamoDB,
-            #[cfg(feature = "redis")]
-            "redis" => LockBackend::Redis,
-            "none" | "no-locks" | "false" => LockBackend::None,
-            _ => panic!("Could not parse lock-backend!"),
-        }
-    }
 }
 
 #[derive(Parser, Debug)]
@@ -163,7 +149,6 @@ pub struct LockArgs {
     #[clap(
         long = "lock-backend",
         default_value = "no-locks",
-        value_parser = clap::value_parser!(LockBackend),
         env = "RUDOLFS_LOCK_BACKEND"
     )]
     lock_backend: LockBackend,
@@ -367,17 +352,17 @@ impl LocalArgs {
         global_args: GlobalArgs,
         lock: LockArgs,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Local storage has no disk cache in front of it; say so, rather than
+        // run without the cache that was asked for.
+        if global_args.cache_dir.is_some() {
+            return Err(
+                "--cache-dir is only supported with the s3 backend".into()
+            );
+        }
+
         let mut builder = LocalServerBuilder::new(self.path, global_args.key);
 
         builder.authenticated(global_args.github_auth);
-
-        if let Some(cache_dir) = global_args.cache_dir {
-            let max_cache_size = global_args
-                .max_cache_size
-                .into::<human_size::Byte>()
-                .value() as u64;
-            builder.cache(Cache::new(cache_dir, max_cache_size));
-        }
 
         match lock.lock_backend {
             #[cfg(feature = "dynamodb")]
@@ -436,4 +421,48 @@ async fn main() {
     // `exit` skips destructors, so flush explicitly.
     drop(guard);
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses `--lock-backend value`, with every backend's required argument.
+    fn lock_backend(value: &str) -> Result<LockBackend, clap::Error> {
+        let mut args = vec!["lfs-rs", "--lock-backend", value];
+        args.extend(["--lock-path", "/tmp/locks.json"]);
+        #[cfg(feature = "dynamodb")]
+        args.extend(["--lock-dynamodb-table", "locks"]);
+        #[cfg(feature = "redis")]
+        args.extend(["--lock-redis-uri", "redis://localhost"]);
+        args.extend(["local", "--path", "/tmp/lfs"]);
+
+        let args = Args::try_parse_from(args)?;
+        Ok(args.lock_args.lock_backend)
+    }
+
+    #[test]
+    fn unknown_lock_backends_are_usage_errors() {
+        let err = lock_backend("bogus").expect_err("bogus was accepted");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn lock_backend_names_and_aliases() {
+        for value in ["local", "localfs"] {
+            assert!(matches!(lock_backend(value).unwrap(), LockBackend::Local));
+        }
+        for value in ["no-locks", "none", "false"] {
+            assert!(matches!(lock_backend(value).unwrap(), LockBackend::None));
+        }
+        #[cfg(feature = "dynamodb")]
+        for value in ["dynamodb", "dynamo"] {
+            assert!(matches!(
+                lock_backend(value).unwrap(),
+                LockBackend::DynamoDB
+            ));
+        }
+        #[cfg(feature = "redis")]
+        assert!(matches!(lock_backend("redis").unwrap(), LockBackend::Redis));
+    }
 }

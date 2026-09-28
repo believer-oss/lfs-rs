@@ -115,3 +115,40 @@ async fn index_is_html() -> Result<(), Box<dyn std::error::Error>> {
     server.abort();
     Ok(())
 }
+
+/// The local backend has no disk cache, so it refuses to start with one
+/// rather than run without it.
+#[test]
+fn local_storage_refuses_a_cache_dir() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::TempDir::new()?;
+    let mut server = Command::new(env!("CARGO_BIN_EXE_lfs-rs"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .args(["--host", "127.0.0.1:0", "local", "--path"])
+        .arg(dir.path().join("objects"))
+        .env_remove("RUDOLFS_CACHE_DIR")
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // If it starts, it runs until it's stopped.
+    let started = Instant::now();
+    while server.try_wait()?.is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            server.kill()?;
+            panic!("it started");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = server.wait_with_output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--cache-dir is only supported with the s3 backend"),
+        "{stdout}"
+    );
+    Ok(())
+}

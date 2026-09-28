@@ -316,7 +316,6 @@ impl S3ServerBuilder {
 pub struct LocalServerBuilder {
     path: PathBuf,
     key: Option<[u8; 32]>,
-    cache: Option<Cache>,
     authenticated: bool,
     authentication_server: Option<String>,
 }
@@ -328,7 +327,6 @@ impl LocalServerBuilder {
         Self {
             path,
             key,
-            cache: None,
             authenticated: false,
             authentication_server: None,
         }
@@ -337,16 +335,6 @@ impl LocalServerBuilder {
     /// Sets the encryption key to use.
     pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
-        self
-    }
-
-    /// Sets the cache to use. If not specified, then no local disk cache is
-    /// used. It is uncommon to want to use this when the object storage is
-    /// already local. However, a cache may be useful when the data storage path
-    /// is on a mounted network file system. In such a case, the network file
-    /// system could be slow and the local disk storage could be fast.
-    pub fn cache(&mut self, cache: Cache) -> &mut Self {
-        self.cache = Some(cache);
         self
     }
 
