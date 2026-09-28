@@ -304,15 +304,17 @@ where
                 // server should still continue operating.
                 let cache =
                     cache_and_prune(cache, key.clone(), b, lru, max_size)
-                        .map_err(Error::from_cache);
+                        .map_err(Error::<C::Error, S::Error>::from_cache);
 
-                tokio::spawn(
-                    future::try_join(f.map_err(Error::from_stream), cache)
-                        .map_ok(|((), ())| ())
-                        .map_err(move |err: Self::Error| {
-                            tracing::error!("Error caching {} ({})", key, err);
-                        }),
-                );
+                tokio::spawn(async move {
+                    let (sent, cached) = future::join(f, cache).await;
+                    if let Err(err) = cached {
+                        tracing::error!("Error caching {} ({})", key, err);
+                    }
+                    if let Err(err) = sent {
+                        tracing::debug!("Download of {} stopped: {}", key, err);
+                    }
+                });
 
                 // Send the object from permanent-storage.
                 Ok(Some(a))
@@ -351,6 +353,7 @@ where
         let max_size = self.max_size;
         let cache = self.cache.clone();
 
+        let oid = *key.oid();
         let (f, a, b) = value.fanout();
 
         // Note: We can only cache an object if it is successfully uploaded to
@@ -391,9 +394,16 @@ where
             lru,
             max_size,
         )
-        .map_err(Error::from_cache);
+        .map_err(Error::<C::Error, S::Error>::from_cache);
 
-        future::try_join3(f.map_err(Error::from_stream), cache, store).await?;
+        // The cache is best effort: its failure is logged, and doesn't fail an
+        // upload that permanent storage accepted.
+        let (sent, cached, stored) = future::join3(f, cache, store).await;
+        if let Err(err) = cached {
+            tracing::error!("Error caching {} ({})", oid, err);
+        }
+        stored?;
+        sent.map_err(Error::from_stream)?;
 
         Ok(())
     }
@@ -483,6 +493,8 @@ mod tests {
         objects: parking_lot::Mutex<HashMap<StorageKey, Bytes>>,
         gate: Option<(Arc<Notify>, Arc<Notify>)>,
         delete_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        /// Fail every `put`, as a full or broken disk would.
+        fail_puts: bool,
     }
 
     impl Memory {
@@ -511,7 +523,12 @@ mod tests {
             let data = self.objects.lock().get(key).cloned();
             Ok(data.map(|data| {
                 let len = data.len() as u64;
-                LFSObject::new(len, Box::pin(stream::once(future::ok(data))))
+                // In small chunks, as a real download would arrive.
+                let chunks: Vec<io::Result<Bytes>> = data
+                    .chunks(4)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                LFSObject::new(len, Box::pin(stream::iter(chunks)))
             }))
         }
 
@@ -520,6 +537,9 @@ mod tests {
             key: StorageKey,
             value: LFSObject,
         ) -> Result<(), Self::Error> {
+            if self.fail_puts {
+                return Err(io::Error::other("disk full"));
+            }
             let chunks: Vec<Bytes> = value.stream().try_collect().await?;
             self.objects.lock().insert(key, chunks.concat().into());
             Ok(())
@@ -652,6 +672,40 @@ mod tests {
         assert_eq!(data.concat(), [2; 26]);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!backend.cache.objects.lock().contains_key(&big));
+    }
+
+    fn failing() -> Memory {
+        Memory {
+            fail_puts: true,
+            ..Memory::default()
+        }
+    }
+
+    /// Caching is best effort: a cache that can't store an object must not
+    /// cut the download short.
+    #[tokio::test]
+    async fn cache_failures_dont_affect_downloads() {
+        let key = numbered(3);
+        let backend =
+            Backend::new(1000, failing(), Memory::with(&key, b"from storage"))
+                .await
+                .unwrap();
+
+        let got = backend.get(&key).await.unwrap().unwrap();
+        let data: Vec<Bytes> = got.stream().try_collect().await.unwrap();
+        assert_eq!(data.concat(), b"from storage");
+    }
+
+    /// ...and must not fail an upload that permanent storage accepted.
+    #[tokio::test]
+    async fn cache_failures_dont_affect_uploads() {
+        let key = numbered(4);
+        let backend = Backend::new(1000, failing(), Memory::default())
+            .await
+            .unwrap();
+
+        backend.put(key.clone(), object(b"uploaded")).await.unwrap();
+        assert!(backend.storage.objects.lock().contains_key(&key));
     }
 
     /// Pruning deletes evicted objects from the cache. Those deletes must not
