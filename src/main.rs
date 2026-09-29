@@ -35,8 +35,6 @@ use lfs_rs::DynamoLs;
 use lfs_rs::RedisLs;
 
 mod init_tracing;
-#[cfg(feature = "otel")]
-use tracing::{field, instrument, span};
 
 // Additional help to append to the end when `--help` is specified.
 static AFTER_HELP: &str = include_str!("help.md");
@@ -246,10 +244,6 @@ struct LocalArgs {
 
 impl Args {
     async fn main(self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(feature = "otel")]
-        let server_span =
-            span!(tracing::Level::INFO, "server", local_addr = field::Empty);
-
         tracing::info!("Starting server...");
 
         if !self.global.stats_interval.is_zero() {
@@ -264,9 +258,6 @@ impl Args {
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8080))),
             None => SocketAddr::from(([0, 0, 0, 0], self.global.port)),
         };
-
-        #[cfg(feature = "otel")]
-        server_span.record("local_addr", addr.to_string());
 
         tracing::info!("Initializing storage...");
 
@@ -284,10 +275,6 @@ impl Args {
 }
 
 impl S3Args {
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", name = "s3args.run", skip_all)
-    )]
     async fn run(
         self,
         addr: SocketAddr,
@@ -342,10 +329,6 @@ impl S3Args {
 }
 
 impl LocalArgs {
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", name = "localargs.run", skip_all)
-    )]
     async fn run(
         self,
         addr: SocketAddr,

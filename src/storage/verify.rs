@@ -24,6 +24,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use derive_more::{Display, From};
 use futures::stream::TryStreamExt;
+use tracing::Instrument as _;
 
 use crate::sha256::{Sha256VerifyError, VerifyStream};
 
@@ -101,9 +102,16 @@ where
                             let storage = storage.clone();
                             let key = key.clone();
 
-                            // Delete the corrupted object from storage.
+                            // Delete the corrupted object from storage, in
+                            // a span of its own: in the request's, it would
+                            // keep the request's span going.
+                            let span = tracing::info_span!(
+                                "delete_corrupted",
+                                lfs.oid = %key.oid()
+                            );
                             tokio::spawn(
-                                async move { storage.delete(&key).await },
+                                async move { storage.delete(&key).await }
+                                    .instrument(span),
                             );
 
                             io::Error::other("found corrupted object")

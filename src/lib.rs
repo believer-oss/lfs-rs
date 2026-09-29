@@ -83,6 +83,12 @@ impl Cache {
     }
 }
 
+/// A spawned server, to be awaited on, and the address it listens on.
+type Spawned = Result<
+    (BoxFuture<'static, Result<(), Error>>, SocketAddr),
+    Box<dyn std::error::Error>,
+>;
+
 #[derive(Debug)]
 pub struct S3ServerBuilder {
     bucket: String,
@@ -194,14 +200,15 @@ impl S3ServerBuilder {
 
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", name = "startup", skip_all)
+    )]
     pub async fn spawn(
         mut self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<
-        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Spawned {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
 
         // With a CDN or S3TA, transfers go straight between clients and S3,
@@ -355,14 +362,15 @@ impl LocalServerBuilder {
 
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", name = "startup", skip_all)
+    )]
     pub async fn spawn(
         self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<
-        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Spawned {
         let storage = Disk::new(self.path).map_err(Error::from).await?;
         let storage = Verify::new(match self.key {
             Some(key) => {
@@ -402,6 +410,54 @@ impl LocalServerBuilder {
         server.await?;
         Ok(())
     }
+}
+
+/// `err` and the errors it came from, as `outer: inner: ...`. hyper's errors
+/// only describe themselves.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(err), |err| err.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+/// Whether a connection's error is the client going away (closing or
+/// resetting the connection, or ending a request early) rather than the
+/// server failing. Only for a client connection's own errors: a request's
+/// errors can come from the server's own connections, which fail the same
+/// ways.
+fn client_went_away(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(err) = err.downcast_ref::<hyper::Error>()
+            && (err.is_incomplete_message()
+                || err.is_canceled()
+                || err.is_body_write_aborted())
+        {
+            return true;
+        }
+        if let Some(err) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                err.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+            // An `io::Error`'s `source` skips the error it wraps.
+            if let Some(inner) = err.get_ref()
+                && client_went_away(inner)
+            {
+                return true;
+            }
+        }
+        next = err.source();
+    }
+    false
 }
 
 async fn spawn_server<S, L>(
@@ -484,7 +540,21 @@ where
 
                         let handler = async move {
                             if let Err(err) = conn.await {
-                                tracing::error!("connection error: {}", err);
+                                // The request's own line has already said
+                                // why its service or body failed, or that
+                                // the client went away.
+                                let logged = err
+                                    .downcast_ref::<hyper::Error>()
+                                    .is_some_and(hyper::Error::is_user);
+                                let message = format!(
+                                    "connection error: {}",
+                                    error_chain(&*err)
+                                );
+                                if logged || client_went_away(&*err) {
+                                    tracing::debug!("{message}");
+                                } else {
+                                    tracing::error!("{message}");
+                                }
                             }
                             tracing::debug!("connection dropped: {}", peer_addr);
                         };

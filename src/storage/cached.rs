@@ -30,6 +30,7 @@ use futures::{
     stream::{StreamExt, TryStreamExt},
 };
 use tokio::{self, sync::Mutex};
+use tracing::Instrument as _;
 
 use crate::lru;
 use crate::stats::STATS;
@@ -78,11 +79,19 @@ impl<C, S> Error<C, S> {
     }
 }
 
+// Transparent, like `Display`: the source is the wrapped error's.
 impl<C, S> std::error::Error for Error<C, S>
 where
-    C: fmt::Debug + fmt::Display,
-    S: fmt::Debug + fmt::Display,
+    C: std::error::Error,
+    S: std::error::Error,
 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Cache(x) => x.source(),
+            Error::Storage(x) => x.source(),
+            Error::Stream(x) => x.source(),
+        }
+    }
 }
 
 /// Combines a cache with a permanent storage backend such that if a query to
@@ -306,15 +315,32 @@ where
                     cache_and_prune(cache, key.clone(), b, lru, max_size)
                         .map_err(Error::<C::Error, S::Error>::from_cache);
 
-                tokio::spawn(async move {
-                    let (sent, cached) = future::join(f, cache).await;
-                    if let Err(err) = cached {
-                        tracing::error!("Error caching {} ({})", key, err);
+                tokio::spawn(
+                    async move {
+                        let (sent, cached) = future::join(f, cache).await;
+                        // If reading the object failed, so did the cache's
+                        // copy of it, and the download's error says why.
+                        match (&sent, cached) {
+                            (Err(_), Err(err)) => {
+                                tracing::debug!("Not caching {} ({})", key, err)
+                            }
+                            (Ok(()), Err(err)) => tracing::error!(
+                                "Error caching {} ({})",
+                                key,
+                                err
+                            ),
+                            (_, Ok(())) => {}
+                        }
+                        if let Err(err) = sent {
+                            tracing::debug!(
+                                "Download of {} stopped: {}",
+                                key,
+                                err
+                            );
+                        }
                     }
-                    if let Err(err) = sent {
-                        tracing::debug!("Download of {} stopped: {}", key, err);
-                    }
-                });
+                    .in_current_span(),
+                );
 
                 // Send the object from permanent-storage.
                 Ok(Some(a))
@@ -400,7 +426,15 @@ where
         // upload that permanent storage accepted.
         let (sent, cached, stored) = future::join3(f, cache, store).await;
         if let Err(err) = cached {
-            tracing::error!("Error caching {} ({})", oid, err);
+            // If the upload failed, so did the cache's copy of it, and the
+            // upload's own error says why. A cache that failed by itself (a
+            // full disk, say) during a failed upload is missed here, but not on
+            // the next upload that succeeds.
+            if sent.is_err() || stored.is_err() {
+                tracing::debug!("Not caching {} ({})", oid, err);
+            } else {
+                tracing::error!("Error caching {} ({})", oid, err);
+            }
         }
         stored?;
         sent.map_err(Error::from_stream)?;

@@ -102,7 +102,12 @@ pub fn setup_tracing(
         let tracer = tracer_provider.tracer(CRATE_TARGET);
 
         let subscriber = subscriber
-            .with(OpenTelemetryLayer::new(tracer))
+            .with(
+                // Busy/idle times and thread ids are noise on every span.
+                OpenTelemetryLayer::new(tracer)
+                    .with_tracked_inactivity(false)
+                    .with_threads(false),
+            )
             .with(filter);
         tracing::subscriber::set_global_default(subscriber)?;
 

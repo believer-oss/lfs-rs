@@ -46,6 +46,7 @@ use tokio::task::JoinHandle;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
+use tracing::Instrument as _;
 #[cfg(feature = "otel")]
 use tracing::instrument;
 
@@ -112,7 +113,21 @@ impl From<SdkError<HeadObjectError, HttpResponse>> for Error {
     }
 }
 
-impl ::std::error::Error for Error {}
+// Transparent, like `Display`: the source is the wrapped error's.
+impl ::std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Get(x) => x.source(),
+            Error::Put(x) => x.source(),
+            Error::CreateMultipart(x) => x.source(),
+            Error::Upload(x) => x.source(),
+            Error::CompleteMultipart(x) => x.source(),
+            Error::Head(x) => x.source(),
+            Error::Stream(x) => x.source(),
+            Error::TooLarge(_) => None,
+        }
+    }
+}
 
 /// How long before its credentials expire the S3 clients get new ones, by
 /// default.
@@ -508,14 +523,19 @@ impl Backend {
                 break Ok(());
             }
 
-            *in_flight.lock() = Some(tokio::spawn(upload_part(
-                self.client.clone(),
-                self.bucket.clone(),
-                path.to_string(),
-                upload_id.to_string(),
-                part_number,
-                chunk,
-            )));
+            // The part's span is made when the task first runs, so it needs
+            // this one to be the put's child.
+            *in_flight.lock() = Some(tokio::spawn(
+                upload_part(
+                    self.client.clone(),
+                    self.bucket.clone(),
+                    path.to_string(),
+                    upload_id.to_string(),
+                    part_number,
+                    chunk,
+                )
+                .in_current_span(),
+            ));
             part_number += 1;
 
             if last {
@@ -639,6 +659,16 @@ where
     clippy::result_large_err,
     reason = "the same error type as `Storage::put`, which it returns"
 )]
+#[cfg_attr(
+    feature = "otel",
+    instrument(
+        level = "info",
+        name = "s3.upload_part",
+        skip_all,
+        err(Display),
+        fields(part = part_number, size = chunk.len() as i64)
+    )
+)]
 async fn upload_part(
     client: Client,
     bucket: String,
@@ -696,7 +726,10 @@ async fn join_in_flight(
 impl Storage for Backend {
     type Error = Error;
 
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "info", skip_all, fields(lfs.oid = %key.oid()))
+    )]
     async fn get(
         &self,
         key: &StorageKey,
@@ -737,7 +770,12 @@ impl Storage for Backend {
     ///
     /// If anything fails, the upload is aborted, so that the parts already
     /// sent aren't left in the bucket (and billed).
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self, value)))]
+    #[cfg_attr(feature = "otel", instrument(
+            level = "info",
+            skip_all,
+            fields(lfs.oid = %key.oid(), size = value.len() as i64)
+        )
+    )]
     async fn put(
         &self,
         key: StorageKey,
@@ -797,7 +835,10 @@ impl Storage for Backend {
         result
     }
 
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "debug", skip_all, fields(lfs.oid = %key.oid()))
+    )]
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
         // Check cache first if enabled
         if let Some(cache) = &self.size_cache {
@@ -872,7 +913,10 @@ impl Storage for Backend {
 
     // Upload URL is used for the CDN config and the S3 Transfer Acceleration
     // config.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "debug", skip_all, fields(lfs.oid = %key.oid()))
+    )]
     async fn upload_url(
         &self,
         key: &StorageKey,
@@ -910,7 +954,10 @@ impl Storage for Backend {
     }
 
     // Download URL is only used when S3 Transfer Acceleration is enabled.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(self)))]
+    #[cfg_attr(
+        feature = "otel",
+        instrument(level = "debug", skip_all, fields(lfs.oid = %key.oid()))
+    )]
     async fn download_url(
         &self,
         key: &StorageKey,

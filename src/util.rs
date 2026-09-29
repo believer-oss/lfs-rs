@@ -28,10 +28,6 @@ use futures::TryStreamExt;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-#[cfg(feature = "otel")]
-use core::fmt;
-#[cfg(feature = "otel")]
-use http::HeaderMap;
 use http_body_util::{BodyExt, BodyStream, Full};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
@@ -171,6 +167,8 @@ impl AsyncWrite for NamedTempFile {
     }
 }
 
+/// Reads a request's JSON body. For request bodies only: a failure to read
+/// the body is taken to be the client going away (`ClientAborted`).
 pub async fn from_json<T>(body: Incoming) -> Result<T, Error>
 where
     T: for<'de> Deserialize<'de>,
@@ -178,7 +176,12 @@ where
     let mut buf = Vec::new();
     let mut stream = BodyStream::new(body);
 
-    while let Some(chunk) = stream.try_next().await? {
+    // Reading a request's body only fails when the client stops sending it.
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|err| crate::logger::ClientAborted(err.into()))?
+    {
         if chunk.is_data() {
             buf.extend_from_slice(chunk.into_data().unwrap().as_ref());
         }
@@ -206,22 +209,4 @@ pub fn empty() -> BoxBody {
     Full::new(Bytes::new())
         .map_err(|never| match never {})
         .boxed_unsync()
-}
-
-#[cfg(feature = "otel")]
-pub struct RedactedHeaders(pub HeaderMap);
-
-// Redact the Authorization header.
-#[cfg(feature = "otel")]
-impl fmt::Display for RedactedHeaders {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (key, value) in &self.0 {
-            if key == "authorization" {
-                writeln!(f, "{}: [REDACTED]", key)?;
-            } else {
-                writeln!(f, "{}: {}", key, value.to_str().unwrap_or_default())?;
-            }
-        }
-        Ok(())
-    }
 }

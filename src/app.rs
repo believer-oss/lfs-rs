@@ -21,6 +21,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -52,18 +56,13 @@ use crate::locks::{
     ReleaseLockBatchRequest, ReleaseLockRequest, VerifyLocksRequest,
     VerifyLocksResponse,
 };
+use crate::logger::{BatchSummary, ClientAborted};
 use crate::stats::STATS;
 use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
 use crate::{empty, from_json, full, into_json};
 
 #[cfg(feature = "otel")]
-use crate::util::RedactedHeaders;
-#[cfg(feature = "otel")]
-use opentelemetry::trace::FutureExt;
-#[cfg(feature = "otel")]
 use tracing::instrument;
-#[cfg(feature = "otel")]
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// How long presigned URLs last. git-lfs asks for new URLs once they expire,
 /// and S3 only checks the signature when a transfer starts.
@@ -207,7 +206,6 @@ where
     Error: From<S::Error>,
 {
     /// Handles the index route.
-    #[cfg_attr(feature = "otel", instrument(level = "debug", skip(req)))]
     fn index(req: Req) -> Result<Response<BoxBody>, Error> {
         let template = IndexTemplate {
             title: "Rudolfs",
@@ -221,7 +219,6 @@ where
     }
 
     /// Generates a "404 not found" response.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
     fn not_found(_req: Req) -> Result<Response<BoxBody>, Error> {
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -229,7 +226,6 @@ where
     }
 
     /// Generates a "403 forbidden" response.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
     fn forbidden(_req: Req) -> Result<Response<BoxBody>, Error> {
         Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -251,10 +247,6 @@ where
     }
 
     /// Handles `/api` routes.
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", skip(storage, locks, req))
-    )]
     async fn api(
         storage: S,
         locks: L,
@@ -407,7 +399,7 @@ where
     /// Downloads a single LFS object.
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, _req))
+        instrument(level = "info", skip_all, fields(lfs.oid = %key.oid()))
     )]
     async fn download(
         storage: S,
@@ -441,7 +433,7 @@ where
     /// Uploads a single LFS object.
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, req))
+        instrument(level = "info", skip_all, fields(lfs.oid = %key.oid()))
     )]
     async fn upload(
         storage: S,
@@ -464,25 +456,39 @@ where
             }
         };
 
-        // Verify the SHA256 of the uploaded object as it is being uploaded.
+        // Whether reading the body failed is noted, as the storage stack
+        // doesn't keep its error. Behind a disk cache, a storage failure
+        // can still be followed by the client going away during the next
+        // chunk's read, and is then taken as the client's. The storage's
+        // error is still in the chain, and the window is one chunk.
+        let body_failed = Arc::new(AtomicBool::new(false));
         let body = req.into_body();
         let stream = BodyDataStream::new(body)
             .try_filter_map(|chunk| async { Ok(Some(chunk)) })
             .inspect_ok(|chunk: &Bytes| STATS.uploaded(chunk.len() as u64))
-            .map_err(std::io::Error::other);
+            .map_err({
+                let body_failed = body_failed.clone();
+                move |err| {
+                    body_failed.store(true, Ordering::Relaxed);
+                    std::io::Error::other(err)
+                }
+            });
 
         let object = LFSObject::new(len, Box::pin(stream));
 
-        storage.put(key, object).await?;
+        if let Err(err) = storage.put(key, object).await {
+            let err = Error::from(err);
+            if body_failed.load(Ordering::Relaxed) {
+                return Err(ClientAborted(err).into());
+            }
+            return Err(err);
+        }
 
         Ok(Response::builder().status(StatusCode::OK).body(empty())?)
     }
 
     /// Verifies that an LFS object exists on the server.
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", skip(storage, req))
-    )]
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip_all))]
     async fn verify(
         storage: S,
         req: Request<Incoming>,
@@ -511,7 +517,16 @@ where
     /// https://github.com/git-lfs/git-lfs/blob/master/docs/api/batch.md
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, req))
+        instrument(
+            level = "info",
+            skip_all,
+            fields(
+                lfs.operation,
+                lfs.objects,
+                lfs.objects.presigned,
+                lfs.objects.missing
+            )
+        )
     )]
     async fn batch(
         storage: S,
@@ -523,6 +538,8 @@ where
         let headers = req.headers().clone();
 
         match from_json::<lfs::BatchRequest>(req.into_body()).await {
+            // The client went away: there is no one to answer.
+            Err(err) if err.is::<ClientAborted>() => Err(err),
             Ok(val) => {
                 let operation = val.operation;
 
@@ -551,11 +568,13 @@ where
                 {
                     transfer = Some(lfs::Transfer::LfsRs)
                 }
+                let summary = batch_summary(operation, &objects, &uri);
                 let response = lfs::BatchResponse { transfer, objects };
 
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
+                    .extension(summary)
                     .body(full(into_json(&response)?))?)
             }
             Err(err) => {
@@ -825,6 +844,49 @@ where
     }
 }
 
+/// Sums up a batch response for its request span and log line, and records it
+/// on the batch span. Objects are presigned when their action goes straight to
+/// S3 rather than through this server.
+fn batch_summary(
+    operation: lfs::Operation,
+    objects: &[lfs::ResponseObject],
+    server: &Uri,
+) -> BatchSummary {
+    let server = server.to_string();
+    let presigned = objects
+        .iter()
+        .filter_map(|object| object.actions.as_ref())
+        .filter_map(|actions| {
+            actions.download.as_ref().or(actions.upload.as_ref())
+        })
+        .filter(|action| !action.href.starts_with(&server))
+        .count();
+    let summary = BatchSummary {
+        operation: match operation {
+            lfs::Operation::Upload => "upload",
+            lfs::Operation::Download => "download",
+        },
+        objects: objects.len(),
+        presigned,
+        missing: objects
+            .iter()
+            .filter(|object| object.error.is_some())
+            .count(),
+    };
+
+    // The batch handler's span only exists with `otel`; without it, the
+    // current span is the request's, which records its own.
+    #[cfg(feature = "otel")]
+    {
+        let span = tracing::Span::current();
+        span.record("lfs.operation", summary.operation);
+        span.record("lfs.objects", summary.objects as i64);
+        span.record("lfs.objects.presigned", summary.presigned as i64);
+        span.record("lfs.objects.missing", summary.missing as i64);
+    }
+    summary
+}
+
 async fn basic_response<E, S>(
     uri: Uri,
     headers: &HeaderMap,
@@ -1062,44 +1124,8 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[cfg_attr(
-        feature = "otel",
-        instrument(
-            level = "info",
-            skip(self, req),
-            name = "http.request",
-            fields(
-                method = req.method().as_str(),
-                path = req.uri().path(),
-                query = req.uri().query().unwrap_or_default(),
-                headers
-            )
-        )
-    )]
+    // The request's span is `Logger`'s, which this is called within.
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        #[cfg(feature = "otel")]
-        {
-            let span = tracing::Span::current();
-
-            span.record(
-                "headers",
-                format!("{}", RedactedHeaders(req.headers().clone())),
-            );
-            let ctx = span.context();
-
-            if req.uri().path() == "/" {
-                Box::pin(future::ready(Self::index(req)).with_context(ctx))
-            } else if req.uri().path().starts_with("/api/") {
-                Box::pin(
-                    Self::api(self.storage.clone(), self.locks.clone(), req)
-                        .with_context(ctx),
-                )
-            } else {
-                Box::pin(future::ready(Self::not_found(req)).with_context(ctx))
-            }
-        }
-
-        #[cfg(not(feature = "otel"))]
         if req.uri().path() == "/" {
             Box::pin(future::ready(Self::index(req)))
         } else if req.uri().path().starts_with("/api/") {

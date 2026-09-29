@@ -134,11 +134,16 @@ impl Stats {
         }
     }
 
-    /// A request that failed without a response (the connection was dropped
-    /// or the service errored).
+    /// A request that failed on the server: its service errored, or its
+    /// response body failed partway.
     pub fn failed_request(&self, class: RequestClass) {
         add(&self.requests[class.index()], 1);
         add(&self.server_errors, 1);
+    }
+
+    /// A request the client gave up on before it got a response.
+    pub fn unanswered_request(&self, class: RequestClass) {
+        add(&self.requests[class.index()], 1);
     }
 
     pub fn uploaded(&self, bytes: u64) {

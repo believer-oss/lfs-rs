@@ -148,7 +148,12 @@ impl DynamoLockStore {
         }
     }
 
-    #[instrument(level = "info", err, skip(self), fields(paths = paths.len()))]
+    #[instrument(
+        level = "info",
+        err,
+        skip_all,
+        fields(paths = paths.len() as i64)
+    )]
     async fn get_locks_for_paths(
         &self,
         repo: &str,
@@ -243,7 +248,12 @@ impl DynamoLockStore {
         Ok(all_locks)
     }
 
-    #[instrument(level = "info", err, skip(self), fields(writes = writes.len()))]
+    #[instrument(
+        level = "info",
+        err,
+        skip_all,
+        fields(writes = writes.len() as i64)
+    )]
     async fn write_batch(&self, mut writes: Vec<WriteRequest>) -> Result<()> {
         let mut iterations: u64 = 0;
 
@@ -403,7 +413,7 @@ impl DynamoLockStore {
 impl LockStorage for DynamoLockStore {
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret(level = "debug"))
+        tracing::instrument(level = "info", skip_all, fields(lfs.path = %path))
     )]
     async fn create_lock(
         &self,
@@ -424,7 +434,11 @@ impl LockStorage for DynamoLockStore {
     /// taken after any check made first.
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret(level = "debug"))
+        tracing::instrument(
+            level = "info",
+            skip_all,
+            fields(paths = paths.len() as i64)
+        )
     )]
     async fn create_locks(
         &self,
@@ -470,7 +484,11 @@ impl LockStorage for DynamoLockStore {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(
+            level = "info",
+            skip_all,
+            fields(lfs.path = path.as_deref(), lfs.lock_id = id.as_deref())
+        )
     )]
     async fn list_locks(
         &self,
@@ -552,10 +570,7 @@ impl LockStorage for DynamoLockStore {
         }
     }
 
-    #[cfg_attr(
-        feature = "otel",
-        tracing::instrument(level = "info", skip(self))
-    )]
+    #[cfg_attr(feature = "otel", tracing::instrument(level = "info", skip_all))]
     async fn verify_locks(
         &self,
         repo: String,
@@ -622,7 +637,11 @@ impl LockStorage for DynamoLockStore {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(
+            level = "info",
+            skip_all,
+            fields(lfs.lock_id = %id, force = force.unwrap_or_default())
+        )
     )]
     async fn release_lock(
         &self,
@@ -671,7 +690,14 @@ impl LockStorage for DynamoLockStore {
 
     #[cfg_attr(
         feature = "otel",
-        tracing::instrument(level = "info", skip(self), ret)
+        tracing::instrument(
+            level = "info",
+            skip_all,
+            fields(
+                paths = paths.len() as i64,
+                force = force.unwrap_or_default()
+            )
+        )
     )]
     async fn release_locks(
         &self,

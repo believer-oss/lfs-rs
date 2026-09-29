@@ -24,9 +24,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "otel")]
-use tracing::{Instrument as _, instrument};
-
 use tracing::{Level, event};
 
 type GithubAuthCache = Arc<RwLock<LinkedHashMap<String, AuthCacheEntry>>>;
@@ -266,15 +263,7 @@ where
         self.service.poll_ready(cx)
     }
 
-    #[cfg_attr(
-        feature = "otel",
-        instrument(
-            name = "auth.call",
-            level = "debug",
-            skip_all,
-            fields(authenticated, cache.entries, server)
-        )
-    )]
+    // Called within the request's span; `authorize` has its own.
     fn call(&mut self, mut req: Req) -> Self::Future {
         tracing::debug!("checking auth for {}", &req.uri());
 
@@ -287,18 +276,12 @@ where
                 return Box::pin(self.service.call(req));
             }
         };
-        #[cfg(feature = "otel")]
-        tracing::Span::current().record("authenticated", true);
 
         let mut service = self.service.clone();
 
         let cache = Arc::clone(&self.cache);
-        #[cfg(feature = "otel")]
-        tracing::Span::current().record("cache.entries", cache.read().len());
 
         let server = self.server.clone();
-        #[cfg(feature = "otel")]
-        tracing::Span::current().record("server", &server);
 
         let auth_fut = async move {
             let mut parts =
@@ -346,9 +329,6 @@ where
             response.extensions_mut().insert(user);
             Ok(response)
         };
-
-        #[cfg(feature = "otel")]
-        let auth_fut = auth_fut.instrument(tracing::info_span!("auth"));
 
         Box::pin(auth_fut)
     }
