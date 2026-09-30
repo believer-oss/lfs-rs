@@ -11,7 +11,6 @@ use tokio::{
 };
 
 use crate::lfs::Oid;
-use hex::FromHex;
 
 use super::{
     ListLocksResponse, Lock, LockBatch, LockFailure, LockStorage,
@@ -184,11 +183,7 @@ impl LocalFsLockFile {
                     .remove(&path_key)
                     .context("could not find the oid to delete")?;
             } else {
-                bail!(
-                    "lock owner {}, but unlocking with {} and not forced",
-                    owner,
-                    o.name
-                )
+                bail!(super::held_by_another(&o.name, &owner))
             }
         } else {
             bail!("lock with no owner!")
@@ -272,10 +267,8 @@ impl LockStorage for LocalFsLockStore {
         {
             let mut lockfile =
                 self.lockfile.lock().expect("couldnt aquire lock, poisoned");
-            match lockfile.locks.contains_key(&key) {
-                true => bail!("lock exists"),
-                false => lockfile.add_entry(key, path_key, lock.clone())?,
-            }
+            // This reports a conflict with the lock that holds the path.
+            lockfile.add_entry(key, path_key, lock.clone())?;
         }
         self.save_store().await?;
         Ok(lock)
@@ -343,7 +336,7 @@ impl LockStorage for LocalFsLockStore {
         if let Some(id) = id {
             // if we're passed an id, look it up and return the single lock.
             // Path shouldn't matter?
-            let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
+            let oid = super::parse_lock_id(&id)?;
             let key = LocalFsKey::new_from_oid(&repo, &oid);
 
             {
@@ -351,17 +344,16 @@ impl LockStorage for LocalFsLockStore {
                     .lockfile
                     .lock()
                     .expect("couldnt acquire lock, poisoned");
-                match lockfile.locks.get(&key) {
-                    Some(lock) => {
-                        locks = vec![lock.clone()];
-
-                        return Ok(ListLocksResponse {
-                            locks,
-                            next_cursor: None,
-                        });
-                    }
-                    None => bail!("couldn't find key"),
-                }
+                // No lock is an empty list, as the locking API says.
+                return Ok(ListLocksResponse {
+                    locks: lockfile
+                        .locks
+                        .get(&key)
+                        .cloned()
+                        .into_iter()
+                        .collect(),
+                    next_cursor: None,
+                });
             }
         } else if let Some(path) = path {
             let path_key = LocalFsPathKey::new(&repo, &path);
@@ -385,7 +377,7 @@ impl LockStorage for LocalFsLockStore {
                             .clone(),
                     ]
                 }
-                None => bail!("could not find lock for path"),
+                None => locks = vec![],
             }
         } else {
             // If we don't get an id or path, we return them all...
@@ -445,7 +437,7 @@ impl LockStorage for LocalFsLockStore {
         id: String,
         force: Option<bool>,
     ) -> Result<Lock> {
-        let oid = Oid::from(<[u8; 32]>::from_hex(id)?);
+        let oid = super::parse_lock_id(&id)?;
         let key = LocalFsKey::new_from_oid(&repo, &oid);
 
         let mut lockfile = self

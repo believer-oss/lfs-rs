@@ -86,96 +86,42 @@ const _: () = assert!(
 /// uploaded through the server, which sends them to S3 in parts.
 const MAX_PRESIGNED_UPLOAD_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
+/// The response to a lock store's error: one the client can act on for its
+/// own mistakes, and otherwise the error back, for `Logger` to answer as the
+/// server failing.
+fn handle_lock_error_response(
+    err: anyhow::Error,
+) -> Result<(StatusCode, BoxBody), Error> {
+    let lock_error = |status, message: String, locks| {
+        let body = into_json(&lfs::BatchResponseError {
+            locks,
+            message,
+            documentation_url: None,
+            request_id: None,
+        })
+        .unwrap_or_default();
+        Ok((status, full(body)))
+    };
     match err.downcast_ref::<LockStoreError>() {
-        Some(e @ LockStoreError::CreateConflict(l)) => (
-            StatusCode::CONFLICT,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: Some(l.clone()),
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::NotImplemented) => {
-            (StatusCode::NOT_FOUND, empty())
+        Some(e @ LockStoreError::CreateConflict(l)) => {
+            lock_error(StatusCode::CONFLICT, e.to_string(), Some(l.clone()))
         }
-        #[cfg(feature = "redis")]
-        Some(LockStoreError::RedisError(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::DeleteNotFound(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::LockNotFound(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::BadRequest(e)) => (
-            StatusCode::BAD_REQUEST,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::InternalServerError(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: err.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
+        Some(LockStoreError::NotImplemented) => {
+            Ok((StatusCode::NOT_FOUND, empty()))
+        }
+        Some(
+            e @ (LockStoreError::DeleteNotFound(_)
+            | LockStoreError::LockNotFound(_)),
+        ) => lock_error(StatusCode::NOT_FOUND, e.to_string(), None),
+        Some(e @ LockStoreError::BadRequest(_)) => {
+            lock_error(StatusCode::BAD_REQUEST, e.to_string(), None)
+        }
+        Some(e @ LockStoreError::Forbidden(_)) => {
+            lock_error(StatusCode::FORBIDDEN, e.to_string(), None)
+        }
+        // The store failed: a Redis or DynamoDB error, or a file it couldn't
+        // write.
+        _ => Err(err),
     }
 }
 
@@ -630,7 +576,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -675,7 +621,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -711,7 +657,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -750,7 +696,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -795,7 +741,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -830,7 +776,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -1158,6 +1104,39 @@ mod tests {
     use super::*;
     use crate::storage::StorageStream;
     use async_trait::async_trait;
+
+    #[test]
+    fn lock_errors_are_answered_for_what_they_are() {
+        let status = |err: LockStoreError| {
+            handle_lock_error_response(anyhow::anyhow!(err))
+                .map(|(status, _)| status)
+                .ok()
+        };
+        assert_eq!(
+            status(crate::locks::held_by_another("alice", "bob")),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(LockStoreError::LockNotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            status(LockStoreError::DeleteNotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            status(LockStoreError::BadRequest("x".into())),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        // The store failing is left to `Logger`, which answers with a 503.
+        assert_eq!(
+            status(LockStoreError::InternalServerError("x".into())),
+            None
+        );
+        assert!(
+            handle_lock_error_response(anyhow::anyhow!("disk full")).is_err()
+        );
+    }
 
     /// A store that presigns every upload and holds nothing.
     struct Presigning;

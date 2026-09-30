@@ -81,3 +81,57 @@ async fn locking_without_a_github_username_is_forbidden()
     server.abort();
     Ok(())
 }
+
+/// The local store says which of a client's mistakes it made, so that the
+/// server can answer them as the client's.
+#[tokio::test]
+async fn local_lock_mistakes_are_classified()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lfs_rs::{LockStorage, LockStoreError};
+
+    let dir = tempfile::TempDir::new()?;
+    let locks = lfs_rs::LocalLs::new(dir.path().join("locks.json")).await?;
+    let repo = "test/classified".to_string();
+
+    let lock = locks
+        .create_lock(repo.clone(), "a.bin".into(), "alice".into())
+        .await?;
+    let err = locks
+        .create_lock(repo.clone(), "a.bin".into(), "bob".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref(), Some(LockStoreError::CreateConflict(_))),
+        "{err}"
+    );
+
+    let err = locks
+        .release_lock(repo.clone(), "bob".into(), lock.id.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref(), Some(LockStoreError::Forbidden(_))),
+        "{err}"
+    );
+    assert!(err.to_string().contains("held by alice, not bob"), "{err}");
+
+    // No lock is an empty list, as the locking API says, by path or id.
+    let listed = locks
+        .list_locks(repo.clone(), Some("b.bin".into()), None, None, None)
+        .await?;
+    assert!(listed.locks.is_empty());
+    let listed = locks
+        .list_locks(repo.clone(), None, Some("c".repeat(64)), None, None)
+        .await?;
+    assert!(listed.locks.is_empty());
+
+    let err = locks
+        .release_lock(repo, "alice".into(), "not-an-id".into(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref(), Some(LockStoreError::BadRequest(_))),
+        "{err}"
+    );
+    Ok(())
+}

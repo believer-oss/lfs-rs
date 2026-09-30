@@ -61,7 +61,7 @@ async fn locks_are_scoped_to_their_repo()
     let listed = locks
         .list_locks(other.clone(), None, Some(lock.id.clone()), None, None)
         .await;
-    assert!(listed.is_err(), "listed another repo's lock by id");
+    assert!(listed?.locks.is_empty(), "listed another repo's lock by id");
 
     let released = locks
         .release_lock(

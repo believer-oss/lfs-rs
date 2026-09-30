@@ -210,3 +210,47 @@ async fn bad_cursors_and_limits_are_handled()
         .await?;
     Ok(())
 }
+
+/// Releasing another user's lock without forcing it is refused, and leaves
+/// the lock. A lock can be listed by its id, and only it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn locks_are_released_by_their_owner_and_listed_by_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lfs_rs::{LockStorage, LockStoreError};
+
+    let Some(locks) = dynamo("DynamoDB release", "release").await? else {
+        return Ok(());
+    };
+    let repo = "test/release".to_string();
+
+    let lock = locks
+        .create_lock(repo.clone(), "a.bin".into(), "alice".into())
+        .await?;
+    locks
+        .create_lock(repo.clone(), "b.bin".into(), "alice".into())
+        .await?;
+
+    let listed = locks
+        .list_locks(repo.clone(), None, Some(lock.id.clone()), None, None)
+        .await?;
+    assert_eq!(listed.locks.len(), 1);
+    assert_eq!(listed.locks[0].id, lock.id);
+
+    let err = locks
+        .release_lock(repo.clone(), "bob".into(), lock.id.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.downcast_ref(), Some(LockStoreError::Forbidden(_))),
+        "{err}"
+    );
+    let listed = locks
+        .list_locks(repo.clone(), Some("a.bin".into()), None, None, None)
+        .await?;
+    assert_eq!(owner_of(&listed), Some("alice"), "the lock was released");
+
+    locks
+        .release_lock(repo.clone(), "bob".into(), lock.id, Some(true))
+        .await?;
+    Ok(())
+}

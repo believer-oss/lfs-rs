@@ -498,6 +498,37 @@ impl LockStorage for DynamoLockStore {
         cursor: Option<String>,
         limit: Option<u64>,
     ) -> Result<ListLocksResponse> {
+        // A lock by its id, from the index by id: at most one, so no paging.
+        if let Some(id) = id {
+            let output = self
+                .client
+                .query()
+                .table_name(self.table_name.clone())
+                .index_name("id-index")
+                .projection_expression("id, #path, locked_at, #owner")
+                .expression_attribute_names("#path", "path")
+                .expression_attribute_names("#owner", "owner")
+                .key_condition_expression("repo = :repo and id = :id")
+                .expression_attribute_values(":repo", AttributeValue::S(repo))
+                .expression_attribute_values(":id", AttributeValue::S(id))
+                .send()
+                .await?;
+            let locks = output
+                .items()
+                .iter()
+                .map(lock_from_item)
+                .collect::<Result<Vec<Lock>>>()?
+                .into_iter()
+                .filter(|lock| {
+                    path.as_ref().is_none_or(|path| &lock.path == path)
+                })
+                .collect();
+            return Ok(ListLocksResponse {
+                locks,
+                next_cursor: None,
+            });
+        }
+
         let mut request = self
             .client
             .query()
@@ -554,7 +585,7 @@ impl LockStorage for DynamoLockStore {
                     .list_locks(
                         repo.clone(),
                         path.clone(),
-                        id,
+                        None,
                         next_cursor,
                         limit,
                     )
@@ -670,17 +701,20 @@ impl LockStorage for DynamoLockStore {
         if let Some(item) = output.items().first() {
             let lock = lock_from_item(item)?;
 
-            if lock.owner.as_ref().is_some_and(|o| o.name == owner)
-                || force.unwrap_or(false)
-            {
-                self.client
-                    .delete_item()
-                    .table_name(self.table_name.clone())
-                    .key("repo", AttributeValue::S(repo))
-                    .key("path", AttributeValue::S(lock.path.clone()))
-                    .send()
-                    .await?;
+            let holder = lock.owner.as_ref().map(|o| o.name.as_str());
+            if holder != Some(owner.as_str()) && !force.unwrap_or(false) {
+                bail!(super::held_by_another(
+                    holder.unwrap_or("no one"),
+                    &owner
+                ));
             }
+            self.client
+                .delete_item()
+                .table_name(self.table_name.clone())
+                .key("repo", AttributeValue::S(repo))
+                .key("path", AttributeValue::S(lock.path.clone()))
+                .send()
+                .await?;
 
             Ok(lock)
         } else {

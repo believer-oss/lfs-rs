@@ -1,5 +1,4 @@
 use futures::TryStreamExt;
-use hex::FromHex;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, FromRedisValue, ParsingError, from_redis_value};
 use std::sync::LazyLock;
@@ -183,9 +182,7 @@ impl RedisLockStore {
 
         match &lock.owner {
             Some(o) if o.name == owner || force => {}
-            Some(o) => {
-                bail!("lock held by {}, not {owner}, and not forced", o.name)
-            }
+            Some(o) => bail!(super::held_by_another(&o.name, owner)),
             None => bail!("lock with no owner!"),
         }
 
@@ -268,10 +265,11 @@ impl LockStorage for RedisLockStore {
 
         let locks = if let Some(id) = id {
             // Reject anything that isn't an id before using it as a key.
-            let id = Oid::from(<[u8; 32]>::from_hex(id)?).to_string();
+            let id = super::parse_lock_id(&id)?.to_string();
             match Self::get_repo_lock(&mut con, &repo, &id).await? {
                 Some(lock) => vec![lock],
-                None => bail!(Error::LockNotFound(id)),
+                // No lock is an empty list, as the locking API says.
+                None => vec![],
             }
         } else if let Some(path) = path {
             let id: Option<String> = con.get(path_key(&repo, &path)).await?;
@@ -281,7 +279,7 @@ impl LockStorage for RedisLockStore {
             };
             match lock {
                 Some(lock) => vec![lock],
-                None => bail!(Error::LockNotFound(path)),
+                None => vec![],
             }
         } else {
             Self::repo_locks(&mut con, &repo).await?
@@ -322,7 +320,7 @@ impl LockStorage for RedisLockStore {
         id: String,
         force: Option<bool>,
     ) -> Result<Lock> {
-        let id = Oid::from(<[u8; 32]>::from_hex(id)?).to_string();
+        let id = super::parse_lock_id(&id)?.to_string();
         let mut con = self.connection().await?;
         Self::release(&mut con, &repo, &owner, &id, force.unwrap_or(false))
             .await

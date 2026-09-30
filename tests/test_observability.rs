@@ -62,7 +62,7 @@ struct Observed {
     spans: InMemorySpanExporter,
     logs: Arc<Mutex<Vec<u8>>>,
     _provider: SdkTracerProvider,
-    _data: tempfile::TempDir,
+    data: tempfile::TempDir,
     _mock: MockServer,
     _guard: tracing::subscriber::DefaultGuard,
 }
@@ -185,7 +185,7 @@ async fn observed_with(
         spans,
         logs,
         _provider: provider,
-        _data: data,
+        data,
         _mock: mock,
         _guard: guard,
     })
@@ -435,31 +435,81 @@ async fn aborts_are_marked() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A 5xx response marks the request's span as an error.
+/// A lock request's body.
+fn lock_request(path: &str) -> String {
+    format!(r#"{{"path": "{path}", "ref": {{"name": "refs/heads/main"}}}}"#)
+}
+
+/// A lock store that fails is the server failing: a 503 that doesn't say why,
+/// and an error in the log that does.
 #[tokio::test]
-async fn server_errors_are_errors() -> Result<(), Box<dyn std::error::Error>> {
+async fn lock_store_failures_are_server_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
     let server = observed().await?;
-
-    // Releasing a lock that doesn't exist is a 500.
+    let locks = "/api/test/test/locks";
     let (status, _) = server
-        .request("POST", "/api/test/test/locks/nonexistent/unlock", b"{}")
+        .request("POST", locks, lock_request("a.bin").as_bytes())
         .await?;
-    assert_eq!(status, 500);
+    assert_eq!(status, 201);
 
-    let root = server
-        .root("POST /api/{org}/{project}/locks/{id}/unlock")
-        .await;
-    assert!(
-        matches!(root.status, Status::Error { .. }),
-        "{:?}",
-        root.status
-    );
-    assert_eq!(
-        attr(&root, "http.response.status_code"),
-        Some(Value::I64(500))
-    );
-    let line = line_for(&server.logs(), &root);
-    assert!(line.contains(" WARN "), "{line}");
+    // Make the lock file one the store can't write.
+    let file = server.data.path().join("locks");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444))?;
+    if std::fs::OpenOptions::new().write(true).open(&file).is_ok() {
+        eprintln!("skipping: running as a user that can write any file");
+        return Ok(());
+    }
+
+    let (status, body) = server
+        .request("POST", locks, lock_request("b.bin").as_bytes())
+        .await?;
+    assert_eq!(status, 503);
+    let body = String::from_utf8_lossy(&body);
+    assert!(!body.contains("denied"), "{body}");
+
+    server.closed(2).await;
+    let logs = server.logs();
+    let line = logs
+        .lines()
+        .find(|line| line.contains(" status=503 "))
+        .unwrap_or_else(|| panic!("no 503 in:\n{logs}"));
+    assert!(line.contains(" ERROR "), "{line}");
+    assert!(line.contains("Permission denied"), "{line}");
+    Ok(())
+}
+
+/// Lock requests a retry can't fix are answered as the client's mistakes.
+#[tokio::test]
+async fn lock_mistakes_are_the_clients()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = observed().await?;
+    let locks = "/api/test/test/locks";
+    let lock = lock_request("a.bin");
+
+    let (status, _) = server.request("POST", locks, lock.as_bytes()).await?;
+    assert_eq!(status, 201);
+    // Locking it again conflicts, and says with what.
+    let (status, body) = server.request("POST", locks, lock.as_bytes()).await?;
+    assert_eq!(status, 409);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["lock"]["path"], "a.bin", "{body}");
+
+    // Releasing a lock that doesn't exist.
+    let missing = format!("{locks}/{}/unlock", "c".repeat(64));
+    let (status, _) = server.request("POST", &missing, b"{}").await?;
+    assert_eq!(status, 404);
+
+    // A lock id that isn't one.
+    let bad = format!("{locks}/nonexistent/unlock");
+    let (status, _) = server.request("POST", &bad, b"{}").await?;
+    assert_eq!(status, 400);
+
+    server.closed(4).await;
+
+    assert!(!server.logs().contains(" ERROR "), "{}", server.logs());
+    assert!(!server.logs().contains(" WARN  lfs_rs::logger"));
     Ok(())
 }
 

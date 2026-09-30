@@ -34,6 +34,10 @@ pub enum LockStoreError {
     /// A request the client should not have made, such as a bad cursor.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// A request the client isn't allowed to make, such as releasing
+    /// another user's lock without forcing it.
+    #[error("{0}")]
+    Forbidden(String),
     #[cfg(feature = "redis")]
     #[error("redis error: {0}")]
     RedisError(#[from] ::redis::RedisError),
@@ -292,4 +296,24 @@ where
     ) -> Result<LockBatch> {
         self.as_ref().release_locks(repo, owner, ids, force).await
     }
+}
+
+/// Parses a client's lock id, which is an OID in hex. One that isn't is a
+/// [`LockStoreError::BadRequest`].
+pub(crate) fn parse_lock_id(id: &str) -> Result<crate::lfs::Oid> {
+    use hex::FromHex;
+
+    let bytes = <[u8; 32]>::from_hex(id).map_err(|_| {
+        anyhow::anyhow!(LockStoreError::BadRequest(format!(
+            "invalid lock id '{id}'"
+        )))
+    })?;
+    Ok(crate::lfs::Oid::from(bytes))
+}
+
+/// The message for releasing `holder`'s lock as `owner`, without forcing it.
+pub(crate) fn held_by_another(holder: &str, owner: &str) -> LockStoreError {
+    LockStoreError::Forbidden(format!(
+        "lock is held by {holder}, not {owner}; use --force to release it"
+    ))
 }
