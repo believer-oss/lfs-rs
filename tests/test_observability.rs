@@ -673,20 +673,26 @@ async fn github_failures_are_server_errors()
     })
     .await?;
 
-    // The request fails without a response: hyper closes the connection.
+    // Answered with a 503 that says only which trace to look at.
     let mut response = Vec::new();
     server
         .send("GET", "/api/test/test/locks", b"")
         .await?
         .read_to_end(&mut response)
         .await?;
-    assert!(
-        response.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&response)
+    let head = String::from_utf8_lossy(&response).to_lowercase();
+    assert!(head.contains("\r\nretry-after: 5\r\n"), "{head}");
+    let (status, body) = parse(&response);
+    assert_eq!(status, 503);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["message"],
+        "The server failed to handle the request; try again"
     );
 
     let root = server.root("GET /api/{org}/{project}/locks").await;
+    let trace_id = root.span_context.trace_id().to_string();
+    assert_eq!(body["request_id"], trace_id.as_str());
     assert!(
         matches!(root.status, Status::Error { .. }),
         "{:?}",
@@ -694,7 +700,7 @@ async fn github_failures_are_server_errors()
     );
     let line = line_for(&server.logs(), &root);
     assert!(line.contains(" ERROR "), "{line}");
-    assert!(line.contains("outcome=\"error\""), "{line}");
+    assert!(line.contains(" status=503 "), "{line}");
     // The cause is in the line, not just the outermost error. GitHub's
     // connection is closed or reset, depending on timing.
     assert!(line.contains("SendRequest): connection"), "{line}");
@@ -720,5 +726,63 @@ async fn aborted_batches_are_unanswered()
     assert!(line.contains(" INFO "), "{line}");
     assert!(line.contains("outcome=\"aborted\""), "{line}");
     assert!(!line.contains(" status="), "{line}");
+    Ok(())
+}
+
+/// A request whose JSON doesn't parse is answered with a 400 saying why, not
+/// dropped as a server error.
+#[tokio::test]
+async fn malformed_json_is_a_bad_request()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = observed().await?;
+
+    for path in ["/api/test/test/locks", "/api/test/test/objects/batch"] {
+        let (status, body) = server.request("POST", path, b"{not json").await?;
+        assert_eq!(status, 400, "{path}");
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("key must be a string"), "{path}: {body}");
+    }
+
+    let root = server.root("POST /api/{org}/{project}/locks").await;
+    assert_eq!(root.status, Status::Unset);
+    let line = line_for(&server.logs(), &root);
+    assert!(line.contains(" INFO "), "{line}");
+    assert!(line.contains("key must be a string"), "{line}");
+    Ok(())
+}
+
+/// An upload that doesn't match its OID is the client's mistake: a 400 that
+/// says so, and nothing stored. That includes S3 behind a disk cache.
+#[tokio::test]
+async fn mismatched_uploads_are_bad_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut backends = vec![None];
+    if let Some(s3) = common::s3_target("mismatched S3 uploads").await {
+        backends.push(Some(s3));
+    }
+    for s3 in backends {
+        let backend = if s3.is_some() { "S3" } else { "local" };
+        let server = observed_with(Options {
+            s3,
+            ..Options::default()
+        })
+        .await?;
+
+        let path = format!("/api/test/test/object/{}", "b".repeat(64));
+        let (status, body) = server.request("PUT", &path, &[7u8; 1000]).await?;
+        assert_eq!(status, 400, "{backend}");
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("expected SHA256"), "{backend}: {body}");
+
+        let root = server.root("PUT /api/{org}/{project}/object/{oid}").await;
+        let line = line_for(&server.logs(), &root);
+        assert!(line.contains(" INFO "), "{backend}: {line}");
+        assert!(!server.logs().contains(" ERROR "), "{backend}");
+
+        let (status, _) = server.request("GET", &path, b"").await?;
+        assert_eq!(status, 404, "{backend}: the object was stored");
+    }
     Ok(())
 }

@@ -84,10 +84,11 @@ Verify( Verify(Encrypted(Cached(Disk, S3))) | Verify(Cached(Disk, S3)) )
 ```
 
 Rules about the order:
-- `Verify` checks the SHA256 against the OID, so it has to sit outside
-  `Encrypted` because it needs plaintext. When a download fails
-  verification, `Verify` deletes the object from the layer below. That is
-  how corrupted cache entries get cleaned up.
+- `Verify` checks downloads' SHA256 against the OID, so it has to sit
+  outside `Encrypted` because it needs plaintext. When a download fails
+  verification, `Verify` deletes the object from the layer below. That is how
+  corrupted cache entries get cleaned up. Uploads are checked by the upload
+  handler in `app.rs`, which answers a mismatch with a 400.
 - `Cached` keeps an in-memory LRU (`src/lru.rs`) of the disk cache. The LRU
   is rebuilt from `list()` at startup and pruned down to `--max-cache-size`.
   On a cache miss, `LFSObject::fanout` streams the object to the client and

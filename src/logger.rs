@@ -30,11 +30,11 @@ use core::task::{Context, Poll, ready};
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
-use http::{Method, StatusCode, Uri, header};
+use http::{HeaderValue, Method, StatusCode, Uri, header};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response};
@@ -44,7 +44,9 @@ use tracing::{Instrument, Span};
 
 use crate::app::BoxBody;
 use crate::auth::UserRepoInfo;
+use crate::error::{BadRequest, ClientAborted, find};
 use crate::stats::{RequestClass, STATS};
+use crate::{full, into_json, lfs};
 
 /// What a batch request asked for, put on its response by the batch handler
 /// for the request span and log line.
@@ -135,36 +137,6 @@ fn client_address(req: &Request<Incoming>, peer: SocketAddr) -> String {
         .unwrap_or_else(|| peer.ip().to_string())
 }
 
-/// The client stopped sending a request's body partway. Handlers return this
-/// rather than whatever their storage made of the body ending, so that the
-/// request is logged as the client going away and not as the server failing.
-///
-/// Only a request's own body can say this: a request's errors can also come
-/// from the server's own connections (to GitHub, or S3), which fail in the
-/// same ways.
-#[derive(Debug)]
-pub struct ClientAborted(pub anyhow::Error);
-
-impl fmt::Display for ClientAborted {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("the client stopped sending the request body")
-    }
-}
-
-impl std::error::Error for ClientAborted {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        let err: &(dyn std::error::Error + Send + Sync + 'static) =
-            self.0.as_ref();
-        Some(err)
-    }
-}
-
-/// Whether `err`, or an error it came from, is [`ClientAborted`].
-fn is_client_abort(err: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(err), |err| err.source())
-        .any(|err| err.is::<ClientAborted>())
-}
-
 impl<S> Service<Request<Incoming>> for Logger<S>
 where
     S: Service<Request<Incoming>, Response = Response<BoxBody>>,
@@ -194,40 +166,31 @@ where
         // `GET /` is the health check: no span, and only a debug line unless
         // it fails, as it would otherwise be most of both.
         if class == RequestClass::Health {
-            return Box::pin(self.service.call(req).inspect(move |response| {
-                #[cfg(feature = "otel")]
-                let elapsed = start.elapsed();
-                match response {
-                    Ok(response) => {
-                        let status = response.status();
-                        #[cfg(feature = "otel")]
-                        metrics::record(
-                            class,
-                            &method,
-                            Some(status),
-                            None,
-                            elapsed,
-                        );
-                        STATS.request(class, status);
-                        if status.is_success() {
-                            tracing::debug!("{method} {uri} - {status}");
-                        } else {
-                            tracing::warn!("{method} {uri} - {status}");
-                        }
-                    }
+            return Box::pin(self.service.call(req).map(move |response| {
+                // Answered like any other request's failure.
+                let (response, failed) = match response {
+                    Ok(response) => (response, false),
                     Err(err) => {
-                        #[cfg(feature = "otel")]
-                        metrics::record(
-                            class,
-                            &method,
-                            None,
-                            Some("_OTHER"),
-                            elapsed,
-                        );
-                        STATS.failed_request(class);
                         tracing::error!("{method} {uri} - {err:#}");
+                        (error_response(err.as_ref(), None, class), true)
                     }
+                };
+                let status = response.status();
+                #[cfg(feature = "otel")]
+                metrics::record(
+                    class,
+                    &method,
+                    Some(status),
+                    None,
+                    start.elapsed(),
+                );
+                STATS.request(class, status);
+                if status.is_success() {
+                    tracing::debug!("{method} {uri} - {status}");
+                } else if !failed {
+                    tracing::warn!("{method} {uri} - {status}");
                 }
+                Ok(response)
             }));
         }
 
@@ -290,6 +253,8 @@ where
             sent: 0,
             length: None,
             batch: None,
+            error: None,
+            failed: false,
         }));
 
         Box::pin(async move {
@@ -301,14 +266,21 @@ where
 
             let response = match result {
                 Ok(response) => response,
-                Err(err) => {
-                    let outcome = if is_client_abort(err.as_ref()) {
-                        Outcome::Aborted
-                    } else {
-                        Outcome::Error(format!("{err:#}"))
-                    };
-                    finish.done(outcome);
+                // There is no one to answer.
+                Err(err) if find::<ClientAborted>(err.as_ref()).is_some() => {
+                    finish.done(Outcome::Aborted);
                     return Err(err);
+                }
+                // Answered, rather than left to hyper, which would close the
+                // connection. The error itself is only logged.
+                Err(err) => {
+                    finish.error = Some(format!("{err:#}"));
+                    finish.failed = find::<BadRequest>(err.as_ref()).is_none();
+                    error_response(
+                        err.as_ref(),
+                        trace_id(&finish.span),
+                        finish.class,
+                    )
                 }
             };
 
@@ -348,6 +320,61 @@ where
     }
 }
 
+/// How long a client is asked to wait before retrying a request that failed on
+/// the server.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// The response to a request of `class` whose service failed with `err`: a
+/// 400 saying why for a [`BadRequest`], or else the server failing, which is
+/// nearly always of what it depends on (GitHub, S3, a disk) and passes.
+///
+/// git-lfs retries a batch request only on a 429 (after its `Retry-After`),
+/// so that is what it gets, though the client made too many requests only in
+/// that there was one too soon. Anything else gets a 503 with `Retry-After`:
+/// git-lfs treats it as fatal, as it does a 500, but other clients and load
+/// balancers may not. git-lfs retries object transfers whatever the status,
+/// and a verify three times at once whatever the status; a 429 there would
+/// also have it upload the object again, up to eight times, so a verify
+/// gets the 503. It never retries lock requests.
+///
+/// Neither says why, as the error may name storage details, but both give
+/// the trace to look for.
+fn error_response(
+    err: &(dyn std::error::Error + 'static),
+    trace_id: Option<String>,
+    class: RequestClass,
+) -> Response<BoxBody> {
+    let failed = "The server failed to handle the request; try again";
+    let (status, message) = match find::<BadRequest>(err) {
+        Some(bad) => (StatusCode::BAD_REQUEST, format!("{:#}", bad.0)),
+        None if class == RequestClass::Batch => {
+            (StatusCode::TOO_MANY_REQUESTS, failed.to_string())
+        }
+        None => (StatusCode::SERVICE_UNAVAILABLE, failed.to_string()),
+    };
+    let body = into_json(&lfs::BatchResponseError {
+        locks: None,
+        message,
+        documentation_url: None,
+        request_id: trace_id,
+    })
+    .unwrap_or_default();
+
+    let mut response = Response::new(full(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.git-lfs+json"),
+    );
+    if status != StatusCode::BAD_REQUEST {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(RETRY_AFTER.as_secs()),
+        );
+    }
+    response
+}
+
 /// How a request ended.
 #[derive(Debug, PartialEq)]
 enum Outcome {
@@ -357,8 +384,6 @@ enum Outcome {
     Aborted,
     /// Producing the response's body failed.
     Failed(String),
-    /// The request failed without a response.
-    Error(String),
 }
 
 impl Outcome {
@@ -371,7 +396,6 @@ impl Outcome {
             Outcome::Completed => None,
             Outcome::Aborted => Some("aborted"),
             Outcome::Failed(_) => Some("response_body"),
-            Outcome::Error(_) => Some("_OTHER"),
         }
     }
 }
@@ -393,6 +417,10 @@ struct Finish {
     /// The response's `Content-Length`, if it has one.
     length: Option<u64>,
     batch: Option<BatchSummary>,
+    /// The error the response was made for, to be logged.
+    error: Option<String>,
+    /// Whether the server failed the request, whatever its status says.
+    failed: bool,
 }
 
 /// Finishes a request that is dropped before its response is made.
@@ -442,12 +470,12 @@ impl Finish {
 
     /// Ends the request: counts it, completes its span and logs it.
     fn done(self, outcome: Outcome) {
-        // A body that failed partway is counted as the server error it was,
-        // whatever status its head said.
+        // A body that failed partway, or a batch request answered with a 429
+        // for git-lfs to retry, is counted as the server error it was,
+        // whatever its status says.
         match (&outcome, self.status) {
-            (Outcome::Failed(_) | Outcome::Error(_), _) => {
-                STATS.failed_request(self.class)
-            }
+            (Outcome::Failed(_), _) => STATS.failed_request(self.class),
+            _ if self.failed => STATS.failed_request(self.class),
             (_, Some(status)) => STATS.request(self.class, status),
             (_, None) => STATS.unanswered_request(self.class),
         }
@@ -456,7 +484,11 @@ impl Finish {
             self.class,
             &self.method,
             self.status,
-            outcome.error_type(),
+            outcome.error_type().or_else(|| {
+                let status_says =
+                    self.status.is_some_and(|s| s.is_server_error());
+                (self.failed && !status_says).then_some("_OTHER")
+            }),
             self.start.elapsed(),
         );
 
@@ -465,7 +497,8 @@ impl Finish {
         // An aborted request is an error on the span, so that it can be
         // found, but git-lfs cancels transfers routinely, so it is logged at
         // info.
-        let server_error = self.status.is_some_and(|s| s.is_server_error());
+        let server_error =
+            self.failed || self.status.is_some_and(|s| s.is_server_error());
         if server_error || outcome != Outcome::Completed {
             let description = match &outcome {
                 Outcome::Aborted if self.status.is_none() => {
@@ -474,18 +507,23 @@ impl Finish {
                 Outcome::Aborted => {
                     "the client went away before the response was sent"
                 }
-                Outcome::Failed(err) | Outcome::Error(err) => err.as_str(),
-                Outcome::Completed => self
-                    .status
-                    .and_then(|s| s.canonical_reason())
-                    .unwrap_or("server error"),
+                Outcome::Failed(err) => err.as_str(),
+                Outcome::Completed => match &self.error {
+                    Some(err) => err.as_str(),
+                    None => self
+                        .status
+                        .and_then(|s| s.canonical_reason())
+                        .unwrap_or("server error"),
+                },
             };
             span.record("otel.status_code", "ERROR");
             span.record("otel.status_description", description);
         }
 
+        // A server error the server made the response for is its own failure;
+        // one that came from below (a lock store's answer) is only a warning.
         let level = match &outcome {
-            Outcome::Error(_) => tracing::Level::ERROR,
+            _ if self.failed => tracing::Level::ERROR,
             Outcome::Failed(_) => tracing::Level::WARN,
             _ if server_error => tracing::Level::WARN,
             _ => tracing::Level::INFO,
@@ -494,8 +532,8 @@ impl Finish {
             Outcome::Completed => ("completed", None),
             Outcome::Aborted => ("aborted", None),
             Outcome::Failed(err) => ("failed", Some(err.as_str())),
-            Outcome::Error(err) => ("error", Some(err.as_str())),
         };
+        let error = error.or(self.error.as_deref());
         let trace_id = trace_id(span);
 
         // Logged outside the span: the line carries what matters itself.
@@ -539,7 +577,7 @@ impl Finish {
 
 /// The OpenTelemetry trace id of `span`, for linking a log line to its trace.
 #[cfg(feature = "otel")]
-fn trace_id(span: &Span) -> Option<String> {
+pub(crate) fn trace_id(span: &Span) -> Option<String> {
     use opentelemetry::trace::TraceContextExt as _;
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
@@ -551,7 +589,7 @@ fn trace_id(span: &Span) -> Option<String> {
 }
 
 #[cfg(not(feature = "otel"))]
-fn trace_id(_span: &Span) -> Option<String> {
+pub(crate) fn trace_id(_span: &Span) -> Option<String> {
     None
 }
 
@@ -628,6 +666,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_failures_are_answered_so_git_lfs_retries_what_it_can() {
+        let err = anyhow::anyhow!("S3 failed");
+        let status = |class| error_response(err.as_ref(), None, class).status();
+        // git-lfs retries a batch on a 429 only.
+        assert_eq!(status(RequestClass::Batch), StatusCode::TOO_MANY_REQUESTS);
+        // A verify it retries anyway, and a 429 would have it upload again.
+        for class in [
+            RequestClass::Verify,
+            RequestClass::Locks,
+            RequestClass::Download,
+        ] {
+            assert_eq!(status(class), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let bad = anyhow::Error::from(BadRequest(anyhow::anyhow!("no")));
+        let response = error_response(bad.as_ref(), None, RequestClass::Batch);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
     fn routes_have_placeholders() {
         let oid =
             "b1fbeefc23e6a149a6f7d0c2fb635bfc78f7ddc2da963ea9c6a63eb324260e6d";
@@ -673,6 +731,8 @@ mod tests {
             sent,
             length,
             batch: None,
+            error: None,
+            failed: false,
         }
     }
 

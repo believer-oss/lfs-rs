@@ -48,6 +48,7 @@ use bytes::Bytes;
 
 use crate::auth::UserRepoInfo;
 use crate::error::Error;
+use crate::error::{BadRequest, ClientAborted};
 use crate::hyperext::RequestExt;
 use crate::lfs;
 use crate::locks::{
@@ -56,10 +57,12 @@ use crate::locks::{
     ReleaseLockBatchRequest, ReleaseLockRequest, VerifyLocksRequest,
     VerifyLocksResponse,
 };
-use crate::logger::{BatchSummary, ClientAborted};
+use crate::logger::BatchSummary;
+use crate::sha256::{Sha256VerifyError, VerifyStream};
 use crate::stats::STATS;
 use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
 use crate::{empty, from_json, full, into_json};
+use parking_lot::Mutex;
 
 #[cfg(feature = "otel")]
 use tracing::instrument;
@@ -456,28 +459,42 @@ where
             }
         };
 
-        // Whether reading the body failed is noted, as the storage stack
-        // doesn't keep its error. Behind a disk cache, a storage failure
-        // can still be followed by the client going away during the next
-        // chunk's read, and is then taken as the client's. The storage's
-        // error is still in the chain, and the window is one chunk.
+        // The object is checked against its OID here, rather than by the
+        // storage stack, so that a mismatch is known to be the client's.
+        // Whether reading the body failed, or it didn't match, is noted, as
+        // the storage stack doesn't keep its error. Behind a disk cache, a
+        // storage failure can still be followed by the client going away
+        // during the next chunk's read, and is then taken as the client's.
+        // The storage's error is still in the chain, and the window is one
+        // chunk.
         let body_failed = Arc::new(AtomicBool::new(false));
-        let body = req.into_body();
-        let stream = BodyDataStream::new(body)
-            .try_filter_map(|chunk| async { Ok(Some(chunk)) })
+        let mismatch = Arc::new(Mutex::new(None));
+        let oid = *key.oid();
+        let body = BodyDataStream::new(req.into_body())
             .inspect_ok(|chunk: &Bytes| STATS.uploaded(chunk.len() as u64))
-            .map_err({
-                let body_failed = body_failed.clone();
-                move |err| {
+            .map_err(UploadError::Body);
+        let stream = VerifyStream::new(body, len, oid).map_err({
+            let (body_failed, mismatch) =
+                (body_failed.clone(), mismatch.clone());
+            move |err| match err {
+                UploadError::Body(err) => {
                     body_failed.store(true, Ordering::Relaxed);
                     std::io::Error::other(err)
                 }
-            });
+                UploadError::Mismatch(err) => {
+                    *mismatch.lock() = Some(err.clone());
+                    std::io::Error::other(err)
+                }
+            }
+        });
 
         let object = LFSObject::new(len, Box::pin(stream));
 
         if let Err(err) = storage.put(key, object).await {
             let err = Error::from(err);
+            if let Some(mismatch) = mismatch.lock().take() {
+                return Err(BadRequest(mismatch.into()).into());
+            }
             if body_failed.load(Ordering::Relaxed) {
                 return Err(ClientAborted(err).into());
             }
@@ -537,59 +554,41 @@ where
         let uri = req.base_uri().path_and_query("/").build()?;
         let headers = req.headers().clone();
 
-        match from_json::<lfs::BatchRequest>(req.into_body()).await {
-            // The client went away: there is no one to answer.
-            Err(err) if err.is::<ClientAborted>() => Err(err),
-            Ok(val) => {
-                let operation = val.operation;
+        // JSON that doesn't parse is answered with a 400 by `Logger`.
+        let val = from_json::<lfs::BatchRequest>(req.into_body()).await?;
+        let operation = val.operation;
 
-                // For each object, check if it exists in the storage
-                // backend.
-                let objects = val.objects.into_iter().map(|object| {
-                    let uri = uri.clone();
-                    let key = StorageKey::new(namespace.clone(), object.oid);
+        // For each object, check if it exists in the storage backend.
+        let objects = val.objects.into_iter().map(|object| {
+            let uri = uri.clone();
+            let key = StorageKey::new(namespace.clone(), object.oid);
 
-                    async {
-                        let size = storage.size(&key).await;
+            async {
+                let size = storage.size(&key).await;
 
-                        let (namespace, _) = key.into_parts();
-                        Ok(basic_response(
-                            uri, &headers, &storage, object, operation, size,
-                            namespace,
-                        )
-                        .await)
-                    }
-                });
-
-                let objects = future::try_join_all(objects).await?;
-                let mut transfer = Some(lfs::Transfer::Basic);
-                if let Some(transfers) = val.transfers
-                    && transfers.contains(&lfs::Transfer::LfsRs)
-                {
-                    transfer = Some(lfs::Transfer::LfsRs)
-                }
-                let summary = batch_summary(operation, &objects, &uri);
-                let response = lfs::BatchResponse { transfer, objects };
-
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .extension(summary)
-                    .body(full(into_json(&response)?))?)
+                let (namespace, _) = key.into_parts();
+                Ok(basic_response(
+                    uri, &headers, &storage, object, operation, size, namespace,
+                )
+                .await)
             }
-            Err(err) => {
-                let response = lfs::BatchResponseError {
-                    locks: None,
-                    message: err.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                };
+        });
 
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full(into_json(&response)?))?)
-            }
+        let objects = future::try_join_all(objects).await?;
+        let mut transfer = Some(lfs::Transfer::Basic);
+        if let Some(transfers) = val.transfers
+            && transfers.contains(&lfs::Transfer::LfsRs)
+        {
+            transfer = Some(lfs::Transfer::LfsRs)
         }
+        let summary = batch_summary(operation, &objects, &uri);
+        let response = lfs::BatchResponse { transfer, objects };
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(summary)
+            .body(full(into_json(&response)?))?)
     }
 
     async fn list_locks(
@@ -922,21 +921,24 @@ where
     let size = match size {
         Ok(size) => size,
         Err(err) => {
-            tracing::error!("batch response error: {err}");
+            tracing::error!("batch response error: {err:#}");
 
             // Return a generic "500 - Internal Server Error" for objects that
             // we failed to get the size of. This is usually caused by some
             // intermittent problem on the storage backend. A retry strategy
             // should be implemented on the storage backend to help mitigate
             // this possibility because the git-lfs client does not currenty
-            // implement retries in this case.
+            // implement retries in this case. It doesn't say why, as the error
+            // may name storage details, but gives the trace to look for.
+            let request_id = crate::logger::trace_id(&tracing::Span::current());
+            let message = match request_id {
+                Some(id) => format!("Internal server error (request ID {id})"),
+                None => "Internal server error".to_string(),
+            };
             return lfs::ResponseObject {
                 oid: object.oid,
                 size: object.size,
-                error: Some(lfs::ObjectError {
-                    code: 500,
-                    message: err.to_string(),
-                }),
+                error: Some(lfs::ObjectError { code: 500, message }),
                 authenticated: Some(true),
                 actions: None,
             };
@@ -1133,6 +1135,21 @@ where
         } else {
             Box::pin(future::ready(Self::not_found(req)))
         }
+    }
+}
+
+/// Why an upload's body stream failed.
+#[derive(Debug)]
+enum UploadError {
+    /// Reading it from the client failed.
+    Body(hyper::Error),
+    /// It didn't match its OID.
+    Mismatch(Sha256VerifyError),
+}
+
+impl From<Sha256VerifyError> for UploadError {
+    fn from(err: Sha256VerifyError) -> Self {
+        UploadError::Mismatch(err)
     }
 }
 

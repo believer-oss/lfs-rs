@@ -38,7 +38,7 @@ use tokio::{
 };
 
 use crate::app::BoxBody;
-use crate::error::Error;
+use crate::error::{BadRequest, ClientAborted, Error};
 
 /// A temporary file path. When dropped, the file is deleted.
 #[derive(Debug)]
@@ -168,7 +168,8 @@ impl AsyncWrite for NamedTempFile {
 }
 
 /// Reads a request's JSON body. For request bodies only: a failure to read
-/// the body is taken to be the client going away (`ClientAborted`).
+/// the body is taken to be the client going away (`ClientAborted`), and JSON
+/// that doesn't parse is a `BadRequest`.
 pub async fn from_json<T>(body: Incoming) -> Result<T, Error>
 where
     T: for<'de> Deserialize<'de>,
@@ -180,14 +181,14 @@ where
     while let Some(chunk) = stream
         .try_next()
         .await
-        .map_err(|err| crate::logger::ClientAborted(err.into()))?
+        .map_err(|err| ClientAborted(err.into()))?
     {
         if chunk.is_data() {
             buf.extend_from_slice(chunk.into_data().unwrap().as_ref());
         }
     }
 
-    Ok(serde_json::from_slice(&buf)?)
+    serde_json::from_slice(&buf).map_err(|err| BadRequest(err.into()).into())
 }
 
 #[allow(clippy::result_large_err)]

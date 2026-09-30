@@ -38,12 +38,10 @@ enum Error {
 
 impl std::error::Error for Error {}
 
-/// Verifies LFS objects as they are uploaded or downloaded.
-///
-/// If corruption is detected upon upload, the object is rejected.
-///
-/// If corruption is detected upon download, the object is deleted from the
-/// underlying storage backend.
+/// Verifies LFS objects as they are downloaded. If corruption is detected, the
+/// object is deleted from the underlying storage backend. Uploads are checked
+/// by the upload handler (`App::upload`), which rejects an object that
+/// doesn't match its OID with a 400.
 ///
 /// Note that this must be composed with decrypted data. Otherwise, the
 /// verification will always fail. Thus, this should be the last thing between
@@ -126,23 +124,14 @@ where
         }
     }
 
+    /// Uploads aren't checked here, but by the upload handler, which can tell
+    /// the client that its object didn't match.
     async fn put(
         &self,
         key: StorageKey,
         value: LFSObject,
     ) -> Result<(), Self::Error> {
-        let (len, stream) = value.into_parts();
-
-        let stream =
-            VerifyStream::new(stream.map_err(Error::from), len, *key.oid())
-                .map_err(move |err| match err {
-                    Error::Verify(err) => io::Error::other(err),
-                    Error::Io(err) => io::Error::other(err),
-                });
-
-        self.storage
-            .put(key, LFSObject::new(len, Box::pin(stream)))
-            .await
+        self.storage.put(key, value).await
     }
 
     async fn size(&self, key: &StorageKey) -> Result<Option<u64>, Self::Error> {
