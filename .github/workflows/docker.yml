@@ -4,36 +4,62 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE_NAME: lfs-rs
+  IMAGE: ghcr.io/believer-oss/lfs-rs
 
 jobs:
-  docker:
-    name: Docker Build and Push
-    permissions: write-all
-    runs-on: ubuntu-latest
+  # Each platform builds on a runner of its own architecture: under
+  # emulation, arm64 took over an hour. Each pushes a tag of its own, and
+  # `publish` makes the commit's tag from both.
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Log in to registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
-
-      # Each platform builds natively, so arm64 builds under qemu emulation. This
-      # registers qemu the way docker/setup-qemu-action does, without adding a
-      # third-party action.
-      - name: Set up emulation and buildx
         run: |
-          docker run --privileged --rm \
-            tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
-            --install arm64
-          docker buildx create --use --driver docker-container
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build, tag, and push image
+      - name: Build and push ${{ matrix.arch }} image
         env:
-          IMAGE_TAG: ${{ github.sha }}
+          TAG: ${{ github.sha }}-${{ matrix.arch }}
         run: |
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --tag ghcr.io/believer-oss/$IMAGE_NAME:$IMAGE_TAG \
+            --platform linux/${{ matrix.arch }} \
+            --tag "$IMAGE:$TAG" \
             --push \
             .
+
+  publish:
+    name: Publish multi-arch image
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag the commit for both architectures
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:$SHA" \
+            "$IMAGE:$SHA-amd64" \
+            "$IMAGE:$SHA-arm64"
+          docker buildx imagetools inspect "$IMAGE:$SHA"

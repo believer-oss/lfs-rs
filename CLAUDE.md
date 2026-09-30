@@ -30,8 +30,9 @@ cargo clippy --all-features           # lib.rs has #![deny(clippy::all)]
   the backend subcommand. `test.sh` is gitignored so it can hold a local run
   script.
 - Docker images are static musl binaries in a `scratch` image, published for
-  amd64 and arm64 by the manually triggered `docker` workflow (buildx, with arm64
-  built under qemu). To build locally: `podman build --platform linux/arm64 .`
+  amd64 and arm64 by the manually triggered `docker` workflow (each built on a
+  runner of its own architecture, then combined into one multi-arch tag). To
+  build locally: `podman build --platform linux/arm64 .`
 
 Cargo features: `dynamodb` and `otel` are on by default. `redis` and
 `faulty` are opt-in. `faulty` injects random failures into the S3 and cache
