@@ -44,7 +44,7 @@ use tracing::{Instrument, Span};
 
 use crate::app::BoxBody;
 use crate::auth::UserRepoInfo;
-use crate::error::{BadRequest, ClientAborted, find};
+use crate::error::{BadRequest, ClientAborted, RateLimited, find};
 use crate::stats::{RequestClass, STATS};
 use crate::{full, into_json, lfs};
 
@@ -321,7 +321,7 @@ where
 }
 
 /// How long a client is asked to wait before retrying a request that failed on
-/// the server.
+/// the server, unless what failed said how long.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// The response to a request of `class` whose service failed with `err`: a
@@ -336,6 +336,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// and a verify three times at once whatever the status; a 429 there would
 /// also have it upload the object again, up to eight times, so a verify
 /// gets the 503. It never retries lock requests.
+///
+/// `Retry-After` is how long the server was asked to wait, when GitHub rate
+/// limits it: git-lfs then waits that long, or gives up at once if it is
+/// longer than it will wait.
 ///
 /// Neither says why, as the error may name storage details, but both give
 /// the trace to look for.
@@ -367,10 +371,14 @@ fn error_response(
         HeaderValue::from_static("application/vnd.git-lfs+json"),
     );
     if status != StatusCode::BAD_REQUEST {
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from(RETRY_AFTER.as_secs()),
-        );
+        let wait = find::<RateLimited>(err)
+            .map_or(RETRY_AFTER, |limited| limited.retry_after);
+        // Rounded up: never less than was asked for.
+        let retry_after =
+            (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1);
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
     }
     response
 }
@@ -683,6 +691,24 @@ mod tests {
         let response = error_response(bad.as_ref(), None, RequestClass::Batch);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key(header::RETRY_AFTER));
+
+        // How long GitHub asked to be left alone is passed on.
+        let limited = anyhow::Error::from(RateLimited {
+            retry_after: Duration::from_secs(120),
+            message: "limited".into(),
+        });
+        let response =
+            error_response(limited.as_ref(), None, RequestClass::Batch);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "120");
+
+        // Rounded up, never asking for less than GitHub did.
+        let limited = anyhow::Error::from(RateLimited {
+            retry_after: Duration::from_millis(41_500),
+            message: "limited".into(),
+        });
+        let response =
+            error_response(limited.as_ref(), None, RequestClass::Batch);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "42");
     }
 
     #[test]

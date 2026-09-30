@@ -836,3 +836,234 @@ async fn mismatched_uploads_are_bad_requests()
     }
     Ok(())
 }
+
+/// A GitHub that answers `/repos/test/test` with `failures` 503s before it
+/// answers properly.
+async fn flaky_github(failures: u64) -> MockServer {
+    let github = MockServer::start().await;
+    if failures > 0 {
+        Mock::given(method("GET"))
+            .and(path("/repos/test/test"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(failures)
+            .with_priority(1)
+            .mount(&github)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/repos/test/test"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"id": 1, "permissions": {"push": true, "pull": true}}"#,
+            "application/json",
+        ))
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"login": "testuser1"}"#, "application/json"),
+        )
+        .mount(&github)
+        .await;
+    github
+}
+
+/// A GitHub hiccup is retried by the server, as git-lfs doesn't retry lock
+/// requests.
+#[tokio::test]
+async fn github_hiccups_are_retried() -> Result<(), Box<dyn std::error::Error>>
+{
+    let github = flaky_github(2).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let (status, _) =
+        server.request("GET", "/api/test/test/locks", b"").await?;
+    assert_eq!(status, 200);
+    Ok(())
+}
+
+/// GitHub failing isn't the client's credentials being wrong: it is the
+/// server failing. Batch requests get a 429, which git-lfs retries; others
+/// get a 503.
+#[tokio::test]
+async fn github_outages_are_server_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let github = flaky_github(u64::MAX).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let batch = br#"{"operation": "download", "objects": []}"#;
+    let mut response = Vec::new();
+    server
+        .send("POST", "/api/test/test/objects/batch", batch)
+        .await?
+        .read_to_end(&mut response)
+        .await?;
+    let head = String::from_utf8_lossy(&response).to_lowercase();
+    assert!(head.contains("\r\nretry-after: 5\r\n"), "{head}");
+    assert_eq!(parse(&response).0, 429);
+
+    let (status, _) =
+        server.request("GET", "/api/test/test/locks", b"").await?;
+    assert_eq!(status, 503);
+
+    server.closed(2).await;
+    let logs = server.logs();
+    let line = logs
+        .lines()
+        .find(|line| line.contains(" status=429 "))
+        .unwrap_or_else(|| panic!("no 429 in:\n{logs}"));
+    assert!(line.contains(" ERROR "), "{line}");
+    assert!(line.contains("GitHub answered 503"), "{line}");
+    Ok(())
+}
+
+/// A GitHub that answers `/repos/test/test` with `response`, as many times
+/// as `calls` says, and `/user` with `user`.
+async fn github_answering(
+    response: ResponseTemplate,
+    calls: u64,
+    user: ResponseTemplate,
+) -> MockServer {
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/test/test"))
+        .respond_with(response)
+        .expect(calls)
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(user)
+        .mount(&github)
+        .await;
+    github
+}
+
+fn user_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_raw(r#"{"login": "testuser1"}"#, "application/json")
+}
+
+/// GitHub rate limiting isn't retried, which GitHub says makes it worse, and
+/// isn't the credentials not granting access, whichever way GitHub says it.
+#[tokio::test]
+async fn github_rate_limits_are_not_retried()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Each way GitHub says it, and how long the client is asked to wait.
+    let secondary =
+        r#"{"message": "You have exceeded a secondary rate limit."}"#;
+    let limits = [
+        (
+            ResponseTemplate::new(429).insert_header("retry-after", "30"),
+            "30",
+        ),
+        (
+            ResponseTemplate::new(403)
+                .insert_header("x-ratelimit-remaining", "0"),
+            "60",
+        ),
+        (
+            ResponseTemplate::new(403)
+                .set_body_raw(secondary, "application/json"),
+            "60",
+        ),
+    ];
+    for (limit, wait) in limits {
+        // Asked once: dropping it checks.
+        let github = github_answering(limit, 1, user_ok()).await;
+        let server = observed_with(Options {
+            github: Some(github.uri()),
+            ..Options::default()
+        })
+        .await?;
+
+        let mut response = Vec::new();
+        server
+            .send("GET", "/api/test/test/locks", b"")
+            .await?
+            .read_to_end(&mut response)
+            .await?;
+        assert_eq!(parse(&response).0, 503);
+        let head = String::from_utf8_lossy(&response).to_lowercase();
+        let retry_after = format!("\r\nretry-after: {wait}\r\n");
+        assert!(head.contains(&retry_after), "{head}");
+
+        // And the next is answered from the cache, not by asking GitHub.
+        let (status, _) =
+            server.request("GET", "/api/test/test/locks", b"").await?;
+        assert_eq!(status, 503);
+    }
+    Ok(())
+}
+
+/// Only locking (taking, releasing and verifying locks) needs the username, so
+/// GitHub failing to give it fails only that. The answer is cached only
+/// briefly, so that GitHub isn't asked on every request while it fails.
+#[tokio::test]
+async fn username_outages_only_fail_locking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repo = ResponseTemplate::new(200).set_body_raw(
+        r#"{"id": 1, "permissions": {"push": true, "pull": true}}"#,
+        "application/json",
+    );
+    // Asked once, for both requests: dropping it checks.
+    let github = github_answering(repo, 1, ResponseTemplate::new(503)).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let batch = br#"{"operation": "download", "objects": []}"#;
+    let (status, _) = server
+        .request("POST", "/api/test/test/objects/batch", batch)
+        .await?;
+    assert_eq!(status, 200);
+
+    // Creating a lock records its owner, so it needs the username.
+    let lock = lock_request("a.bin");
+    let (status, _) = server
+        .request("POST", "/api/test/test/locks", lock.as_bytes())
+        .await?;
+    assert_eq!(status, 503);
+    Ok(())
+}
+
+/// GitHub rate limiting the username lookup is passed on to locking, which
+/// needs the username, with GitHub's wait.
+#[tokio::test]
+async fn username_rate_limits_keep_githubs_wait()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repo = ResponseTemplate::new(200).set_body_raw(
+        r#"{"id": 1, "permissions": {"push": true, "pull": true}}"#,
+        "application/json",
+    );
+    let limited = ResponseTemplate::new(429).insert_header("retry-after", "42");
+    let github = github_answering(repo, 1, limited).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let lock = lock_request("a.bin");
+    let mut response = Vec::new();
+    server
+        .send("POST", "/api/test/test/locks", lock.as_bytes())
+        .await?
+        .read_to_end(&mut response)
+        .await?;
+    assert_eq!(parse(&response).0, 503);
+    let head = String::from_utf8_lossy(&response).to_lowercase();
+    assert!(head.contains("\r\nretry-after: 42\r\n"), "{head}");
+    Ok(())
+}

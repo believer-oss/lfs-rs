@@ -72,3 +72,19 @@ pub fn find<'a, E: StdError + 'static>(
     }
     None
 }
+
+/// Something the server depends on asked to be left alone for `retry_after`,
+/// which the client is asked to wait too.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after: std::time::Duration,
+    pub message: String,
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for RateLimited {}
