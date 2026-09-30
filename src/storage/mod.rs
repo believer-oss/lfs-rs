@@ -23,7 +23,6 @@ mod disk;
 mod encrypt;
 #[cfg(feature = "faulty")]
 mod faulty;
-mod retrying;
 mod s3;
 mod verify;
 
@@ -32,8 +31,10 @@ pub use disk::Backend as Disk;
 pub use encrypt::Backend as Encrypted;
 #[cfg(feature = "faulty")]
 pub use faulty::Backend as Faulty;
-pub use retrying::Backend as Retrying;
-pub use s3::Backend as S3;
+pub use s3::{
+    Backend as S3, DEFAULT_CREDENTIAL_REFRESH_BUFFER, DEFAULT_PART_SIZE,
+    MIN_PART_SIZE,
+};
 pub use verify::Backend as Verify;
 
 use crate::lfs::Oid;
@@ -46,11 +47,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
+    Future,
     channel::mpsc,
     future::Either,
     sink::SinkExt,
     stream::{BoxStream, StreamExt},
-    Future,
 };
 
 /// Stream returned by storage operations.
@@ -161,27 +162,58 @@ impl LFSObject {
         (self.len, self.stream)
     }
 
-    /// Duplicates the underlying byte stream such that we have two identical
-    /// LFS object streams that must be consumed in lock-step.
+    /// Duplicates the byte stream into a primary and a secondary copy, fed in
+    /// lock-step by the returned future.
     ///
-    /// This is useful for caching LFS objects while simultaneously sending them
-    /// to a client.
+    /// The secondary copy is best effort: if its consumer gives up (a cache
+    /// that can't store the object, say), the primary copy still gets every
+    /// byte. If the primary's consumer gives up, or the source fails, both
+    /// copies stop, and a source error reaches both as an error rather than
+    /// an early end.
+    ///
+    /// Used to cache an object while sending it to a client or storing it.
     pub fn fanout(
         self,
     ) -> (impl Future<Output = Result<(), io::Error>>, Self, Self) {
-        let (len, stream) = self.into_parts();
+        let (len, mut stream) = self.into_parts();
 
-        let (sender_a, receiver_a) = mpsc::channel::<Bytes>(0);
-        let (sender_b, receiver_b) = mpsc::channel::<Bytes>(0);
+        let (mut primary, primary_rx) = mpsc::channel::<io::Result<Bytes>>(0);
+        let (secondary, secondary_rx) = mpsc::channel::<io::Result<Bytes>>(0);
 
-        let sink = sender_a.fanout(sender_b).sink_map_err(io::Error::other);
+        let f = async move {
+            let mut secondary = Some(secondary);
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        primary.send(Ok(chunk.clone())).await.map_err(
+                            |_| {
+                                io::Error::other("the primary copy was dropped")
+                            },
+                        )?;
+                        let gone = match &mut secondary {
+                            Some(tx) => tx.send(Ok(chunk)).await.is_err(),
+                            None => false,
+                        };
+                        if gone {
+                            secondary = None;
+                        }
+                    }
+                    Err(err) => {
+                        let copy =
+                            || io::Error::new(err.kind(), err.to_string());
+                        if let Some(tx) = &mut secondary {
+                            let _ = tx.send(Err(copy())).await;
+                        }
+                        let _ = primary.send(Err(copy())).await;
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(())
+        };
 
-        let receiver_a = receiver_a.map(|x| -> io::Result<_> { Ok(x) });
-        let receiver_b = receiver_b.map(|x| -> io::Result<_> { Ok(x) });
-
-        let f = stream.forward(sink);
-        let a = LFSObject::new(len, Box::pin(receiver_a));
-        let b = LFSObject::new(len, Box::pin(receiver_b));
+        let a = LFSObject::new(len, Box::pin(primary_rx));
+        let b = LFSObject::new(len, Box::pin(secondary_rx));
 
         (f, a, b)
     }

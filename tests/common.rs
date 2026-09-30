@@ -1,31 +1,31 @@
 // Some code in here is used in tests that aren't always built/run
 #![allow(dead_code)]
 
-// mod common;
+use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
 use base64::Engine;
 use bytes::Bytes;
-use duct::cmd;
-use futures::future::Either;
+use futures::future::{Either, Future};
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use lfs_rs::{
-    into_json, CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter,
-    LockStorage, ReleaseLockBatchRequest,
+    CreateLockBatchRequest, LocalServerBuilder, LockBatchOuter, LockStorage,
+    ReleaseLockBatchRequest, into_json,
 };
-use rand::rngs::StdRng;
-use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::{Rng, RngExt};
 use std::fs::{self, File};
 use std::io;
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::span::EnteredSpan;
@@ -35,12 +35,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[cfg(feature = "dynamodb")]
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, KeySchemaElement, LocalSecondaryIndex, Projection,
+    TableStatus,
 };
 
 #[cfg(feature = "otel")]
-use opentelemetry_sdk::runtime;
-#[cfg(feature = "otel")]
-use tracing_subscriber::{prelude::*, Registry};
+use tracing_subscriber::{Registry, prelude::*};
 
 /// Bind test server to localhost port 0. We don't want this server to be
 /// externally visible.
@@ -60,6 +59,223 @@ fn empty() -> BoxBody {
         .map_err(|never| match never {})
         .boxed_unsync()
 }
+
+/// Runs `git` with a global config of our own, so that the developer's
+/// `~/.gitconfig` (e.g. `lfs.storage` or `lfs.url`) can't change what the
+/// tests do.
+macro_rules! git {
+    ($($arg:expr),* $(,)?) => {
+        duct::cmd!("git", $($arg),*)
+            .env("GIT_CONFIG_GLOBAL", git_config_global())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+    };
+}
+
+/// Returns the path of the global git config used by the tests. It only
+/// registers the LFS filters, which `git clone` needs before any repo-local
+/// config exists.
+fn git_config_global() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    PATH.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let path = dir.join("gitconfig");
+
+        // Written to a unique file and renamed into place, since several test
+        // processes may do this at the same time.
+        let tmp = dir.join(format!("gitconfig.{}", std::process::id()));
+        fs::write(
+            &tmp,
+            concat!(
+                "[filter \"lfs\"]\n",
+                "\tclean = git-lfs clean -- %f\n",
+                "\tsmudge = git-lfs smudge -- %f\n",
+                "\tprocess = git-lfs filter-process\n",
+                "\trequired = true\n",
+                "[user]\n",
+                "\tname = Foo Bar\n",
+                "\temail = foobar@example.com\n",
+            ),
+        )
+        .expect("failed to write test gitconfig");
+        fs::rename(&tmp, &path).expect("failed to write test gitconfig");
+
+        path
+    })
+}
+
+/// Integration tests against S3 and DynamoDB are configured with these
+/// environment variables, and skip when they are absent:
+///
+/// - `LFS_TEST_S3_BUCKET`, and `LFS_TEST_S3_ENDPOINT` for an S3-compatible
+///   server. The bucket name must start with [`SCRATCH_PREFIX`]. The bucket is
+///   created if an endpoint is given.
+/// - `LFS_TEST_DYNAMODB_TABLE`, and `LFS_TEST_DYNAMODB_ENDPOINT` for DynamoDB
+///   Local. This is the base of the table names; see [`dynamodb_target`].
+///   Tables are deleted and recreated by the tests.
+/// - `LFS_TEST_REDIS_URI` for the Redis lock backend, e.g.
+///   `redis://localhost:6379`.
+/// - `LFS_TEST_AWS_ACCESS_KEY_ID`, `LFS_TEST_AWS_SECRET_ACCESS_KEY`, and
+///   optionally `LFS_TEST_AWS_SESSION_TOKEN` and `LFS_TEST_AWS_REGION` (default
+///   `us-east-1`), used for both.
+///
+/// Credentials are deliberately not read from the usual `AWS_*` variables or
+/// profiles, so that a test can't touch a production bucket or table by
+/// accident.
+///
+/// Set `LFS_TEST_REQUIRED=1` to turn a skip into a failure. CI sets it, so the
+/// tests can't pass by not running.
+///
+/// Every bucket and table the tests touch is named with [`SCRATCH_PREFIX`], so
+/// a mistyped name can't reach a real one, and test credentials can be limited
+/// to `lfs-rs-scratch-*` resources.
+pub const SCRATCH_PREFIX: &str = "lfs-rs-scratch-";
+
+fn test_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn skip<T>(test: &str, var: &str) -> Option<T> {
+    assert!(
+        std::env::var_os("LFS_TEST_REQUIRED").is_none(),
+        "LFS_TEST_REQUIRED is set but {var} is not; the {test} test would \
+         have skipped and reported success"
+    );
+    eprintln!("Skipping {test} test: {var} is not set");
+    None
+}
+
+/// An AWS configuration built only from the `LFS_TEST_AWS_*` variables.
+fn aws_config(endpoint: Option<String>) -> SdkConfig {
+    let var = |name: &str| {
+        test_var(name).unwrap_or_else(|| {
+            panic!("{name} must be set to run the S3 and DynamoDB tests")
+        })
+    };
+    let credentials = Credentials::new(
+        var("LFS_TEST_AWS_ACCESS_KEY_ID"),
+        var("LFS_TEST_AWS_SECRET_ACCESS_KEY"),
+        test_var("LFS_TEST_AWS_SESSION_TOKEN"),
+        None,
+        "lfs-rs-tests",
+    );
+    let region =
+        test_var("LFS_TEST_AWS_REGION").unwrap_or_else(|| "us-east-1".into());
+
+    let mut config = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::v2026_01_12())
+        .region(Region::new(region))
+        .credentials_provider(SharedCredentialsProvider::new(credentials));
+    if let Some(endpoint) = endpoint {
+        config = config.endpoint_url(endpoint);
+    }
+    config.build()
+}
+
+pub struct S3Target {
+    pub bucket: String,
+    pub config: SdkConfig,
+}
+
+/// Returns the S3 bucket to test against, or `None` if the test should skip.
+pub async fn s3_target(test: &str) -> Option<S3Target> {
+    let Some(bucket) = test_var("LFS_TEST_S3_BUCKET") else {
+        return skip(test, "LFS_TEST_S3_BUCKET");
+    };
+    // Bucket names are global and a real bucket must already exist, so this
+    // can't add the prefix itself; it refuses anything else instead.
+    assert!(
+        bucket.starts_with(SCRATCH_PREFIX),
+        "LFS_TEST_S3_BUCKET is '{bucket}', but test buckets must be named \
+         '{SCRATCH_PREFIX}*' so that they can't be mistaken for real ones"
+    );
+    let endpoint = test_var("LFS_TEST_S3_ENDPOINT");
+    let config = aws_config(endpoint.clone());
+
+    // An S3-compatible server started for the tests starts out empty. Several
+    // tests may get here at once, so a failed create is fine as long as the
+    // bucket exists afterwards.
+    if endpoint.is_some() {
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build(),
+        );
+        if client.head_bucket().bucket(&bucket).send().await.is_err() {
+            let _ = client.create_bucket().bucket(&bucket).send().await;
+            client
+                .head_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("failed to create bucket '{bucket}': {err:?}")
+                });
+        }
+    }
+
+    Some(S3Target { bucket, config })
+}
+
+/// Returns the Redis URI to test against (`LFS_TEST_REDIS_URI`), or `None` if
+/// the test should skip. Lock keys an earlier run left in `repo` are deleted
+/// first, so tests running at once must use different repos. Nothing else in
+/// the database is touched.
+#[cfg(feature = "redis")]
+pub async fn redis_target(test: &str, repo: &str) -> Option<String> {
+    use futures::TryStreamExt;
+    use redis::AsyncCommands;
+
+    let Some(uri) = test_var("LFS_TEST_REDIS_URI") else {
+        return skip(test, "LFS_TEST_REDIS_URI");
+    };
+
+    let client = redis::Client::open(uri.as_str()).expect("invalid Redis URI");
+    let mut con = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("failed to connect to Redis");
+
+    // Each lock is `{repo}:{path}` -> `{id}` and `{id}` -> the lock.
+    let keys: Vec<String> = {
+        let iter = con
+            .scan_match::<_, String>(format!("{repo}:*"))
+            .await
+            .unwrap();
+        iter.try_collect().await.unwrap()
+    };
+    if !keys.is_empty() {
+        let ids: Vec<Option<String>> = con.mget(&keys).await.unwrap();
+        let stale: Vec<String> =
+            keys.into_iter().chain(ids.into_iter().flatten()).collect();
+        let _: u64 = con.del(stale).await.unwrap();
+    }
+
+    Some(uri)
+}
+
+pub struct DynamoTarget {
+    pub table: String,
+    pub config: SdkConfig,
+}
+
+/// Returns the DynamoDB table to test against, or `None` if the test should
+/// skip. Each test uses its own table, since the tables are recreated:
+/// `lfs-rs-scratch-<LFS_TEST_DYNAMODB_TABLE>-<suffix>`. The prefix is always
+/// applied, so the delete can't reach a table that isn't a scratch table.
+pub fn dynamodb_target(test: &str, suffix: &str) -> Option<DynamoTarget> {
+    let Some(table) = test_var("LFS_TEST_DYNAMODB_TABLE") else {
+        return skip(test, "LFS_TEST_DYNAMODB_TABLE");
+    };
+    let base = table.strip_prefix(SCRATCH_PREFIX).unwrap_or(&table);
+    let config = aws_config(test_var("LFS_TEST_DYNAMODB_ENDPOINT"));
+
+    Some(DynamoTarget {
+        table: format!("{SCRATCH_PREFIX}{base}-{suffix}"),
+        config,
+    })
+}
+
 /// A temporary git repository.
 pub struct GitRepo {
     repo: tempfile::TempDir,
@@ -75,39 +291,31 @@ impl GitRepo {
         let path = repo.path();
         let lfs_url = format!("http://{}/api/test/test", lfs_server);
 
-        cmd!("git", "init", "--initial-branch=main", ".")
-            .dir(path)
-            .run()?;
+        git!("init", "--initial-branch=main", ".").dir(path).run()?;
 
-        git_lfs_install(path)?;
+        // Installs the hooks. The filters are in the test global config.
+        git!("lfs", "install", "--local").dir(path).run()?;
 
-        cmd!("git", "remote", "add", "origin", "fake_remote")
+        git!("remote", "add", "origin", "fake_remote")
             .dir(path)
             .run()?;
-        cmd!("git", "config", "lfs.url", &lfs_url,)
-            .dir(path)
-            .run()?;
-        cmd!(
-            "git",
+        git!("config", "lfs.url", &lfs_url,).dir(path).run()?;
+        git!(
             "config",
             "lfs.storage",
             path.join(".git/lfs").to_str().unwrap()
         )
         .dir(path)
         .run()?;
-        cmd!("git", "config", "user.name", "Foo Bar")
+        git!("config", "user.name", "Foo Bar").dir(path).run()?;
+        git!("config", "user.email", "foobar@example.com")
             .dir(path)
             .run()?;
-        cmd!("git", "config", "user.email", "foobar@example.com")
+        git!("lfs", "track", "*.bin", "--lockable")
             .dir(path)
             .run()?;
-        cmd!("git", "lfs", "track", "*.bin", "--lockable")
-            .dir(path)
-            .run()?;
-        cmd!("git", "add", ".gitattributes").dir(path).run()?;
-        cmd!("git", "commit", "-m", "Initial commit")
-            .dir(path)
-            .run()?;
+        git!("add", ".gitattributes").dir(path).run()?;
+        git!("commit", "-m", "Initial commit").dir(path).run()?;
 
         Ok(Self {
             repo,
@@ -130,12 +338,12 @@ impl GitRepo {
             .path()
             .to_str()
             .expect("could not convert src repo path to str");
-        cmd!("git", "clone", src_dir_str, dst_dir_str).run()?;
+        git!("clone", src_dir_str, dst_dir_str).run()?;
 
         let lfs_url = match lfs_server {
             Some(lfs_server) => {
                 let url = format!("http://{}/api/test/test", lfs_server);
-                cmd!("git", "config", "lfs.url", url.clone())
+                git!("config", "lfs.url", url.clone())
                     .dir(dst_dir_str)
                     .run()?;
                 Some(url)
@@ -160,32 +368,30 @@ impl GitRepo {
     ) -> io::Result<()> {
         let mut file = File::create(self.repo.path().join(path))?;
         gen_file(&mut file, size, rng)?;
-        cmd!("git", "add", path).dir(self.repo.path()).run()?;
+        git!("add", path).dir(self.repo.path()).run()?;
         Ok(())
     }
 
     /// Commits the currently staged files.
     pub fn commit(&self, message: &str) -> io::Result<()> {
-        cmd!("git", "commit", "-m", message)
-            .dir(self.repo.path())
-            .run()?;
+        git!("commit", "-m", message).dir(self.repo.path()).run()?;
         Ok(())
     }
 
     pub fn lfs_push(&self) -> io::Result<()> {
-        cmd!("git", "lfs", "push", "origin", "main")
+        git!("lfs", "push", "origin", "main")
             .dir(self.repo.path())
             .run()?;
         Ok(())
     }
 
     pub fn lfs_pull(&self) -> io::Result<()> {
-        cmd!("git", "lfs", "pull").dir(self.repo.path()).run()?;
+        git!("lfs", "pull").dir(self.repo.path()).run()?;
         Ok(())
     }
 
     pub fn pull(&self) -> io::Result<()> {
-        cmd!("git", "pull").dir(self.repo.path()).run()?;
+        git!("pull").dir(self.repo.path()).run()?;
         Ok(())
     }
 
@@ -197,9 +403,7 @@ impl GitRepo {
 
     /// Try to lock a file
     pub fn lock_file(&self, path: &Path) -> anyhow::Result<Output> {
-        Ok(cmd!("git", "lfs", "lock", path)
-            .dir(self.repo.path())
-            .run()?)
+        Ok(git!("lfs", "lock", path).dir(self.repo.path()).run()?)
     }
 
     /// Try to unlock a file
@@ -209,12 +413,12 @@ impl GitRepo {
         force: bool,
     ) -> anyhow::Result<Output> {
         match force {
-            true => Ok(cmd!("git", "lfs", "unlock", path, "--force")
+            true => Ok(git!("lfs", "unlock", path, "--force")
                 .dir(self.repo.path())
                 .run()?),
-            false => Ok(cmd!("git", "lfs", "unlock", path)
-                .dir(self.repo.path())
-                .run()?),
+            false => {
+                Ok(git!("lfs", "unlock", path).dir(self.repo.path()).run()?)
+            }
         }
     }
 
@@ -302,13 +506,13 @@ impl GitRepo {
 
     /// Try to list all locks
     pub fn get_locks(&self) -> io::Result<()> {
-        cmd!("git", "lfs", "locks").dir(self.repo.path()).run()?;
+        git!("lfs", "locks").dir(self.repo.path()).run()?;
         Ok(())
     }
 
     /// Try to verify all locks
     pub fn verify_locks(&self) -> io::Result<String> {
-        let s = cmd!("git", "lfs", "locks", "--verify")
+        let s = git!("lfs", "locks", "--verify")
             .dir(self.repo.path())
             .read()?;
         Ok(s)
@@ -316,8 +520,7 @@ impl GitRepo {
 
     pub fn add_auth_rewrite(&self, user: u32) -> io::Result<()> {
         if let Some(lfs_server) = self.lfs_server {
-            cmd!(
-                "git",
+            git!(
                 "config",
                 format!(
                     "url.http://testuser{}:pass@{}/.insteadOf",
@@ -383,15 +586,16 @@ impl GitRepo {
 
     #[cfg(feature = "dynamodb")]
     pub async fn setup_dynamodb_table(
-        table: &str,
-        endpoint_url: &str,
+        target: &DynamoTarget,
     ) -> anyhow::Result<()> {
-        let shared_config =
-            aws_config::defaults(aws_config::BehaviorVersion::v2024_03_28());
-        let shared_config = shared_config.endpoint_url(endpoint_url);
-        let sdk_config = shared_config.load().await;
-
-        let client = aws_sdk_dynamodb::Client::new(&sdk_config);
+        let table = target.table.as_str();
+        // This deletes the table, so check again here however the target was
+        // built.
+        assert!(
+            table.starts_with(SCRATCH_PREFIX),
+            "refusing to recreate '{table}', which is not a scratch table"
+        );
+        let client = aws_sdk_dynamodb::Client::new(&target.config);
         match client.describe_table().table_name(table).send().await {
             Ok(_) => {
                 tracing::debug!("Table {} already exists", table);
@@ -404,7 +608,7 @@ impl GitRepo {
                     {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
             Err(e) => {
@@ -494,16 +698,21 @@ impl GitRepo {
             return Err(anyhow::anyhow!(e));
         };
 
-        // wait until the table is finished being created
+        // Wait until the table can be used. DynamoDB Local creates tables
+        // immediately, but real DynamoDB takes a while.
         loop {
-            if (client.describe_table().table_name(table).send().await).is_ok()
-            {
+            let status = client
+                .describe_table()
+                .table_name(table)
+                .send()
+                .await
+                .ok()
+                .and_then(|resp| resp.table?.table_status);
+            if status == Some(TableStatus::Active) {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(5000));
 
         Ok(())
     }
@@ -547,25 +756,16 @@ pub fn init_logger() -> tracing::subscriber::DefaultGuard {
 pub fn init_logger() -> tracing::subscriber::DefaultGuard {
     use opentelemetry::trace::TracerProvider as _;
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
+    // Spans go through the OpenTelemetry layer, as they do in the server, but
+    // there is no exporter: the tests have no collector to send them to.
+    let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .build()
-        .unwrap();
-
-    let tracer_provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_id_generator(
-            opentelemetry_sdk::trace::RandomIdGenerator::default(),
-        )
-        .with_batch_exporter(exporter, runtime::Tokio)
-        .build();
-
-    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
+        .tracer(env!("CARGO_PKG_NAME"));
 
     let telemetry = tracing_opentelemetry::layer()
         .with_tracer(tracer)
         .with_filter(tracing_subscriber::EnvFilter::from_default_env());
     let subscriber = Registry::default().with(telemetry);
-    // ignore any errors if we fail to set the global default
     tracing::subscriber::set_default(subscriber)
 }
 
@@ -573,24 +773,39 @@ pub fn startup() -> EnteredSpan {
     tracing::span!(tracing::Level::INFO, "test startup").entered()
 }
 
+/// Runs [`lock_smoke_test`] against local disk storage with the given locks.
 pub async fn smoke_test(
     locks: impl LockStorage + Send + Sync + 'static,
     startup_span: Option<EnteredSpan>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Make sure our seed is deterministic. This makes it easier to reproduce
-    // the same repo every time.
-    let mut rng = StdRng::seed_from_u64(42);
-
     let data = tempfile::TempDir::new()?;
-    let key = rng.gen();
+    let key = Some(StdRng::seed_from_u64(42).random());
 
     let mock = GitRepo::setup_mock_gh_auth().await;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let mut server = LocalServerBuilder::new(data.path().into(), key);
     server.authenticated(true);
     server.authentication_server(mock.uri());
-    let (server, addr) = server.spawn(addr, locks).await?;
+    let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
+
+    lock_smoke_test(server, addr, startup_span).await
+}
+
+/// Pushes, pulls and clones LFS objects through the running `server`, and
+/// exercises locking as two users. The server must authenticate against
+/// [`GitRepo::setup_mock_gh_auth`], which must outlive this call.
+pub async fn lock_smoke_test<F, E>(
+    server: F,
+    addr: SocketAddr,
+    startup_span: Option<EnteredSpan>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = Result<(), E>> + Send + Unpin + 'static,
+    E: Into<Box<dyn std::error::Error>> + Send + 'static,
+{
+    // Make sure our seed is deterministic. This makes it easier to reproduce
+    // the same repo every time.
+    let mut rng = StdRng::seed_from_u64(42);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -726,24 +941,8 @@ pub async fn smoke_test(
 
     if let Either::Right((result, _)) = server.await? {
         // If the server exited first, then propagate the error.
-        result?;
+        result.map_err(Into::into)?;
     }
-
-    #[cfg(feature = "otel")]
-    opentelemetry::global::shutdown_tracer_provider();
-
-    Ok(())
-}
-
-/// Runs `git lfs install`, but serializes it across unit tests. Tests are flaky
-/// if this is not done because it tries to overwrite `~/.gitconfig` and races
-/// with itself.
-fn git_lfs_install(path: &Path) -> io::Result<()> {
-    static LFS_INSTALL: Mutex<()> = Mutex::new(());
-
-    let _guard = LFS_INSTALL.lock().unwrap();
-
-    cmd!("git", "lfs", "install").dir(path).run()?;
 
     Ok(())
 }

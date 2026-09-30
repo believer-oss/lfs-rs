@@ -28,10 +28,12 @@ mod locks;
 mod logger;
 mod lru;
 mod sha256;
+pub mod stats;
 #[doc(hidden)]
 pub mod storage;
 mod util;
 
+use anyhow::Context as _;
 use futures::future::{BoxFuture, Either, Future, TryFutureExt};
 use parking_lot::RwLock;
 use std::{
@@ -49,11 +51,12 @@ use crate::app::App;
 use crate::error::Error;
 pub use crate::lfs::Oid;
 pub use crate::locks::{
-    CreateLockBatchRequest, LocalLs, LockBatch, LockBatchOuter, LockFailure,
-    LockStorage, NoneLs, ReleaseLockBatchRequest,
+    CreateLockBatchRequest, ListLocksResponse, LocalLs, LockBatch,
+    LockBatchOuter, LockFailure, LockStorage, LockStoreError, NoneLs,
+    ReleaseLockBatchRequest,
 };
 use crate::logger::Logger;
-use crate::storage::{Cached, Disk, Encrypted, Retrying, Storage, Verify, S3};
+use crate::storage::{Cached, Disk, Encrypted, S3, Storage, Verify};
 pub use crate::util::{empty, from_json, full, into_json};
 
 #[cfg(feature = "dynamodb")]
@@ -80,6 +83,12 @@ impl Cache {
     }
 }
 
+/// A spawned server, to be awaited on, and the address it listens on.
+type Spawned = Result<
+    (BoxFuture<'static, Result<(), Error>>, SocketAddr),
+    Box<dyn std::error::Error>,
+>;
+
 #[derive(Debug)]
 pub struct S3ServerBuilder {
     bucket: String,
@@ -91,6 +100,8 @@ pub struct S3ServerBuilder {
     authenticated: bool,
     authentication_server: Option<String>,
     size_cache_entries: usize,
+    credential_refresh_buffer: Duration,
+    sdk_config: Option<aws_config::SdkConfig>,
 }
 
 impl S3ServerBuilder {
@@ -105,6 +116,9 @@ impl S3ServerBuilder {
             authenticated: false,
             authentication_server: None,
             size_cache_entries: 256000, // Default to 256k entries
+            credential_refresh_buffer:
+                storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER,
+            sdk_config: None,
         }
     }
 
@@ -114,7 +128,8 @@ impl S3ServerBuilder {
         self
     }
 
-    /// Sets the encryption key to use.
+    /// Sets the encryption key to use. It is ignored with a CDN or S3 Transfer
+    /// Acceleration, which transfer objects directly between clients and S3.
     pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
         self
@@ -126,8 +141,8 @@ impl S3ServerBuilder {
         self
     }
 
-    /// Sets the base URL of the CDN to use. This is incompatible with
-    /// encryption since the LFS object is not sent to Rudolfs.
+    /// Sets the base URL of the CDN to use. Objects are then not encrypted,
+    /// even with a key, since they are transferred directly to and from S3.
     pub fn cdn(&mut self, url: String) -> &mut Self {
         self.cdn = Some(url);
         self
@@ -167,44 +182,72 @@ impl S3ServerBuilder {
         self
     }
 
+    /// Sets how long before they expire the S3 credentials are refreshed.
+    /// Zero keeps the SDK's default. See
+    /// [`storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER`].
+    pub fn credential_refresh_buffer(&mut self, buffer: Duration) -> &mut Self {
+        self.credential_refresh_buffer = buffer;
+        self
+    }
+
+    /// Sets the AWS configuration to use instead of loading it from the
+    /// environment. A custom endpoint in this configuration selects
+    /// path-style addressing, as `$AWS_S3_ENDPOINT` does.
+    pub fn sdk_config(&mut self, config: aws_config::SdkConfig) -> &mut Self {
+        self.sdk_config = Some(config);
+        self
+    }
+
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", name = "startup", skip_all)
+    )]
     pub async fn spawn(
         mut self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<
-        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Spawned {
         let prefix = self.prefix.unwrap_or_else(|| String::from("lfs"));
 
-        if self.cdn.is_some() {
+        // With a CDN or S3TA, transfers go straight between clients and S3,
+        // where the server can't encrypt them. Some objects still go through
+        // the server (uploads over 5 GiB, which can't be presigned), and those
+        // must not be encrypted either: they would be served as ciphertext.
+        if self.key.is_some() && (self.cdn.is_some() || self.s3_accelerate) {
             tracing::warn!(
-                "A CDN was specified. Since uploads and downloads do not flow \
-                 through Rudolfs in this case, they will *not* be encrypted."
+                "--key is ignored with --cdn or --s3ta: objects are \
+                 transferred directly between clients and S3, so they are \
+                 stored unencrypted."
             );
-
-            if self.cache.take().is_some() {
-                tracing::warn!(
-                    "A local disk cache does not work with a CDN and will be \
-                     disabled."
-                );
-            }
+            self.key = None;
         }
 
-        let s3 = S3::new(
+        if self.cdn.is_some() && self.cache.take().is_some() {
+            tracing::warn!(
+                "A local disk cache does not work with a CDN and will be \
+                 disabled."
+            );
+        }
+
+        let sdk_config = match self.sdk_config {
+            Some(config) => config,
+            None => S3::load_config().await?,
+        };
+        let s3 = S3::from_config(
+            &sdk_config,
             self.bucket,
             prefix,
             self.cdn,
             self.s3_accelerate,
             self.size_cache_entries,
-        )
-        .map_err(Error::from)
-        .await?;
+            self.credential_refresh_buffer,
+        );
+        s3.check().await?;
 
-        // Retry certain operations to S3 to make it more reliable.
-        let s3 = Retrying::new(s3);
+        // Retries are left to the AWS SDK, which retries transient failures
+        // (5xx, throttling, timeouts, connection errors) up to 3 times.
 
         // Add a little instability for testing purposes.
         #[cfg(feature = "faulty")]
@@ -280,7 +323,6 @@ impl S3ServerBuilder {
 pub struct LocalServerBuilder {
     path: PathBuf,
     key: Option<[u8; 32]>,
-    cache: Option<Cache>,
     authenticated: bool,
     authentication_server: Option<String>,
 }
@@ -292,7 +334,6 @@ impl LocalServerBuilder {
         Self {
             path,
             key,
-            cache: None,
             authenticated: false,
             authentication_server: None,
         }
@@ -301,16 +342,6 @@ impl LocalServerBuilder {
     /// Sets the encryption key to use.
     pub fn key(&mut self, key: Option<[u8; 32]>) -> &mut Self {
         self.key = key;
-        self
-    }
-
-    /// Sets the cache to use. If not specified, then no local disk cache is
-    /// used. It is uncommon to want to use this when the object storage is
-    /// already local. However, a cache may be useful when the data storage path
-    /// is on a mounted network file system. In such a case, the network file
-    /// system could be slow and the local disk storage could be fast.
-    pub fn cache(&mut self, cache: Cache) -> &mut Self {
-        self.cache = Some(cache);
         self
     }
 
@@ -331,14 +362,15 @@ impl LocalServerBuilder {
 
     /// Spawns the server. The server must be awaited on in order to accept
     /// incoming client connections and run.
+    #[cfg_attr(
+        feature = "otel",
+        tracing::instrument(level = "info", name = "startup", skip_all)
+    )]
     pub async fn spawn(
         self,
         addr: SocketAddr,
         locks: impl LockStorage + Send + Sync + 'static,
-    ) -> Result<
-        (BoxFuture<'static, Result<(), Error>>, SocketAddr),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Spawned {
         let storage = Disk::new(self.path).map_err(Error::from).await?;
         let storage = Verify::new(match self.key {
             Some(key) => {
@@ -380,6 +412,54 @@ impl LocalServerBuilder {
     }
 }
 
+/// `err` and the errors it came from, as `outer: inner: ...`. hyper's errors
+/// only describe themselves.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(err), |err| err.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+/// Whether a connection's error is the client going away (closing or
+/// resetting the connection, or ending a request early) rather than the
+/// server failing. Only for a client connection's own errors: a request's
+/// errors can come from the server's own connections, which fail the same
+/// ways.
+fn client_went_away(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(err) = err.downcast_ref::<hyper::Error>()
+            && (err.is_incomplete_message()
+                || err.is_canceled()
+                || err.is_body_write_aborted())
+        {
+            return true;
+        }
+        if let Some(err) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                err.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+            // An `io::Error`'s `source` skips the error it wraps.
+            if let Some(inner) = err.get_ref()
+                && client_went_away(inner)
+            {
+                return true;
+            }
+        }
+        next = err.source();
+    }
+    false
+}
+
 async fn spawn_server<S, L>(
     storage: S,
     locks: L,
@@ -396,6 +476,18 @@ where
     let storage = Arc::new(storage);
     let locks = Arc::new(locks);
     let cache = Arc::new(RwLock::new(LinkedHashMap::new()));
+
+    // One client for every connection, so they share its connection pool.
+    // Created only when needed, so that without GitHub auth the system root
+    // certificates aren't required.
+    let github = if authenticated {
+        Some(auth::github_client().context(
+            "failed to create the GitHub API client (loading root \
+             certificates)",
+        )?)
+    } else {
+        None
+    };
 
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
@@ -429,7 +521,7 @@ where
                         let auth = Auth::new(
                             app,
                             cache,
-                            authenticated,
+                            github.clone(),
                             authentication_server.clone(),
                         );
 
@@ -448,7 +540,21 @@ where
 
                         let handler = async move {
                             if let Err(err) = conn.await {
-                                tracing::error!("connection error: {}", err);
+                                // The request's own line has already said
+                                // why its service or body failed, or that
+                                // the client went away.
+                                let logged = err
+                                    .downcast_ref::<hyper::Error>()
+                                    .is_some_and(hyper::Error::is_user);
+                                let message = format!(
+                                    "connection error: {}",
+                                    error_chain(&*err)
+                                );
+                                if logged || client_went_away(&*err) {
+                                    tracing::debug!("{message}");
+                                } else {
+                                    tracing::error!("{message}");
+                                }
                             }
                             tracing::debug!("connection dropped: {}", peer_addr);
                         };

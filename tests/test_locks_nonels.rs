@@ -25,12 +25,12 @@ use std::path::Path;
 
 use futures::future::Either;
 use lfs_rs::LocalServerBuilder;
-use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo, SERVER_ADDR};
+use common::{GitRepo, SERVER_ADDR, init_logger};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +41,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = StdRng::seed_from_u64(42);
 
     let data = tempfile::TempDir::new()?;
-    let key = rng.gen();
+    let key = Some(rng.random());
 
     let locks = lfs_rs::NoneLs::new();
 

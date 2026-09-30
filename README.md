@@ -102,15 +102,17 @@ To run in a production environment, it is easiest to use `docker-compose`:
    AWS_ACCESS_KEY_ID=XXXXXXXXXXXXXXXXXXXQ
    AWS_SECRET_ACCESS_KEY=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
    AWS_DEFAULT_REGION=us-west-1
-   LFS_ENCRYPTION_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   LFS_S3_BUCKET=my-bucket
-   LFS_MAX_CACHE_SIZE=10GB
+   RUDOLFS_S3_BUCKET=my-bucket
+   RUDOLFS_MAX_CACHE_SIZE=10GB
+   # Optional. Without it, objects are stored unencrypted.
+   RUDOLFS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
    ```
 
-2. Use the provided `docker-compose.yml` file to run a production environment:
+2. Use the provided `docker-compose.yml` file to build the image and run a
+   production environment:
 
    ```bash
-   docker-compose up -d
+   docker compose up -d --build
    ```
 
 3. **[Optional]**: It is best to use nginx as a reverse proxy for this server.
@@ -121,8 +123,9 @@ To run in a production environment, it is easiest to use `docker-compose`:
 
 - A bigger cache is (almost) always better. Try to use ~85% of the available
   disk space.
-- The cache data is stored in a Docker volume named `rudolfs_data`. If you
-  want to delete it, run `docker volume rm rudolfs_data`.
+- The cache data is stored in a Docker volume named `<project>_data`, where
+  `<project>` is the name of the directory holding `docker-compose.yml` (for
+  example `lfs-rs_data`). To delete it, run `docker volume rm <project>_data`.
 
 ## AWS Credentials
 

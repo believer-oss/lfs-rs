@@ -176,8 +176,9 @@ pub struct BatchResponse {
 /// An error response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BatchResponseError {
-    /// Optional locks if a create conflict has occurred
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The lock that conflicts, if a create conflict has occurred. The
+    /// locking API calls it `lock` (though git-lfs only shows the message).
+    #[serde(rename = "lock", skip_serializing_if = "Option::is_none")]
     pub locks: Option<Lock>,
 
     /// The error message.

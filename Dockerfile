@@ -1,12 +1,13 @@
-FROM rust:1.84 as build
+FROM rust:1.98.1 AS build
 
-ENV CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
+# Set by BuildKit/buildah for each platform being built, e.g. `amd64` or
+# `arm64`. Each platform is built natively, under emulation if necessary.
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN \
   apt-get update && \
-  apt-get -y install ca-certificates musl-tools && \
-  rustup target add ${CARGO_BUILD_TARGET}
+  apt-get -y install ca-certificates musl-tools
 
 ENV PKG_CONFIG_ALLOW_CROSS=1
 
@@ -14,21 +15,24 @@ ENV PKG_CONFIG_ALLOW_CROSS=1
 #
 # Note that this can't be downloaded inside the scratch container as we have no
 # chmod command.
-#
-# TODO: Use `--init` instead when it is more well-supported (this should be the
-# case by Jan 1, 2020).
-ENV TINI_VERSION v0.18.0
-ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static /tini
+ENV TINI_VERSION=v0.18.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-${TARGETARCH} /tini
 RUN chmod +x /tini
 
 # Build the real project.
 COPY ./ ./
 
-RUN cargo build --release
-
+# A static musl binary, so that it can run in a scratch image.
 RUN \
+  case "${TARGETARCH}" in \
+    amd64) CARGO_BUILD_TARGET="x86_64-unknown-linux-musl" ;; \
+    arm64) CARGO_BUILD_TARGET="aarch64-unknown-linux-musl" ;; \
+    *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+  esac && \
+  rustup target add "${CARGO_BUILD_TARGET}" && \
+  cargo build --release --target "${CARGO_BUILD_TARGET}" && \
   mkdir -p /build && \
-  cp target/${CARGO_BUILD_TARGET}/release/lfs-rs /build/ && \
+  cp "target/${CARGO_BUILD_TARGET}/release/lfs-rs" /build/ && \
   strip /build/lfs-rs
 
 # Use scratch so we can get an itty-bitty-teeny-tiny image. This requires us to

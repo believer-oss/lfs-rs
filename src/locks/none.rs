@@ -1,7 +1,7 @@
 use super::{
     ListLocksResponse, Lock, LockBatch, LockStorage, VerifyLocksResponse,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 #[derive(Debug)]

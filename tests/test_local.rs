@@ -23,12 +23,12 @@ use std::path::Path;
 
 use futures::future::Either;
 use lfs_rs::LocalServerBuilder;
-use rand::rngs::StdRng;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo, SERVER_ADDR};
+use common::{GitRepo, SERVER_ADDR, init_logger};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,7 +40,7 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = StdRng::seed_from_u64(42);
 
     let data = tempfile::TempDir::new()?;
-    let key = rng.gen();
+    let key = Some(rng.random());
 
     let locks = lfs_rs::NoneLs::new();
 
@@ -88,5 +88,67 @@ async fn local_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     }
 
+    Ok(())
+}
+
+/// The index page is the health check, and browsers need its content type.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_is_html() -> Result<(), Box<dyn std::error::Error>> {
+    use http_body_util::Empty;
+    use hyper::header::CONTENT_TYPE;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let data = tempfile::TempDir::new()?;
+    let server = LocalServerBuilder::new(data.path().into(), None);
+    let (server, addr) =
+        server.spawn(SERVER_ADDR, lfs_rs::NoneLs::new()).await?;
+    let server = tokio::spawn(server);
+
+    let client = Client::builder(TokioExecutor::new())
+        .build_http::<Empty<bytes::Bytes>>();
+    let response = client.get(format!("http://{addr}/").parse()?).await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+
+    server.abort();
+    Ok(())
+}
+
+/// The local backend has no disk cache, so it refuses to start with one
+/// rather than run without it.
+#[test]
+fn local_storage_refuses_a_cache_dir() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::TempDir::new()?;
+    let mut server = Command::new(env!("CARGO_BIN_EXE_lfs-rs"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .args(["--host", "127.0.0.1:0", "local", "--path"])
+        .arg(dir.path().join("objects"))
+        .env_remove("RUDOLFS_CACHE_DIR")
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // If it starts, it runs until it's stopped.
+    let started = Instant::now();
+    while server.try_wait()?.is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            server.kill()?;
+            panic!("it started");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = server.wait_with_output()?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--cache-dir is only supported with the s3 backend"),
+        "{stdout}"
+    );
     Ok(())
 }

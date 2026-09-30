@@ -24,7 +24,6 @@ use crate::storage::ByteStream;
 use async_trait::async_trait;
 use derive_more::{Display, From};
 use futures::StreamExt;
-use rand::{self, Rng};
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 
@@ -55,7 +54,7 @@ impl<S> Backend<S> {
 
 fn faulty_stream(stream: ByteStream) -> ByteStream {
     Box::pin(stream.map(|item| {
-        if rand::thread_rng().gen::<u8>() == 0 {
+        if rand::random::<u8>() == 0 {
             Err(io::Error::other("injected fault"))
         } else {
             item
