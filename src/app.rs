@@ -46,7 +46,7 @@ use url::form_urlencoded;
 use askama::Template;
 use bytes::Bytes;
 
-use crate::auth::UserRepoInfo;
+use crate::auth::{Permissions, UserRepoInfo};
 use crate::error::Error;
 use crate::error::{BadRequest, ClientAborted};
 use crate::hyperext::RequestExt;
@@ -85,6 +85,30 @@ const _: () = assert!(
 /// PUT. git-lfs uploads each object in one request, so larger objects are
 /// uploaded through the server, which sends them to S3 in parts.
 const MAX_PRESIGNED_UPLOAD_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Whether the request's user has the access `needs` asks for in the repo.
+/// Without GitHub auth there is no user on the request, and anyone may.
+fn may(req: &Request<Incoming>, needs: fn(&Permissions) -> bool) -> bool {
+    match req.extensions().get::<UserRepoInfo>() {
+        None => true,
+        Some(user) => user.permissions.as_ref().is_some_and(needs),
+    }
+}
+
+/// A 403 for a user without the `access` ("push" or "pull") the request
+/// needs, saying so.
+fn no_access(access: &str) -> Result<Response<BoxBody>, Error> {
+    let body = into_json(&lfs::BatchResponseError {
+        locks: None,
+        message: format!("This needs {access} access to the repository"),
+        documentation_url: None,
+        request_id: None,
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+        .body(full(body))?)
+}
 
 /// The response to a lock store's error: one the client can act on for its
 /// own mistakes, and otherwise the error back, for `Logger` to answer as the
@@ -174,14 +198,6 @@ where
             .body(full("Not found"))?)
     }
 
-    /// Generates a "403 forbidden" response.
-    fn forbidden(_req: Req) -> Result<Response<BoxBody>, Error> {
-        Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-            .body(empty())?)
-    }
-
     /// A "403 forbidden" for lock requests from a user whose GitHub username
     /// couldn't be found (a token that can't read the user). Locks record
     /// their owner, so there is none to record.
@@ -239,7 +255,9 @@ where
                 let key = StorageKey::new(namespace, oid);
 
                 match *req.method() {
+                    Method::GET if !may(&req, |p| p.pull) => no_access("pull"),
                     Method::GET => Self::download(storage, req, key).await,
+                    Method::PUT if !may(&req, |p| p.push) => no_access("push"),
                     Method::PUT => Self::upload(storage, req, key).await,
                     _ => Self::not_found(req),
                 }
@@ -247,6 +265,10 @@ where
             Some("objects") => match (req.method(), parts.next()) {
                 (&Method::POST, Some("batch")) => {
                     Self::batch(storage, req, namespace).await
+                }
+                // Verifying follows uploading.
+                (&Method::POST, Some("verify")) if !may(&req, |p| p.push) => {
+                    no_access("push")
                 }
                 (&Method::POST, Some("verify")) => {
                     Self::verify(storage, req, namespace).await
@@ -259,14 +281,14 @@ where
                     match (req.method(), parts.next()) {
                         (&Method::GET, None) => {
                             if !user.permissions.unwrap_or_default().pull {
-                                return Self::forbidden(req);
+                                return no_access("pull");
                             }
 
                             Self::list_locks(locks, req, namespace).await
                         }
                         (&Method::POST, None) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             let Some(owner) = user.username.clone() else {
@@ -278,7 +300,7 @@ where
                         }
                         (&Method::POST, Some("batch")) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             match parts.next() {
@@ -307,7 +329,7 @@ where
                         }
                         (&Method::POST, Some("verify")) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             let Some(owner) = user.username.clone() else {
@@ -321,7 +343,7 @@ where
                         }
                         (&Method::POST, Some(id)) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             match parts.next() {
@@ -504,10 +526,17 @@ where
         // Get the host name and scheme.
         let uri = req.base_uri().path_and_query("/").build()?;
         let headers = req.headers().clone();
+        let (may_pull, may_push) =
+            (may(&req, |p| p.pull), may(&req, |p| p.push));
 
         // JSON that doesn't parse is answered with a 400 by `Logger`.
         let val = from_json::<lfs::BatchRequest>(req.into_body()).await?;
         let operation = val.operation;
+        match operation {
+            lfs::Operation::Upload if !may_push => return no_access("push"),
+            lfs::Operation::Download if !may_pull => return no_access("pull"),
+            _ => {}
+        }
 
         // For each object, check if it exists in the storage backend.
         let objects = val.objects.into_iter().map(|object| {

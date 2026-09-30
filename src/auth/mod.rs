@@ -427,7 +427,7 @@ impl<S> Auth<S> {
     ) -> Result<Option<UserRepoInfo>, Error> {
         if let Some(auth) = headers.get(header::AUTHORIZATION) {
             // check cache
-            let key = Self::encode_auth_key(auth);
+            let key = Self::encode_auth_key(auth, namespace);
 
             if let Some(entry) = github_auth_cache.read().get(&key) {
                 event!(
@@ -543,9 +543,16 @@ impl<S> Auth<S> {
         Ok(None)
     }
 
-    fn encode_auth_key(input: &HeaderValue) -> String {
+    /// The cache key for `auth`'s access to `namespace`: GitHub's answer is
+    /// about that repo only.
+    fn encode_auth_key(auth: &HeaderValue, namespace: &Namespace) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(input.as_bytes());
+        hasher.update(auth.as_bytes());
+        // A header value can't hold a NUL, so none can run into the repo.
+        hasher.update([0]);
+        hasher.update(namespace.org().as_bytes());
+        hasher.update([0]);
+        hasher.update(namespace.project().as_bytes());
         let result = hasher.finalize();
 
         general_purpose::STANDARD.encode(result)

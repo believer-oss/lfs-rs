@@ -1038,6 +1038,27 @@ async fn username_outages_only_fail_locking()
     Ok(())
 }
 
+/// What GitHub said about the credentials' access to one repo is used for
+/// that repo only.
+#[tokio::test]
+async fn cached_access_is_per_repo() -> Result<(), Box<dyn std::error::Error>> {
+    // GitHub knows `test/test`, and no other repo.
+    let github = flaky_github(0).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let (status, _) =
+        server.request("GET", "/api/test/test/locks", b"").await?;
+    assert_eq!(status, 200);
+    let (status, _) =
+        server.request("GET", "/api/other/repo/locks", b"").await?;
+    assert_eq!(status, 401, "another repo was let in on this one's access");
+    Ok(())
+}
+
 /// GitHub rate limiting the username lookup is passed on to locking, which
 /// needs the username, with GitHub's wait.
 #[tokio::test]
@@ -1065,5 +1086,57 @@ async fn username_rate_limits_keep_githubs_wait()
     assert_eq!(parse(&response).0, 503);
     let head = String::from_utf8_lossy(&response).to_lowercase();
     assert!(head.contains("\r\nretry-after: 42\r\n"), "{head}");
+    Ok(())
+}
+
+/// Credentials that can only read the repo can download from it, and not
+/// upload to it.
+#[tokio::test]
+async fn read_only_access_cannot_upload()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_only = ResponseTemplate::new(200).set_body_raw(
+        r#"{"id": 1, "permissions": {"push": false, "pull": true}}"#,
+        "application/json",
+    );
+    let github = github_answering(read_only, 1, user_ok()).await;
+    let server = observed_with(Options {
+        github: Some(github.uri()),
+        ..Options::default()
+    })
+    .await?;
+
+    let batch = |operation: &str| {
+        format!(r#"{{"operation": "{operation}", "objects": []}}"#)
+    };
+    let path = "/api/test/test/objects/batch";
+    let download = batch("download");
+    let (status, _) = server.request("POST", path, download.as_bytes()).await?;
+    assert_eq!(status, 200);
+    let upload = batch("upload");
+    let (status, body) =
+        server.request("POST", path, upload.as_bytes()).await?;
+    assert_eq!(status, 403);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["message"], "This needs push access to the repository");
+
+    let object = format!("/api/test/test/object/{}", "b".repeat(64));
+    let (status, _) = server.request("PUT", &object, b"object").await?;
+    assert_eq!(status, 403);
+    let verify = format!(r#"{{"oid": "{}", "size": 6}}"#, "b".repeat(64));
+    let (status, _) = server
+        .request("POST", "/api/test/test/objects/verify", verify.as_bytes())
+        .await?;
+    assert_eq!(status, 403);
+    let (status, _) = server.request("GET", &object, b"").await?;
+    assert_eq!(status, 404, "a download was refused");
+
+    // Locking says the same.
+    let lock = lock_request("a.bin");
+    let (status, body) = server
+        .request("POST", "/api/test/test/locks", lock.as_bytes())
+        .await?;
+    assert_eq!(status, 403);
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["message"], "This needs push access to the repository");
     Ok(())
 }
