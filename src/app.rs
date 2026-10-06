@@ -21,21 +21,24 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
 
 use futures::{
-    future::{self, BoxFuture},
     TryStreamExt,
+    future::{self, BoxFuture},
 };
 
-use http::{self, header, HeaderMap, StatusCode, Uri};
+use http::{self, HeaderMap, StatusCode, Uri, header};
 use http_body_util::{BodyDataStream, BodyExt, StreamBody};
 use hyper::{
-    self,
+    self, Method, Request, Response,
     body::{Frame, Incoming},
-    Method, Request, Response,
 };
 use tower::Service;
 use url::form_urlencoded;
@@ -43,8 +46,9 @@ use url::form_urlencoded;
 use askama::Template;
 use bytes::Bytes;
 
-use crate::auth::UserRepoInfo;
+use crate::auth::{Permissions, UserRepoInfo};
 use crate::error::Error;
+use crate::error::{BadRequest, ClientAborted};
 use crate::hyperext::RequestExt;
 use crate::lfs;
 use crate::locks::{
@@ -53,98 +57,95 @@ use crate::locks::{
     ReleaseLockBatchRequest, ReleaseLockRequest, VerifyLocksRequest,
     VerifyLocksResponse,
 };
+use crate::logger::BatchSummary;
+use crate::sha256::{Sha256VerifyError, VerifyStream};
+use crate::stats::STATS;
 use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
 use crate::{empty, from_json, full, into_json};
+use parking_lot::Mutex;
 
-#[cfg(feature = "otel")]
-use crate::util::RedactedHeaders;
-#[cfg(feature = "otel")]
-use opentelemetry::trace::FutureExt;
 #[cfg(feature = "otel")]
 use tracing::instrument;
-#[cfg(feature = "otel")]
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-const PRESIGNED_URL_EXPIRATION: Duration = Duration::from_secs(30 * 60);
+/// How long presigned URLs last. git-lfs asks for new URLs once they expire,
+/// and S3 only checks the signature when a transfer starts.
+///
+/// A URL can't outlive the credentials that signed it, and those are only
+/// known to have half the credential refresh buffer left, so this must be at
+/// most that. See `storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER`.
+const PRESIGNED_URL_EXPIRATION: Duration = Duration::from_secs(15 * 60);
 
-fn handle_lock_error_response(err: anyhow::Error) -> (StatusCode, BoxBody) {
+const _: () = assert!(
+    PRESIGNED_URL_EXPIRATION.as_secs() * 2
+        <= crate::storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER.as_secs(),
+    "presigned URLs must last at most half the credential refresh buffer",
+);
+
+/// The largest upload that is sent to a presigned URL: S3's limit for a single
+/// PUT. git-lfs uploads each object in one request, so larger objects are
+/// uploaded through the server, which sends them to S3 in parts.
+const MAX_PRESIGNED_UPLOAD_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Whether the request's user has the access `needs` asks for in the repo.
+/// Without GitHub auth there is no user on the request, and anyone may.
+fn may(req: &Request<Incoming>, needs: fn(&Permissions) -> bool) -> bool {
+    match req.extensions().get::<UserRepoInfo>() {
+        None => true,
+        Some(user) => user.permissions.as_ref().is_some_and(needs),
+    }
+}
+
+/// A 403 for a user without the `access` ("push" or "pull") the request
+/// needs, saying so.
+fn no_access(access: &str) -> Result<Response<BoxBody>, Error> {
+    let body = into_json(&lfs::BatchResponseError {
+        locks: None,
+        message: format!("This needs {access} access to the repository"),
+        documentation_url: None,
+        request_id: None,
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+        .body(full(body))?)
+}
+
+/// The response to a lock store's error: one the client can act on for its
+/// own mistakes, and otherwise the error back, for `Logger` to answer as the
+/// server failing.
+fn handle_lock_error_response(
+    err: anyhow::Error,
+) -> Result<(StatusCode, BoxBody), Error> {
+    let lock_error = |status, message: String, locks| {
+        let body = into_json(&lfs::BatchResponseError {
+            locks,
+            message,
+            documentation_url: None,
+            request_id: None,
+        })
+        .unwrap_or_default();
+        Ok((status, full(body)))
+    };
     match err.downcast_ref::<LockStoreError>() {
-        Some(e @ LockStoreError::CreateConflict(l)) => (
-            StatusCode::CONFLICT,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: Some(l.clone()),
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::NotImplemented) => {
-            (StatusCode::NOT_FOUND, empty())
+        Some(e @ LockStoreError::CreateConflict(l)) => {
+            lock_error(StatusCode::CONFLICT, e.to_string(), Some(l.clone()))
         }
-        #[cfg(feature = "redis")]
-        Some(LockStoreError::RedisError(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::DeleteNotFound(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::LockNotFound(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        Some(LockStoreError::InternalServerError(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: e.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            full(
-                into_json(&lfs::BatchResponseError {
-                    locks: None,
-                    message: err.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                })
-                .unwrap_or_default(),
-            ),
-        ),
+        Some(LockStoreError::NotImplemented) => {
+            Ok((StatusCode::NOT_FOUND, empty()))
+        }
+        Some(
+            e @ (LockStoreError::DeleteNotFound(_)
+            | LockStoreError::LockNotFound(_)),
+        ) => lock_error(StatusCode::NOT_FOUND, e.to_string(), None),
+        Some(e @ LockStoreError::BadRequest(_)) => {
+            lock_error(StatusCode::BAD_REQUEST, e.to_string(), None)
+        }
+        Some(e @ LockStoreError::Forbidden(_)) => {
+            lock_error(StatusCode::FORBIDDEN, e.to_string(), None)
+        }
+        // The store failed: a Redis or DynamoDB error, or a file it couldn't
+        // write.
+        _ => Err(err),
     }
 }
 
@@ -178,7 +179,6 @@ where
     Error: From<S::Error>,
 {
     /// Handles the index route.
-    #[cfg_attr(feature = "otel", instrument(level = "debug", skip(req)))]
     fn index(req: Req) -> Result<Response<BoxBody>, Error> {
         let template = IndexTemplate {
             title: "Rudolfs",
@@ -187,31 +187,36 @@ where
 
         Ok(Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(full(template.render()?))?)
     }
 
     /// Generates a "404 not found" response.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
     fn not_found(_req: Req) -> Result<Response<BoxBody>, Error> {
         Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(full("Not found"))?)
     }
 
-    /// Generates a "403 forbidden" response.
-    #[cfg_attr(feature = "otel", instrument(level = "info", skip(_req)))]
-    fn forbidden(_req: Req) -> Result<Response<BoxBody>, Error> {
+    /// A "403 forbidden" for lock requests from a user whose GitHub username
+    /// couldn't be found (a token that can't read the user). Locks record
+    /// their owner, so there is none to record.
+    ///
+    /// If GitHub failed to say, that is the server failing: an error, for
+    /// `Logger` to answer.
+    fn no_username(user: &UserRepoInfo) -> Result<Response<BoxBody>, Error> {
+        if let Some(err) = &user.username_error {
+            return Err(err.to_error());
+        }
         Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
-            .header("Lfs-Authenticate", "Basic realm=\"GitHub\"")
-            .body(empty())?)
+            .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(full(
+                r#"{"message":"Locking needs your GitHub username, and GitHub didn't return one for these credentials."}"#,
+            ))?)
     }
 
     /// Handles `/api` routes.
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", skip(storage, locks, req))
-    )]
     async fn api(
         storage: S,
         locks: L,
@@ -230,7 +235,7 @@ where
             _ => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(full("Missing org/project in URL"))?)
+                    .body(full("Missing org/project in URL"))?);
             }
         };
 
@@ -243,14 +248,16 @@ where
                     None => {
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(full("Missing OID parameter."))?)
+                            .body(full("Missing OID parameter."))?);
                     }
                 };
 
                 let key = StorageKey::new(namespace, oid);
 
                 match *req.method() {
+                    Method::GET if !may(&req, |p| p.pull) => no_access("pull"),
                     Method::GET => Self::download(storage, req, key).await,
+                    Method::PUT if !may(&req, |p| p.push) => no_access("push"),
                     Method::PUT => Self::upload(storage, req, key).await,
                     _ => Self::not_found(req),
                 }
@@ -258,6 +265,10 @@ where
             Some("objects") => match (req.method(), parts.next()) {
                 (&Method::POST, Some("batch")) => {
                     Self::batch(storage, req, namespace).await
+                }
+                // Verifying follows uploading.
+                (&Method::POST, Some("verify")) if !may(&req, |p| p.push) => {
+                    no_access("push")
                 }
                 (&Method::POST, Some("verify")) => {
                     Self::verify(storage, req, namespace).await
@@ -270,45 +281,46 @@ where
                     match (req.method(), parts.next()) {
                         (&Method::GET, None) => {
                             if !user.permissions.unwrap_or_default().pull {
-                                return Self::forbidden(req);
+                                return no_access("pull");
                             }
 
                             Self::list_locks(locks, req, namespace).await
                         }
                         (&Method::POST, None) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
-                            Self::create_lock(
-                                locks,
-                                req,
-                                namespace,
-                                user.username.unwrap(),
-                            )
-                            .await
+                            let Some(owner) = user.username.clone() else {
+                                return Self::no_username(&user);
+                            };
+
+                            Self::create_lock(locks, req, namespace, owner)
+                                .await
                         }
                         (&Method::POST, Some("batch")) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             match parts.next() {
                                 Some("lock") => {
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username(&user);
+                                    };
                                     Self::create_lock_batch(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, owner,
                                     )
                                     .await
                                 }
                                 Some("unlock") => {
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username(&user);
+                                    };
                                     Self::release_lock_batch(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, owner,
                                     )
                                     .await
                                 }
@@ -317,31 +329,32 @@ where
                         }
                         (&Method::POST, Some("verify")) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
+                            let Some(owner) = user.username.clone() else {
+                                return Self::no_username(&user);
+                            };
+
                             Self::list_locks_for_verification(
-                                locks,
-                                req,
-                                namespace,
-                                user.username.unwrap(),
+                                locks, req, namespace, owner,
                             )
                             .await
                         }
                         (&Method::POST, Some(id)) => {
                             if !user.permissions.unwrap_or_default().push {
-                                return Self::forbidden(req);
+                                return no_access("push");
                             }
 
                             match parts.next() {
                                 Some("unlock") => {
                                     let id = id.to_owned();
+                                    let Some(owner) = user.username.clone()
+                                    else {
+                                        return Self::no_username(&user);
+                                    };
                                     Self::release_lock(
-                                        locks,
-                                        req,
-                                        namespace,
-                                        id,
-                                        user.username.unwrap(),
+                                        locks, req, namespace, id, owner,
                                     )
                                     .await
                                 }
@@ -362,7 +375,7 @@ where
     /// Downloads a single LFS object.
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, _req))
+        instrument(level = "info", skip_all, fields(lfs.oid = %key.oid()))
     )]
     async fn download(
         storage: S,
@@ -374,6 +387,9 @@ where
             let body_stream = StreamBody::new(
                 object
                     .stream()
+                    // Counted as sent, so an aborted download counts only
+                    // what the client got.
+                    .inspect_ok(|chunk| STATS.downloaded(chunk.len() as u64))
                     .map_ok(Frame::data)
                     .map_err(|e: std::io::Error| e.into()),
             );
@@ -393,7 +409,7 @@ where
     /// Uploads a single LFS object.
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, req))
+        instrument(level = "info", skip_all, fields(lfs.oid = %key.oid()))
     )]
     async fn upload(
         storage: S,
@@ -416,24 +432,53 @@ where
             }
         };
 
-        // Verify the SHA256 of the uploaded object as it is being uploaded.
-        let body = req.into_body();
-        let stream = BodyDataStream::new(body)
-            .try_filter_map(|chunk| async { Ok(Some(chunk)) })
-            .map_err(std::io::Error::other);
+        // The object is checked against its OID here, rather than by the
+        // storage stack, so that a mismatch is known to be the client's.
+        // Whether reading the body failed, or it didn't match, is noted, as
+        // the storage stack doesn't keep its error. Behind a disk cache, a
+        // storage failure can still be followed by the client going away
+        // during the next chunk's read, and is then taken as the client's.
+        // The storage's error is still in the chain, and the window is one
+        // chunk.
+        let body_failed = Arc::new(AtomicBool::new(false));
+        let mismatch = Arc::new(Mutex::new(None));
+        let oid = *key.oid();
+        let body = BodyDataStream::new(req.into_body())
+            .inspect_ok(|chunk: &Bytes| STATS.uploaded(chunk.len() as u64))
+            .map_err(UploadError::Body);
+        let stream = VerifyStream::new(body, len, oid).map_err({
+            let (body_failed, mismatch) =
+                (body_failed.clone(), mismatch.clone());
+            move |err| match err {
+                UploadError::Body(err) => {
+                    body_failed.store(true, Ordering::Relaxed);
+                    std::io::Error::other(err)
+                }
+                UploadError::Mismatch(err) => {
+                    *mismatch.lock() = Some(err.clone());
+                    std::io::Error::other(err)
+                }
+            }
+        });
 
         let object = LFSObject::new(len, Box::pin(stream));
 
-        storage.put(key, object).await?;
+        if let Err(err) = storage.put(key, object).await {
+            let err = Error::from(err);
+            if let Some(mismatch) = mismatch.lock().take() {
+                return Err(BadRequest(mismatch.into()).into());
+            }
+            if body_failed.load(Ordering::Relaxed) {
+                return Err(ClientAborted(err).into());
+            }
+            return Err(err);
+        }
 
         Ok(Response::builder().status(StatusCode::OK).body(empty())?)
     }
 
     /// Verifies that an LFS object exists on the server.
-    #[cfg_attr(
-        feature = "otel",
-        instrument(level = "info", skip(storage, req))
-    )]
+    #[cfg_attr(feature = "otel", instrument(level = "info", skip_all))]
     async fn verify(
         storage: S,
         req: Request<Incoming>,
@@ -442,12 +487,12 @@ where
         let val: lfs::VerifyRequest = from_json(req.into_body()).await?;
         let key = StorageKey::new(namespace, val.oid);
 
-        if let Some(size) = storage.size(&key).await? {
-            if size == val.size {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(empty())?);
-            }
+        if let Some(size) = storage.size(&key).await?
+            && size == val.size
+        {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(empty())?);
         }
 
         // Object doesn't exist or the size is incorrect.
@@ -462,7 +507,16 @@ where
     /// https://github.com/git-lfs/git-lfs/blob/master/docs/api/batch.md
     #[cfg_attr(
         feature = "otel",
-        instrument(level = "info", skip(storage, req))
+        instrument(
+            level = "info",
+            skip_all,
+            fields(
+                lfs.operation,
+                lfs.objects,
+                lfs.objects.presigned,
+                lfs.objects.missing
+            )
+        )
     )]
     async fn batch(
         storage: S,
@@ -472,56 +526,49 @@ where
         // Get the host name and scheme.
         let uri = req.base_uri().path_and_query("/").build()?;
         let headers = req.headers().clone();
+        let (may_pull, may_push) =
+            (may(&req, |p| p.pull), may(&req, |p| p.push));
 
-        match from_json::<lfs::BatchRequest>(req.into_body()).await {
-            Ok(val) => {
-                let operation = val.operation;
-
-                // For each object, check if it exists in the storage
-                // backend.
-                let objects = val.objects.into_iter().map(|object| {
-                    let uri = uri.clone();
-                    let key = StorageKey::new(namespace.clone(), object.oid);
-
-                    async {
-                        let size = storage.size(&key).await;
-
-                        let (namespace, _) = key.into_parts();
-                        Ok(basic_response(
-                            uri, &headers, &storage, object, operation, size,
-                            namespace,
-                        )
-                        .await)
-                    }
-                });
-
-                let objects = future::try_join_all(objects).await?;
-                let mut transfer = Some(lfs::Transfer::Basic);
-                if let Some(transfers) = val.transfers {
-                    if transfers.contains(&lfs::Transfer::LfsRs) {
-                        transfer = Some(lfs::Transfer::LfsRs)
-                    }
-                }
-                let response = lfs::BatchResponse { transfer, objects };
-
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(full(into_json(&response)?))?)
-            }
-            Err(err) => {
-                let response = lfs::BatchResponseError {
-                    locks: None,
-                    message: err.to_string(),
-                    documentation_url: None,
-                    request_id: None,
-                };
-
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full(into_json(&response)?))?)
-            }
+        // JSON that doesn't parse is answered with a 400 by `Logger`.
+        let val = from_json::<lfs::BatchRequest>(req.into_body()).await?;
+        let operation = val.operation;
+        match operation {
+            lfs::Operation::Upload if !may_push => return no_access("push"),
+            lfs::Operation::Download if !may_pull => return no_access("pull"),
+            _ => {}
         }
+
+        // For each object, check if it exists in the storage backend.
+        let objects = val.objects.into_iter().map(|object| {
+            let uri = uri.clone();
+            let key = StorageKey::new(namespace.clone(), object.oid);
+
+            async {
+                let size = storage.size(&key).await;
+
+                let (namespace, _) = key.into_parts();
+                Ok(basic_response(
+                    uri, &headers, &storage, object, operation, size, namespace,
+                )
+                .await)
+            }
+        });
+
+        let objects = future::try_join_all(objects).await?;
+        let mut transfer = Some(lfs::Transfer::Basic);
+        if let Some(transfers) = val.transfers
+            && transfers.contains(&lfs::Transfer::LfsRs)
+        {
+            transfer = Some(lfs::Transfer::LfsRs)
+        }
+        let summary = batch_summary(operation, &objects, &uri);
+        let response = lfs::BatchResponse { transfer, objects };
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(summary)
+            .body(full(into_json(&response)?))?)
     }
 
     async fn list_locks(
@@ -563,7 +610,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -608,7 +655,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -644,7 +691,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -683,7 +730,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -728,7 +775,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -763,7 +810,7 @@ where
                     .body(full(into_json(&resp)?))?)
             }
             Err(err) => {
-                let (status, body) = handle_lock_error_response(err);
+                let (status, body) = handle_lock_error_response(err)?;
                 Ok(Response::builder()
                     .status(status)
                     .header(
@@ -774,6 +821,49 @@ where
             }
         }
     }
+}
+
+/// Sums up a batch response for its request span and log line, and records it
+/// on the batch span. Objects are presigned when their action goes straight to
+/// S3 rather than through this server.
+fn batch_summary(
+    operation: lfs::Operation,
+    objects: &[lfs::ResponseObject],
+    server: &Uri,
+) -> BatchSummary {
+    let server = server.to_string();
+    let presigned = objects
+        .iter()
+        .filter_map(|object| object.actions.as_ref())
+        .filter_map(|actions| {
+            actions.download.as_ref().or(actions.upload.as_ref())
+        })
+        .filter(|action| !action.href.starts_with(&server))
+        .count();
+    let summary = BatchSummary {
+        operation: match operation {
+            lfs::Operation::Upload => "upload",
+            lfs::Operation::Download => "download",
+        },
+        objects: objects.len(),
+        presigned,
+        missing: objects
+            .iter()
+            .filter(|object| object.error.is_some())
+            .count(),
+    };
+
+    // The batch handler's span only exists with `otel`; without it, the
+    // current span is the request's, which records its own.
+    #[cfg(feature = "otel")]
+    {
+        let span = tracing::Span::current();
+        span.record("lfs.operation", summary.operation);
+        span.record("lfs.objects", summary.objects as i64);
+        span.record("lfs.objects.presigned", summary.presigned as i64);
+        span.record("lfs.objects.missing", summary.missing as i64);
+    }
+    summary
 }
 
 async fn basic_response<E, S>(
@@ -811,21 +901,24 @@ where
     let size = match size {
         Ok(size) => size,
         Err(err) => {
-            tracing::error!("batch response error: {err}");
+            tracing::error!("batch response error: {err:#}");
 
             // Return a generic "500 - Internal Server Error" for objects that
             // we failed to get the size of. This is usually caused by some
             // intermittent problem on the storage backend. A retry strategy
             // should be implemented on the storage backend to help mitigate
             // this possibility because the git-lfs client does not currenty
-            // implement retries in this case.
+            // implement retries in this case. It doesn't say why, as the error
+            // may name storage details, but gives the trace to look for.
+            let request_id = crate::logger::trace_id(&tracing::Span::current());
+            let message = match request_id {
+                Some(id) => format!("Internal server error (request ID {id})"),
+                None => "Internal server error".to_string(),
+            };
             return lfs::ResponseObject {
                 oid: object.oid,
                 size: object.size,
-                error: Some(lfs::ObjectError {
-                    code: 500,
-                    message: err.to_string(),
-                }),
+                error: Some(lfs::ObjectError { code: 500, message }),
                 authenticated: Some(true),
                 actions: None,
             };
@@ -848,16 +941,26 @@ where
                     actions: None,
                 },
                 None => {
+                    let presigned_url = if object.size
+                        <= MAX_PRESIGNED_UPLOAD_SIZE
+                    {
+                        storage
+                            .upload_url(
+                                &StorageKey::new(namespace.clone(), object.oid),
+                                PRESIGNED_URL_EXPIRATION,
+                            )
+                            .await
+                    } else {
+                        None
+                    };
+
                     // If we're returning a pre-signed URL, don't also reflect
                     // the auth header back to the client.
-                    let (upload_url, header) = match storage
-                        .upload_url(
-                            &StorageKey::new(namespace.clone(), object.oid),
-                            PRESIGNED_URL_EXPIRATION,
-                        )
-                        .await
-                    {
-                        Some(url) => (url, None),
+                    let (upload_url, header) = match presigned_url {
+                        Some(url) => {
+                            STATS.presigned_upload();
+                            (url, None)
+                        }
                         None => (
                             format!(
                                 "{}api/{}/object/{}",
@@ -897,14 +1000,14 @@ where
         lfs::Operation::Download => {
             // If we're returning a pre-signed URL, don't also reflect
             // the auth header back to the client.
-            let (download_url, header) = match storage
+            let (download_url, header, presigned) = match storage
                 .download_url(
                     &StorageKey::new(namespace.clone(), object.oid),
                     PRESIGNED_URL_EXPIRATION,
                 )
                 .await
             {
-                Some(url) => (url, None),
+                Some(url) => (url, None, true),
                 None => (
                     storage
                         .public_url(&StorageKey::new(
@@ -918,8 +1021,13 @@ where
                             )
                         }),
                     extract_auth_header(headers),
+                    false,
                 ),
             };
+
+            if presigned && size.is_some() {
+                STATS.presigned_download();
+            }
 
             // If the object does not exist, then we should return a 404 error
             // for this object.
@@ -933,7 +1041,11 @@ where
                         download: Some(lfs::Action {
                             href: download_url,
                             header,
-                            expires_in: None,
+                            // So that git-lfs asks for a new URL, rather than
+                            // using one that has expired.
+                            expires_in: presigned.then_some(
+                                PRESIGNED_URL_EXPIRATION.as_secs() as i32,
+                            ),
                             expires_at: None,
                         }),
                         upload: None,
@@ -973,11 +1085,7 @@ fn extract_auth_header(
         }
     });
     let map = BTreeMap::from_iter(headers);
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
+    if map.is_empty() { None } else { Some(map) }
 }
 
 impl<S, L> Service<Req> for App<S, L>
@@ -998,44 +1106,8 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[cfg_attr(
-        feature = "otel",
-        instrument(
-            level = "info",
-            skip(self, req),
-            name = "http.request",
-            fields(
-                method = req.method().as_str(),
-                path = req.uri().path(),
-                query = req.uri().query().unwrap_or_default(),
-                headers
-            )
-        )
-    )]
+    // The request's span is `Logger`'s, which this is called within.
     fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        #[cfg(feature = "otel")]
-        {
-            let span = tracing::Span::current();
-
-            span.record(
-                "headers",
-                format!("{}", RedactedHeaders(req.headers().clone())),
-            );
-            let ctx = span.context();
-
-            if req.uri().path() == "/" {
-                Box::pin(future::ready(Self::index(req)).with_context(ctx))
-            } else if req.uri().path().starts_with("/api/") {
-                Box::pin(
-                    Self::api(self.storage.clone(), self.locks.clone(), req)
-                        .with_context(ctx),
-                )
-            } else {
-                Box::pin(future::ready(Self::not_found(req)).with_context(ctx))
-            }
-        }
-
-        #[cfg(not(feature = "otel"))]
         if req.uri().path() == "/" {
             Box::pin(future::ready(Self::index(req)))
         } else if req.uri().path().starts_with("/api/") {
@@ -1043,5 +1115,163 @@ where
         } else {
             Box::pin(future::ready(Self::not_found(req)))
         }
+    }
+}
+
+/// Why an upload's body stream failed.
+#[derive(Debug)]
+enum UploadError {
+    /// Reading it from the client failed.
+    Body(hyper::Error),
+    /// It didn't match its OID.
+    Mismatch(Sha256VerifyError),
+}
+
+impl From<Sha256VerifyError> for UploadError {
+    fn from(err: Sha256VerifyError) -> Self {
+        UploadError::Mismatch(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::StorageStream;
+    use async_trait::async_trait;
+
+    #[test]
+    fn lock_errors_are_answered_for_what_they_are() {
+        let status = |err: LockStoreError| {
+            handle_lock_error_response(anyhow::anyhow!(err))
+                .map(|(status, _)| status)
+                .ok()
+        };
+        assert_eq!(
+            status(crate::locks::held_by_another("alice", "bob")),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(LockStoreError::LockNotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            status(LockStoreError::DeleteNotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            status(LockStoreError::BadRequest("x".into())),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        // The store failing is left to `Logger`, which answers with a 503.
+        assert_eq!(
+            status(LockStoreError::InternalServerError("x".into())),
+            None
+        );
+        assert!(
+            handle_lock_error_response(anyhow::anyhow!("disk full")).is_err()
+        );
+    }
+
+    /// A store that presigns every upload and holds nothing.
+    struct Presigning;
+
+    #[async_trait]
+    impl Storage for Presigning {
+        type Error = std::io::Error;
+
+        async fn get(
+            &self,
+            _: &StorageKey,
+        ) -> Result<Option<LFSObject>, Self::Error> {
+            Ok(None)
+        }
+        async fn put(
+            &self,
+            _: StorageKey,
+            _: LFSObject,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn size(
+            &self,
+            _: &StorageKey,
+        ) -> Result<Option<u64>, Self::Error> {
+            Ok(None)
+        }
+        async fn delete(&self, _: &StorageKey) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn list(&self) -> StorageStream<(StorageKey, u64), Self::Error> {
+            Box::pin(futures::stream::empty())
+        }
+        fn public_url(&self, _: &StorageKey) -> Option<String> {
+            None
+        }
+        async fn upload_url(
+            &self,
+            _: &StorageKey,
+            _: Duration,
+        ) -> Option<String> {
+            Some("https://presigned.example/upload".into())
+        }
+        async fn download_url(
+            &self,
+            _: &StorageKey,
+            _: Duration,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// The upload action the batch response gives for a new object of `size`.
+    async fn upload_action(size: u64) -> lfs::Action {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Basic dXNlcjp0b2tlbg==".parse().unwrap(),
+        );
+        let object = lfs::RequestObject {
+            oid: "b1fbeefc23e6a149a6f7d0c2fb635bfc78f7ddc2da963ea9c6a63eb324260e6d"
+                .parse()
+                .unwrap(),
+            size,
+        };
+
+        let response = basic_response(
+            "http://lfs.example/".parse().unwrap(),
+            &headers,
+            &Presigning,
+            object,
+            lfs::Operation::Upload,
+            Ok::<_, std::io::Error>(None),
+            Namespace::new("org".into(), "project".into()),
+        )
+        .await;
+
+        response.actions.unwrap().upload.unwrap()
+    }
+
+    /// S3 takes a single PUT of up to 5 GiB; git-lfs can't split an upload.
+    #[tokio::test]
+    async fn uploads_up_to_5_gib_are_presigned() {
+        let action = upload_action(MAX_PRESIGNED_UPLOAD_SIZE).await;
+        assert_eq!(action.href, "https://presigned.example/upload");
+        assert!(action.header.is_none());
+    }
+
+    /// Larger uploads go through the server, which sends them to S3 in parts.
+    #[tokio::test]
+    async fn larger_uploads_go_through_the_server() {
+        let action = upload_action(MAX_PRESIGNED_UPLOAD_SIZE + 1).await;
+        assert!(
+            action
+                .href
+                .starts_with("http://lfs.example/api/org/project/object/"),
+            "{}",
+            action.href
+        );
+        // The client needs its credentials to upload to the server.
+        let header = action.header.unwrap();
+        assert_eq!(header["authorization"], "Basic dXNlcjp0b2tlbg==");
     }
 }

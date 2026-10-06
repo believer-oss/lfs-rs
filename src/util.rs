@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use core::{
-    fmt, mem,
+    mem,
     ops::Deref,
     pin::Pin,
     task::{Context, Poll},
@@ -28,7 +28,6 @@ use futures::TryStreamExt;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use http::HeaderMap;
 use http_body_util::{BodyExt, BodyStream, Full};
 use hyper::body::Incoming;
 use serde::{Deserialize, Serialize};
@@ -39,7 +38,7 @@ use tokio::{
 };
 
 use crate::app::BoxBody;
-use crate::error::Error;
+use crate::error::{BadRequest, ClientAborted, Error};
 
 /// A temporary file path. When dropped, the file is deleted.
 #[derive(Debug)]
@@ -168,6 +167,9 @@ impl AsyncWrite for NamedTempFile {
     }
 }
 
+/// Reads a request's JSON body. For request bodies only: a failure to read
+/// the body is taken to be the client going away (`ClientAborted`), and JSON
+/// that doesn't parse is a `BadRequest`.
 pub async fn from_json<T>(body: Incoming) -> Result<T, Error>
 where
     T: for<'de> Deserialize<'de>,
@@ -175,13 +177,18 @@ where
     let mut buf = Vec::new();
     let mut stream = BodyStream::new(body);
 
-    while let Some(chunk) = stream.try_next().await? {
+    // Reading a request's body only fails when the client stops sending it.
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|err| ClientAborted(err.into()))?
+    {
         if chunk.is_data() {
             buf.extend_from_slice(chunk.into_data().unwrap().as_ref());
         }
     }
 
-    Ok(serde_json::from_slice(&buf)?)
+    serde_json::from_slice(&buf).map_err(|err| BadRequest(err.into()).into())
 }
 
 #[allow(clippy::result_large_err)]
@@ -203,20 +210,4 @@ pub fn empty() -> BoxBody {
     Full::new(Bytes::new())
         .map_err(|never| match never {})
         .boxed_unsync()
-}
-
-pub struct RedactedHeaders(pub HeaderMap);
-
-// Redact the Authorization header.
-impl fmt::Display for RedactedHeaders {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (key, value) in &self.0 {
-            if key == "authorization" {
-                writeln!(f, "{}: [REDACTED]", key)?;
-            } else {
-                writeln!(f, "{}: {}", key, value.to_str().unwrap_or_default())?;
-            }
-        }
-        Ok(())
-    }
 }

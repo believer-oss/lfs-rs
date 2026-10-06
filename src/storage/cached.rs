@@ -30,8 +30,10 @@ use futures::{
     stream::{StreamExt, TryStreamExt},
 };
 use tokio::{self, sync::Mutex};
+use tracing::Instrument as _;
 
 use crate::lru;
+use crate::stats::STATS;
 
 use super::{LFSObject, Storage, StorageKey, StorageStream};
 
@@ -77,11 +79,19 @@ impl<C, S> Error<C, S> {
     }
 }
 
+// Transparent, like `Display`: the source is the wrapped error's.
 impl<C, S> std::error::Error for Error<C, S>
 where
-    C: fmt::Debug + fmt::Display,
-    S: fmt::Debug + fmt::Display,
+    C: std::error::Error,
+    S: std::error::Error,
 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Cache(x) => x.source(),
+            Error::Storage(x) => x.source(),
+            Error::Stream(x) => x.source(),
+        }
+    }
 }
 
 /// Combines a cache with a permanent storage backend such that if a query to
@@ -122,6 +132,7 @@ where
         if count > 0 {
             tracing::info!("Pruned {} entries from the cache", count);
         }
+        STATS.disk_cache_size(lru.lock().await.size(), max_size);
 
         Ok(Backend {
             lru,
@@ -130,6 +141,13 @@ where
             storage: Arc::new(storage),
         })
     }
+}
+
+/// Whether an object is too big to go in a cache of `max_size` bytes (0 is
+/// unlimited). Caching one close to the cache's size would evict everything
+/// else, and one over it would be written to disk only to be evicted at once.
+fn too_big_to_cache(len: u64, max_size: u64) -> bool {
+    max_size != 0 && len > max_size / 4
 }
 
 /// Returns a future that prunes the least recently used entries that cause the
@@ -147,19 +165,34 @@ where
         return Ok(0);
     }
 
-    let mut deleted = 0;
-
-    let mut lru = lru.lock().await;
-
-    while lru.size() > max_size {
-        if let Some((key, _)) = lru.pop() {
-            tracing::debug!("Pruning '{}' from cache", key);
-            let _ = storage.delete(&key).await;
-            deleted += 1;
+    // Choose what to evict with the LRU locked, but delete the files after
+    // unlocking it: every request needs the LRU, and deleting files takes a
+    // while.
+    //
+    // If an evicted object is downloaded and cached again before its file is
+    // deleted here, the new file is deleted instead. That is harmless: the LRU
+    // lists it without a file, so the next `get` drops the entry and falls back
+    // to permanent storage.
+    let evicted = {
+        let mut lru = lru.lock().await;
+        let mut evicted = Vec::new();
+        while lru.size() > max_size {
+            match lru.pop() {
+                Some((key, _)) => evicted.push(key),
+                // Only if the size is miscounted; don't spin.
+                None => break,
+            }
         }
+        STATS.disk_cache_size(lru.size(), max_size);
+        evicted
+    };
+
+    for key in &evicted {
+        tracing::debug!("Pruning '{}' from cache", key);
+        let _ = storage.delete(key).await;
     }
 
-    Ok(deleted)
+    Ok(evicted.len())
 }
 
 async fn cache_and_prune<C>(
@@ -185,6 +218,7 @@ where
     {
         let mut lru = lru.lock().await;
         lru.push(key, len);
+        STATS.disk_cache_size(lru.size(), max_size);
     }
 
     match prune_cache(lru, max_size, cache).await {
@@ -226,13 +260,21 @@ where
             let obj = self.cache.get(key).await.map_err(Error::from_cache)?;
 
             return match obj {
-                Some(obj) => Ok(Some(obj)),
+                Some(obj) => {
+                    STATS.disk_cache_hit();
+                    Ok(Some(obj))
+                }
                 None => {
+                    STATS.disk_cache_miss();
                     // If the cache doesn't actually have it, delete the entry
                     // from our LRU. This can happen if the cache is cleared out
-                    // manually.
-                    let mut lru = self.lru.lock().await;
-                    lru.remove(key);
+                    // manually. The lock is released before falling back, so
+                    // other requests aren't held up by the download.
+                    {
+                        let mut lru = self.lru.lock().await;
+                        lru.remove(key);
+                        STATS.disk_cache_size(lru.size(), self.max_size);
+                    }
 
                     // Fall back to permanent storage. Note that this won't
                     // actually cache the object. This will be done next time
@@ -244,6 +286,7 @@ where
 
         // Cache miss. Get the object from permanent storage. If successful, we
         // need to cache the resulting byte stream.
+        STATS.disk_cache_miss();
         let lru = self.lru.clone();
         let max_size = self.max_size;
         let cache = self.cache.clone();
@@ -252,6 +295,14 @@ where
         let obj = self.storage.get(&key).await.map_err(Error::from_storage)?;
 
         match obj {
+            Some(obj) if too_big_to_cache(obj.len(), max_size) => {
+                tracing::debug!(
+                    "Not caching {} ({} bytes): too big for the cache",
+                    key,
+                    obj.len()
+                );
+                Ok(Some(obj))
+            }
             Some(obj) => {
                 // Cache the returned LFS object.
                 let (f, a, b) = obj.fanout();
@@ -262,14 +313,33 @@ where
                 // server should still continue operating.
                 let cache =
                     cache_and_prune(cache, key.clone(), b, lru, max_size)
-                        .map_err(Error::from_cache);
+                        .map_err(Error::<C::Error, S::Error>::from_cache);
 
                 tokio::spawn(
-                    future::try_join(f.map_err(Error::from_stream), cache)
-                        .map_ok(|((), ())| ())
-                        .map_err(move |err: Self::Error| {
-                            tracing::error!("Error caching {} ({})", key, err);
-                        }),
+                    async move {
+                        let (sent, cached) = future::join(f, cache).await;
+                        // If reading the object failed, so did the cache's
+                        // copy of it, and the download's error says why.
+                        match (&sent, cached) {
+                            (Err(_), Err(err)) => {
+                                tracing::debug!("Not caching {} ({})", key, err)
+                            }
+                            (Ok(()), Err(err)) => tracing::error!(
+                                "Error caching {} ({})",
+                                key,
+                                err
+                            ),
+                            (_, Ok(())) => {}
+                        }
+                        if let Err(err) = sent {
+                            tracing::debug!(
+                                "Download of {} stopped: {}",
+                                key,
+                                err
+                            );
+                        }
+                    }
+                    .in_current_span(),
                 );
 
                 // Send the object from permanent-storage.
@@ -292,10 +362,24 @@ where
         key: StorageKey,
         value: LFSObject,
     ) -> Result<(), Self::Error> {
+        if too_big_to_cache(value.len(), self.max_size) {
+            tracing::debug!(
+                "Not caching {} ({} bytes): too big for the cache",
+                key,
+                value.len()
+            );
+            return self
+                .storage
+                .put(key, value)
+                .await
+                .map_err(Error::from_storage);
+        }
+
         let lru = self.lru.clone();
         let max_size = self.max_size;
         let cache = self.cache.clone();
 
+        let oid = *key.oid();
         let (f, a, b) = value.fanout();
 
         // Note: We can only cache an object if it is successfully uploaded to
@@ -336,9 +420,24 @@ where
             lru,
             max_size,
         )
-        .map_err(Error::from_cache);
+        .map_err(Error::<C::Error, S::Error>::from_cache);
 
-        future::try_join3(f.map_err(Error::from_stream), cache, store).await?;
+        // The cache is best effort: its failure is logged, and doesn't fail an
+        // upload that permanent storage accepted.
+        let (sent, cached, stored) = future::join3(f, cache, store).await;
+        if let Err(err) = cached {
+            // If the upload failed, so did the cache's copy of it, and the
+            // upload's own error says why. A cache that failed by itself (a
+            // full disk, say) during a failed upload is missed here, but not on
+            // the next upload that succeeds.
+            if sent.is_err() || stored.is_err() {
+                tracing::debug!("Not caching {} ({})", oid, err);
+            } else {
+                tracing::error!("Error caching {} ({})", oid, err);
+            }
+        }
+        stored?;
+        sent.map_err(Error::from_stream)?;
 
         Ok(())
     }
@@ -408,5 +507,289 @@ where
         expires_in: Duration,
     ) -> Option<String> {
         self.storage.download_url(key, expires_in).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lfs::Oid;
+    use crate::storage::Namespace;
+    use futures::stream;
+    use std::collections::HashMap;
+    use tokio::sync::Notify;
+
+    /// In-memory storage. If it has a gate, `get` (or with `delete_gate`,
+    /// `delete`) signals `entered` and then waits for `release`, so a test can
+    /// hold a download or a delete open.
+    #[derive(Default)]
+    struct Memory {
+        objects: parking_lot::Mutex<HashMap<StorageKey, Bytes>>,
+        gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        delete_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        /// Fail every `put`, as a full or broken disk would.
+        fail_puts: bool,
+    }
+
+    impl Memory {
+        fn with(key: &StorageKey, data: &'static [u8]) -> Self {
+            let memory = Memory::default();
+            memory
+                .objects
+                .lock()
+                .insert(key.clone(), Bytes::from_static(data));
+            memory
+        }
+    }
+
+    #[async_trait]
+    impl Storage for Memory {
+        type Error = io::Error;
+
+        async fn get(
+            &self,
+            key: &StorageKey,
+        ) -> Result<Option<LFSObject>, Self::Error> {
+            if let Some((entered, release)) = &self.gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            let data = self.objects.lock().get(key).cloned();
+            Ok(data.map(|data| {
+                let len = data.len() as u64;
+                // In small chunks, as a real download would arrive.
+                let chunks: Vec<io::Result<Bytes>> = data
+                    .chunks(4)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                LFSObject::new(len, Box::pin(stream::iter(chunks)))
+            }))
+        }
+
+        async fn put(
+            &self,
+            key: StorageKey,
+            value: LFSObject,
+        ) -> Result<(), Self::Error> {
+            if self.fail_puts {
+                return Err(io::Error::other("disk full"));
+            }
+            let chunks: Vec<Bytes> = value.stream().try_collect().await?;
+            self.objects.lock().insert(key, chunks.concat().into());
+            Ok(())
+        }
+
+        async fn size(
+            &self,
+            key: &StorageKey,
+        ) -> Result<Option<u64>, Self::Error> {
+            Ok(self.objects.lock().get(key).map(|data| data.len() as u64))
+        }
+
+        async fn delete(&self, key: &StorageKey) -> Result<(), Self::Error> {
+            if let Some((entered, release)) = &self.delete_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            self.objects.lock().remove(key);
+            Ok(())
+        }
+
+        fn list(&self) -> StorageStream<(StorageKey, u64), Self::Error> {
+            let objects: Vec<_> = self
+                .objects
+                .lock()
+                .iter()
+                .map(|(key, data)| Ok((key.clone(), data.len() as u64)))
+                .collect();
+            Box::pin(stream::iter(objects))
+        }
+
+        fn public_url(&self, _key: &StorageKey) -> Option<String> {
+            None
+        }
+
+        async fn upload_url(
+            &self,
+            _key: &StorageKey,
+            _expires_in: Duration,
+        ) -> Option<String> {
+            None
+        }
+
+        async fn download_url(
+            &self,
+            _key: &StorageKey,
+            _expires_in: Duration,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// When the LRU lists an object that the cache no longer has, `get` falls
+    /// back to permanent storage. That download must not hold the LRU lock,
+    /// which every other request needs.
+    #[tokio::test]
+    async fn fallback_download_does_not_hold_lru_lock() {
+        let key = StorageKey::new(
+            Namespace::new("org".into(), "project".into()),
+            Oid::from([1; 32]),
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut storage = Memory::with(&key, b"stored");
+        storage.gate = Some((entered.clone(), release.clone()));
+
+        let backend = Backend::new(0, Memory::with(&key, b"cached"), storage)
+            .await
+            .unwrap();
+
+        // The LRU was populated from the cache; now the cache loses the
+        // object, as if its files were removed by hand.
+        backend.cache.delete(&key).await.unwrap();
+
+        let backend = Arc::new(backend);
+        let download = tokio::spawn({
+            let backend = backend.clone();
+            let key = key.clone();
+            async move { backend.get(&key).await.map(|obj| obj.is_some()) }
+        });
+
+        // Wait until the fallback download is in progress...
+        entered.notified().await;
+
+        // ...and check the LRU can still be locked meanwhile.
+        tokio::time::timeout(Duration::from_secs(5), backend.total_size())
+            .await
+            .expect("the LRU lock is held during the fallback download");
+
+        release.notify_one();
+        assert!(download.await.unwrap().unwrap());
+    }
+
+    fn object(data: &'static [u8]) -> LFSObject {
+        LFSObject::new(
+            data.len() as u64,
+            Box::pin(stream::once(future::ok(Bytes::from_static(data)))),
+        )
+    }
+
+    fn numbered(n: u8) -> StorageKey {
+        StorageKey::new(
+            Namespace::new("org".into(), "project".into()),
+            Oid::from([n; 32]),
+        )
+    }
+
+    /// Objects over a quarter of the cache go straight to permanent storage,
+    /// both ways, so a huge object can't flush the cache or fill the disk.
+    #[tokio::test]
+    async fn big_objects_bypass_the_cache() {
+        let backend = Backend::new(100, Memory::default(), Memory::default())
+            .await
+            .unwrap();
+        let (small, big) = (numbered(1), numbered(2));
+
+        backend.put(small.clone(), object(&[1; 25])).await.unwrap();
+        backend.put(big.clone(), object(&[2; 26])).await.unwrap();
+
+        assert!(backend.storage.objects.lock().contains_key(&small));
+        assert!(backend.storage.objects.lock().contains_key(&big));
+        assert!(backend.cache.objects.lock().contains_key(&small));
+        assert!(!backend.cache.objects.lock().contains_key(&big));
+
+        // Downloading the big object doesn't cache it either. Caching happens
+        // in the background, so give it a chance to run.
+        let got = backend.get(&big).await.unwrap().unwrap();
+        let data: Vec<Bytes> = got.stream().try_collect().await.unwrap();
+        assert_eq!(data.concat(), [2; 26]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!backend.cache.objects.lock().contains_key(&big));
+    }
+
+    fn failing() -> Memory {
+        Memory {
+            fail_puts: true,
+            ..Memory::default()
+        }
+    }
+
+    /// Caching is best effort: a cache that can't store an object must not
+    /// cut the download short.
+    #[tokio::test]
+    async fn cache_failures_dont_affect_downloads() {
+        let key = numbered(3);
+        let backend =
+            Backend::new(1000, failing(), Memory::with(&key, b"from storage"))
+                .await
+                .unwrap();
+
+        let got = backend.get(&key).await.unwrap().unwrap();
+        let data: Vec<Bytes> = got.stream().try_collect().await.unwrap();
+        assert_eq!(data.concat(), b"from storage");
+    }
+
+    /// ...and must not fail an upload that permanent storage accepted.
+    #[tokio::test]
+    async fn cache_failures_dont_affect_uploads() {
+        let key = numbered(4);
+        let backend = Backend::new(1000, failing(), Memory::default())
+            .await
+            .unwrap();
+
+        backend.put(key.clone(), object(b"uploaded")).await.unwrap();
+        assert!(backend.storage.objects.lock().contains_key(&key));
+    }
+
+    /// Pruning deletes evicted objects from the cache. Those deletes must not
+    /// hold the LRU lock either.
+    #[tokio::test]
+    async fn prune_deletes_do_not_hold_lru_lock() {
+        let key = |n: u8| {
+            StorageKey::new(
+                Namespace::new("org".into(), "project".into()),
+                Oid::from([n; 32]),
+            )
+        };
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let storage = Arc::new(Memory {
+            delete_gate: Some((entered.clone(), release.clone())),
+            ..Memory::default()
+        });
+
+        // Three 10-byte objects, oldest first, against a 15-byte limit: the
+        // two oldest must go.
+        let mut lru = Cache::new();
+        for n in 1..=3 {
+            lru.push(key(n), 10);
+        }
+        let lru = Arc::new(Mutex::new(lru));
+
+        let prune = tokio::spawn(prune_cache(lru.clone(), 15, storage));
+
+        // Wait until the first file delete is in progress...
+        entered.notified().await;
+
+        // ...and check the LRU can still be locked meanwhile.
+        let size = tokio::time::timeout(Duration::from_secs(5), async {
+            lru.lock().await.size()
+        })
+        .await
+        .expect("the LRU lock is held while deleting evicted files");
+        assert_eq!(size, 10);
+
+        // Let both deletes finish.
+        release.notify_one();
+        entered.notified().await;
+        release.notify_one();
+        assert_eq!(prune.await.unwrap().unwrap(), 2);
+
+        let mut lru = lru.lock().await;
+        assert!(lru.get_refresh(&key(3)).is_some());
+        assert!(lru.get_refresh(&key(1)).is_none());
+        assert!(lru.get_refresh(&key(2)).is_none());
     }
 }

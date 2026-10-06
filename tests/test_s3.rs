@@ -18,84 +18,48 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! This integration test only runs if the file `.test_credentials.toml` is in
-//! the same directory. Otherwise, it succeeds and does nothing.
+//! Integration tests against S3 or an S3-compatible server. These skip unless
+//! `LFS_TEST_S3_BUCKET` is set; see `tests/common.rs` for the configuration.
 //!
-//! To run this test, create `tests/.test_credentials.toml` with the following
-//! contents:
-//!
-//! ```toml
-//! access_key_id = "XXXXXXXXXXXXXXXXXXXX"
-//! secret_access_key = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-//! default_region = "us-east-1"
-//! bucket = "my-test-bucket"
-//! ```
-//!
-//! Be sure to *only* use non-production credentials for testing purposes. We
-//! intentionally do not load the credentials from the environment to avoid
-//! clobbering any existing S3 bucket.
+//! Be sure to *only* use non-production credentials and buckets for testing
+//! purposes.
 
 mod common;
 
-use std::fs;
 use std::path::Path;
 
 use futures::future::Either;
 use lfs_rs::S3ServerBuilder;
-use rand::rngs::StdRng;
-use rand::Rng;
+use lfs_rs::stats::{RequestClass, STATS};
+use rand::RngExt;
 use rand::SeedableRng;
-use serde::{Deserialize, Serialize};
+use rand::rngs::StdRng;
 use tokio::sync::oneshot;
 
-use common::{init_logger, GitRepo, SERVER_ADDR};
+use common::{GitRepo, SERVER_ADDR, init_logger};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Credentials {
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    default_region: String,
-    bucket: String,
-    #[serde(default)]
-    s3ta_enabled: bool,
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+/// Pushes and pulls LFS objects through S3 without a local cache. Each caller
+/// needs its own prefix: the objects are deterministic, so encrypted and
+/// unencrypted runs would otherwise find each other's objects.
+async fn s3_smoke_test(
+    test: &str,
+    prefix: &str,
+    key: Option<[u8; 32]>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = init_logger();
 
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
+    let Some(target) = common::s3_target(test).await else {
+        return Ok(());
     };
-
-    // Try to load S3 credentials `.test_credentials.toml`. If they don't exist,
-    // then we can't really run this test. Note that these should be completely
-    // separate credentials than what is used in production.
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
-
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
 
     // Make sure our seed is deterministic. This prevents us from filling up our
     // S3 bucket with a bunch of random files if this test gets ran a bunch of
     // times.
     let mut rng = StdRng::seed_from_u64(42);
 
-    let key = rng.gen();
-
-    let mut server = S3ServerBuilder::new(creds.bucket, key);
-    server.prefix("test_lfs".into());
+    let mut server = S3ServerBuilder::new(target.bucket, key);
+    server.prefix(prefix.into());
+    server.sdk_config(target.config);
 
     let locks = lfs_rs::NoneLs::new();
 
@@ -112,139 +76,116 @@ async fn s3_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     repo.commit("Add LFS objects")?;
 
     // Make sure we can push LFS objects to the server.
-    repo.lfs_push().unwrap();
+    repo.lfs_push()?;
 
     // Make sure we can re-download the same objects.
-    repo.clean_lfs().unwrap();
-    repo.lfs_pull().unwrap();
+    let before_pull = STATS.snapshot();
+    repo.clean_lfs()?;
+    repo.lfs_pull()?;
+
+    // The counters are shared by every test in this binary, so only check
+    // for at least what this pull did.
+    let pulled = STATS.snapshot().since(&before_pull);
+    assert!(pulled.requests(RequestClass::Batch) >= 1, "{pulled:?}");
+    assert!(pulled.requests(RequestClass::Download) >= 3, "{pulled:?}");
+    assert!(pulled.bytes_downloaded >= 28 * 1024 * 1024, "{pulled:?}");
+    assert!(
+        pulled.s3_size_cache_hits + pulled.s3_size_cache_misses >= 3,
+        "{pulled:?}"
+    );
 
     // Push again. This should be super fast.
-    repo.lfs_push().unwrap();
+    repo.lfs_push()?;
 
     shutdown_tx.send(()).expect("server died too soon");
 
-    if let Either::Right((result, _)) = server.await.unwrap() {
+    if let Either::Right((result, _)) = server.await? {
         // If the server exited first, then propagate the error.
-        result.expect("server failed unexpectedly");
+        result?;
     }
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn s3ta_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = init_logger();
+async fn s3_smoke_test_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
+    s3_smoke_test("S3 unencrypted", "test_lfs_unencrypted", None).await
+}
 
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_smoke_test_encrypted() -> Result<(), Box<dyn std::error::Error>> {
+    let key = StdRng::seed_from_u64(42).random();
+    s3_smoke_test("S3 encrypted", "test_lfs_encrypted", Some(key)).await
+}
+
+/// The configuration production runs, less transfer acceleration: S3 behind a
+/// local disk cache, unencrypted, with DynamoDB locks and GitHub
+/// authentication (mocked).
+#[cfg(feature = "dynamodb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_production_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let _guard = init_logger();
+    let startup_span = common::startup();
+
+    let test = "S3 production";
+    let Some(s3) = common::s3_target(test).await else {
+        return Ok(());
+    };
+    let Some(dynamodb) = common::dynamodb_target(test, "s3") else {
+        return Ok(());
     };
 
-    // Try to load S3 credentials `.test_credentials.toml`. If they don't exist,
-    // then we can't really run this test. Note that these should be completely
-    // separate credentials than what is used in production.
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
+    GitRepo::setup_dynamodb_table(&dynamodb).await?;
+    let locks = lfs_rs::DynamoLs::from_config(&dynamodb.config, dynamodb.table);
 
-    if creds.s3ta_enabled {
-        eprintln!(
-            "Skipping test. S3 Transfer Acceleration is required and not set \
-             in test credentials config."
-        );
-        return Ok(());
-    }
+    let cache = tempfile::TempDir::new()?;
+    let mock = GitRepo::setup_mock_gh_auth().await;
 
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
-
-    // Make sure our seed is deterministic. This prevents us from filling up our
-    // S3 bucket with a bunch of random files if this test gets ran a bunch of
-    // times.
-    let mut rng = StdRng::seed_from_u64(42);
-
-    let key = rng.gen();
-
-    let mut server = S3ServerBuilder::new(creds.bucket, key);
-    server.s3_accelerate(true);
-    server.prefix("test_lfs".into());
-
-    let locks = lfs_rs::NoneLs::new();
-
+    let mut server = S3ServerBuilder::new(s3.bucket, None);
+    server.prefix("test_lfs_production".into());
+    server.sdk_config(s3.config);
+    server.cache(lfs_rs::Cache::new(cache.path().into(), 1024 * 1024 * 1024));
+    server.authenticated(true);
+    server.authentication_server(mock.uri());
     let (server, addr) = server.spawn(SERVER_ADDR, locks).await?;
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let before = STATS.snapshot();
+    common::lock_smoke_test(server, addr, Some(startup_span)).await?;
 
-    let server = tokio::spawn(futures::future::select(shutdown_rx, server));
-
-    let repo = GitRepo::init(addr)?;
-    repo.add_random(Path::new("4mb.bin"), 4 * 1024 * 1024, &mut rng)?;
-    repo.add_random(Path::new("8mb.bin"), 8 * 1024 * 1024, &mut rng)?;
-    repo.add_random(Path::new("16mb.bin"), 16 * 1024 * 1024, &mut rng)?;
-    repo.commit("Add LFS objects")?;
-
-    // Make sure we can push LFS objects to the server.
-    repo.lfs_push().unwrap();
-
-    // Make sure we can re-download the same objects.
-    repo.clean_lfs().unwrap();
-    repo.lfs_pull().unwrap();
-
-    // Push again. This should be super fast.
-    repo.lfs_push().unwrap();
-
-    shutdown_tx.send(()).expect("server died too soon");
-
-    if let Either::Right((result, _)) = server.await.unwrap() {
-        // If the server exited first, then propagate the error.
-        result.expect("server failed unexpectedly");
-    }
+    // Uploads go through the disk cache, and every API request is
+    // authenticated through the (mocked) GitHub API or its cache.
+    let after = STATS.snapshot();
+    let delta = after.since(&before);
+    assert!(after.disk_cache_bytes >= 28 * 1024 * 1024, "{after:?}");
+    assert_eq!(after.disk_cache_limit, 1024 * 1024 * 1024);
+    assert!(delta.github_api_calls >= 1, "{delta:?}");
+    assert!(delta.github_auth_cache_hits >= 1, "{delta:?}");
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
-    use lfs_rs::storage::{Storage, StorageKey};
     use lfs_rs::Oid;
+    use lfs_rs::storage::{Storage, StorageKey};
 
     let _guard = init_logger();
 
-    let config = match fs::read("tests/.test_credentials.toml") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("Skipping test. No S3 credentials available: {}", err);
-            return Ok(());
-        }
+    let Some(target) = common::s3_target("S3 size cache").await else {
+        return Ok(());
     };
 
-    let creds: Credentials =
-        toml::from_str(std::str::from_utf8(config.as_slice())?)?;
-
-    std::env::set_var("AWS_ACCESS_KEY_ID", creds.access_key_id);
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", creds.secret_access_key);
-    std::env::set_var(
-        "AWS_SESSION_TOKEN",
-        creds.session_token.unwrap_or_default(),
-    );
-    std::env::set_var("AWS_DEFAULT_REGION", creds.default_region);
-
     // Create S3 backend with a very small cache (3 entries) to test eviction
-    let backend = lfs_rs::storage::S3::new(
-        creds.bucket,
+    let backend = lfs_rs::storage::S3::from_config(
+        &target.config,
+        target.bucket,
         "test_lfs_cache".to_string(),
         None,
         false,
         3, // Small cache size for testing
-    )
-    .await?;
+        std::time::Duration::ZERO,
+    );
+    backend.check().await?;
 
     let mut rng = StdRng::seed_from_u64(123);
     let namespace = lfs_rs::storage::Namespace::new(
@@ -408,5 +349,240 @@ async fn s3_size_cache_test() -> Result<(), Box<dyn std::error::Error>> {
         "✓ All cache tests passed! Final stats: {} hits, {} misses, {} entries",
         hits, misses, entries
     );
+    Ok(())
+}
+
+/// Objects are uploaded to S3 in parts, which is what lets objects over 5 GiB
+/// be stored. With the smallest part size S3 allows, small objects exercise
+/// the same code.
+mod multipart {
+    use super::*;
+    use bytes::Bytes;
+    use futures::{StreamExt, TryStreamExt};
+    use lfs_rs::Oid;
+    use lfs_rs::storage::{
+        LFSObject, MIN_PART_SIZE, Namespace, S3, Storage, StorageKey,
+    };
+    use sha2::Digest;
+
+    const PREFIX: &str = "test_lfs_multipart";
+
+    fn backend(target: &common::S3Target) -> S3 {
+        S3::from_config(
+            &target.config,
+            target.bucket.clone(),
+            PREFIX.into(),
+            None,
+            false,
+            0,
+            std::time::Duration::ZERO,
+        )
+        .with_part_size(MIN_PART_SIZE)
+    }
+
+    fn key(data: &[u8]) -> StorageKey {
+        let oid = Oid::from(sha2::Sha256::digest(data));
+        StorageKey::new(Namespace::new("test".into(), "multipart".into()), oid)
+    }
+
+    /// A key no earlier run used, so that uploads a failed run left open can't
+    /// affect this one.
+    fn unique_key(name: &str) -> StorageKey {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        key(format!("{name} {nanos}").as_bytes())
+    }
+
+    /// `data` as a stream of chunks that don't line up with the parts.
+    fn object(data: &[u8]) -> LFSObject {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = data
+            .chunks(1024 * 1024 + 3)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        LFSObject::new(
+            data.len() as u64,
+            Box::pin(futures::stream::iter(chunks)),
+        )
+    }
+
+    async fn round_trip(len: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(target) = common::s3_target("S3 multipart").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        let mut data = vec![0u8; len];
+        StdRng::seed_from_u64(len as u64).fill(&mut data[..]);
+        let key = key(&data);
+
+        backend.put(key.clone(), object(&data)).await?;
+
+        assert_eq!(backend.size(&key).await?, Some(len as u64));
+        let stored = backend.get(&key).await?.expect("object was not stored");
+        let stored: Vec<Bytes> = stored.stream().try_collect().await?;
+        assert!(stored.concat() == data, "stored object differs");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_with_a_short_part() -> Result<(), Box<dyn std::error::Error>>
+    {
+        round_trip(2 * MIN_PART_SIZE + MIN_PART_SIZE * 2 / 5 + 7).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_on_a_part_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        round_trip(2 * MIN_PART_SIZE).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_object() -> Result<(), Box<dyn std::error::Error>> {
+        round_trip(0).await
+    }
+
+    /// Uploads of `key` still open. Only this key's: tests run in parallel, and
+    /// an earlier failed run may have left others open.
+    async fn open_uploads(
+        target: &common::S3Target,
+        key: &StorageKey,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let path = format!("{PREFIX}/{}/{}", key.namespace(), key.oid().path());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&target.config)
+                .force_path_style(true)
+                .build(),
+        );
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(&target.bucket)
+            .prefix(&path)
+            .send()
+            .await?;
+        Ok(uploads.uploads().len())
+    }
+
+    /// When a client disconnects, hyper drops the request, `put` included,
+    /// so it never sees an error. The upload must still be aborted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_upload_is_aborted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(target) = common::s3_target("S3 multipart drop").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        // A part and a bit, then the client stalls.
+        let first: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from(vec![9u8; MIN_PART_SIZE + 1024 * 1024]))];
+        let stream =
+            futures::stream::iter(first).chain(futures::stream::pending());
+        let object =
+            LFSObject::new((MIN_PART_SIZE * 3) as u64, Box::pin(stream));
+
+        let key = unique_key("dropped upload");
+        let put = backend.put(key.clone(), object);
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_secs(3), put).await;
+        assert!(
+            dropped.is_err(),
+            "the upload should still have been waiting"
+        );
+
+        // The abort runs in the background once the part in flight is done.
+        for _ in 0..50 {
+            if open_uploads(&target, &key).await? == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("the dropped upload was left open");
+    }
+
+    /// A failed upload is aborted, so its parts aren't left in the bucket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_upload_is_aborted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Some(target) = common::s3_target("S3 multipart abort").await else {
+            return Ok(());
+        };
+        let backend = backend(&target);
+
+        // One full part, then the client goes away.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(vec![7u8; MIN_PART_SIZE + 1024 * 1024])),
+            Err(std::io::Error::other("client went away")),
+        ];
+        let key = unique_key("failed upload");
+        let object = LFSObject::new(
+            (MIN_PART_SIZE * 3) as u64,
+            Box::pin(futures::stream::iter(chunks)),
+        );
+        assert!(backend.put(key.clone(), object).await.is_err());
+        assert_eq!(open_uploads(&target, &key).await?, 0, "upload left open");
+        assert_eq!(backend.size(&key).await?, None);
+        Ok(())
+    }
+}
+
+/// With a CDN (or S3TA), objects go straight between clients and S3, so they
+/// can't be encrypted. Objects that still go through the server, such as
+/// uploads over 5 GiB, must not be encrypted either, or they would be served
+/// through the CDN as ciphertext.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_is_ignored_with_a_cdn() -> Result<(), Box<dyn std::error::Error>> {
+    use futures::TryStreamExt;
+    use http_body_util::Full;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    use lfs_rs::storage::{Namespace, S3, Storage, StorageKey};
+    use sha2::Digest;
+
+    let _guard = init_logger();
+    let Some(target) = common::s3_target("S3 CDN with key").await else {
+        return Ok(());
+    };
+    let prefix = "test_lfs_cdn_key";
+
+    let mut server = S3ServerBuilder::new(target.bucket.clone(), Some([7; 32]));
+    server.prefix(prefix.into());
+    server.cdn("https://cdn.example".into());
+    server.sdk_config(target.config.clone());
+    let (server, addr) =
+        server.spawn(SERVER_ADDR, lfs_rs::NoneLs::new()).await?;
+    let server = tokio::spawn(server);
+
+    let data = b"stored as sent".to_vec();
+    let oid = lfs_rs::Oid::from(sha2::Sha256::digest(&data));
+    let request = hyper::Request::put(format!(
+        "http://{addr}/api/test/test/object/{oid}"
+    ))
+    .header("content-length", data.len())
+    .body(Full::new(bytes::Bytes::from(data.clone())))?;
+    let response = Client::builder(TokioExecutor::new())
+        .build_http()
+        .request(request)
+        .await?;
+    assert_eq!(response.status(), 200);
+
+    // Read what is in S3, without decrypting.
+    let raw = S3::from_config(
+        &target.config,
+        target.bucket.clone(),
+        prefix.into(),
+        None,
+        false,
+        0,
+        std::time::Duration::ZERO,
+    );
+    let key =
+        StorageKey::new(Namespace::new("test".into(), "test".into()), oid);
+    let stored = raw.get(&key).await?.expect("object was not stored");
+    let stored: Vec<bytes::Bytes> = stored.stream().try_collect().await?;
+    assert!(stored.concat() == data, "object was stored encrypted");
+
+    server.abort();
     Ok(())
 }
