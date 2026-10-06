@@ -114,6 +114,18 @@ struct GlobalArgs {
         env = "RUDOLFS_STATS_INTERVAL"
     )]
     stats_interval: Duration,
+
+    /// How long to wait, on SIGTERM or SIGINT, for requests in flight to
+    /// finish before exiting. An upload through the server can take many
+    /// minutes, so under Kubernetes set this, and the pod's
+    /// terminationGracePeriodSeconds, to allow for one.
+    #[clap(
+        long = "shutdown-timeout",
+        default_value = "25s",
+        value_parser = humantime::parse_duration,
+        env = "RUDOLFS_SHUTDOWN_TIMEOUT"
+    )]
+    shutdown_timeout: Duration,
 }
 
 fn from_hex(s: &str) -> Result<[u8; 32], hex::FromHexError> {
@@ -284,6 +296,7 @@ impl S3Args {
         let mut builder = S3ServerBuilder::new(self.bucket, global_args.key);
         builder.prefix(self.prefix);
         builder.authenticated(global_args.github_auth);
+        builder.shutdown_timeout(global_args.shutdown_timeout);
         builder.size_cache_entries(self.size_cache_entries);
         builder.credential_refresh_buffer(self.credential_refresh_buffer);
 
@@ -346,6 +359,7 @@ impl LocalArgs {
         let mut builder = LocalServerBuilder::new(self.path, global_args.key);
 
         builder.authenticated(global_args.github_auth);
+        builder.shutdown_timeout(global_args.shutdown_timeout);
 
         match lock.lock_backend {
             #[cfg(feature = "dynamodb")]

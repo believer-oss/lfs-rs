@@ -119,6 +119,9 @@ Rules about the order:
 
 `spawn_server` in `src/lib.rs` creates one service chain for each
 connection: `Logger` → `auth::Auth` → `app::App`.
+On SIGTERM (what Kubernetes sends) or SIGINT it stops taking connections and
+waits up to `--shutdown-timeout` (default 25s) for requests in flight, such as
+an upload through the server, to finish.
 
 - `App` (`src/app.rs`) routes by hand on
   `/api/{org}/{project}/{object/<oid> | objects/batch | objects/verify | locks/...}`.

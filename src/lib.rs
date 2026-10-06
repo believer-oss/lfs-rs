@@ -83,6 +83,35 @@ impl Cache {
     }
 }
 
+/// How long the server waits, by default, for requests in flight to finish
+/// when told to stop: within the 30s Kubernetes gives a pod by default.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Resolves when the server is told to stop: SIGTERM (which Kubernetes
+/// sends), or SIGINT (Ctrl-C). Says which.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+            },
+            Err(err) => {
+                tracing::warn!("Can't listen for SIGTERM: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
 /// A spawned server, to be awaited on, and the address it listens on.
 type Spawned = Result<
     (BoxFuture<'static, Result<(), Error>>, SocketAddr),
@@ -102,6 +131,7 @@ pub struct S3ServerBuilder {
     size_cache_entries: usize,
     credential_refresh_buffer: Duration,
     sdk_config: Option<aws_config::SdkConfig>,
+    shutdown_timeout: Duration,
 }
 
 impl S3ServerBuilder {
@@ -119,6 +149,7 @@ impl S3ServerBuilder {
             credential_refresh_buffer:
                 storage::DEFAULT_CREDENTIAL_REFRESH_BUFFER,
             sdk_config: None,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -173,6 +204,13 @@ impl S3ServerBuilder {
         authentication_server: String,
     ) -> &mut Self {
         self.authentication_server = Some(authentication_server);
+        self
+    }
+
+    /// How long to wait, on SIGTERM or SIGINT, for requests in flight to
+    /// finish before exiting.
+    pub fn shutdown_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -277,6 +315,7 @@ impl S3ServerBuilder {
                     addr,
                     self.authenticated,
                     self.authentication_server,
+                    self.shutdown_timeout,
                 )
                 .await?;
 
@@ -295,6 +334,7 @@ impl S3ServerBuilder {
                     addr,
                     self.authenticated,
                     self.authentication_server,
+                    self.shutdown_timeout,
                 )
                 .await?;
 
@@ -325,6 +365,7 @@ pub struct LocalServerBuilder {
     key: Option<[u8; 32]>,
     authenticated: bool,
     authentication_server: Option<String>,
+    shutdown_timeout: Duration,
 }
 
 impl LocalServerBuilder {
@@ -336,7 +377,15 @@ impl LocalServerBuilder {
             key,
             authenticated: false,
             authentication_server: None,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
+    }
+
+    /// How long to wait, on SIGTERM or SIGINT, for requests in flight to
+    /// finish before exiting.
+    pub fn shutdown_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.shutdown_timeout = timeout;
+        self
     }
 
     /// Sets the encryption key to use.
@@ -390,6 +439,7 @@ impl LocalServerBuilder {
             addr,
             self.authenticated,
             self.authentication_server,
+            self.shutdown_timeout,
         )
         .await?;
 
@@ -466,6 +516,7 @@ async fn spawn_server<S, L>(
     addr: SocketAddr,
     authenticated: bool,
     authentication_server: Option<String>,
+    shutdown_timeout: Duration,
 ) -> Result<(impl Future<Output = Result<(), Error>>, SocketAddr), Error>
 where
     S: Storage + Send + Sync + 'static,
@@ -499,7 +550,7 @@ where
         async move {
             let graceful =
                 hyper_util::server::graceful::GracefulShutdown::new();
-            let mut ctrl_c = pin!(tokio::signal::ctrl_c());
+            let mut stop = pin!(shutdown_signal());
             loop {
                 tokio::select! {
                     conn = listener.accept() => {
@@ -561,10 +612,16 @@ where
                         tokio::spawn(handler);
                     },
 
-                    _ = ctrl_c.as_mut() => {
+                    signal = stop.as_mut() => {
+                        // New connections are refused; requests in flight,
+                        // such as a long upload, are given time to finish.
                         drop(listener);
-                        tracing::info!("Ctrl-C received, starting shutdown");
-                            break;
+                        tracing::info!(
+                            "{signal} received, waiting up to {} for requests \
+                             in flight",
+                            humantime::format_duration(shutdown_timeout)
+                        );
+                        break;
                     }
                 }
             }
@@ -574,8 +631,11 @@ where
                     tracing::info!("Gracefully shutdown!");
                     Ok(())
                 },
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                    tracing::info!("Waited 10 seconds for graceful shutdown, aborting...");
+                _ = tokio::time::sleep(shutdown_timeout) => {
+                    tracing::warn!(
+                        "Requests were still in flight after {}; exiting",
+                        humantime::format_duration(shutdown_timeout)
+                    );
                     Ok(())
                 }
             }

@@ -152,3 +152,89 @@ fn local_storage_refuses_a_cache_dir() -> Result<(), Box<dyn std::error::Error>>
     );
     Ok(())
 }
+
+/// On SIGTERM, which Kubernetes sends to stop a pod, the server refuses new
+/// connections but lets a request in flight, such as a long upload, finish,
+/// and then exits.
+#[cfg(unix)]
+#[test]
+fn sigterm_lets_requests_in_flight_finish()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::TempDir::new()?;
+    let mut server = Command::new(env!("CARGO_BIN_EXE_lfs-rs"))
+        .args(["--host", "127.0.0.1:0", "--shutdown-timeout", "20s"])
+        .args(["local", "--path"])
+        .arg(dir.path().join("objects"))
+        .env("RUDOLFS_LOG", "info")
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // The address it listens on, from its log.
+    let mut lines = BufReader::new(server.stdout.take().unwrap()).lines();
+    let addr = loop {
+        let line = lines.next().ok_or("the server exited")??;
+        if let Some(addr) = line.split("Listening on ").nth(1) {
+            break addr.trim().to_string();
+        }
+    };
+    // Keep reading the log, so the server never blocks on a full pipe.
+    let log = std::thread::spawn(move || {
+        lines.map_while(Result::ok).collect::<Vec<_>>().join("\n")
+    });
+
+    let object = vec![7u8; 1 << 20];
+    let oid: String = Sha256::digest(&object)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut upload = TcpStream::connect(&addr)?;
+    write!(
+        upload,
+        "PUT /api/test/test/object/{oid} HTTP/1.1\r\nHost: \
+         localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        object.len()
+    )?;
+    let (first, rest) = object.split_at(object.len() / 2);
+    upload.write_all(first)?;
+    upload.flush()?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    let status = Command::new("kill")
+        .args(["-TERM", &server.id().to_string()])
+        .status()?;
+    assert!(status.success());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // It no longer takes new connections...
+    assert!(TcpStream::connect(&addr).is_err(), "took a new connection");
+
+    // ...but the upload in flight finishes.
+    upload.write_all(rest)?;
+    let mut response = String::new();
+    upload.read_to_string(&mut response)?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    // And then it exits, well before the 20s it would have waited.
+    let started = Instant::now();
+    let exit = loop {
+        if let Some(exit) = server.try_wait()? {
+            break exit;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            server.kill()?;
+            panic!("it didn't exit");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exit.success(), "{exit}");
+    let log = log.join().unwrap();
+    assert!(log.contains("SIGTERM received"), "{log}");
+    Ok(())
+}
